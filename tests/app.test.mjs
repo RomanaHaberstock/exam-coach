@@ -1,7 +1,7 @@
 // End-to-end tests for Exam Coach.
 // Runs the real page in Chromium with the site's security headers, serves the files
-// from this repository, and answers /api/ai with the real backend code. Only the
-// Anthropic API itself is replaced by a fake, so no API key or network is needed.
+// from this repository, and answers /api/ai with the real backend code (Gemini provider).
+// Only the Gemini API itself is replaced by a fake, so no API key or network is needed.
 //
 // Run: npm test   (first time: npm install && npx playwright install chromium)
 
@@ -36,18 +36,14 @@ function fakeAnswer(prompt) {
   return { verdict: "Good start.", covered: ["H0 and H1"], missing: ["Error types"], wrong: [] };
 }
 globalThis.fetch = async (url, init) => {
-  if (!String(url).startsWith("https://api.anthropic.com/")) return realFetch(url, init);
+  if (!String(url).startsWith("https://generativelanguage.googleapis.com/")) return realFetch(url, init);
   upstream.calls++;
+  upstream.models.push(decodeURIComponent(String(url).match(/models\/([^:]+):/)[1]));
+  if (init.headers["x-goog-api-key"] !== "test-key") return new Response(JSON.stringify({ error: { code: 400, message: "API key not valid" } }), { status: 400 });
   const body = JSON.parse(init.body);
-  upstream.models.push(body.model);
-  const text = "```json\n" + JSON.stringify(fakeAnswer(body.messages[0].content)) + "\n```";
+  const text = JSON.stringify(fakeAnswer(body.contents[0].parts[0].text));
   const parts = [text.slice(0, 15), text.slice(15)];
-  const sse = [
-    `event: message_start\ndata: {"type":"message_start"}\n\n`,
-    ...parts.map(t => `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: t } })}\n\n`),
-    `event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n`,
-    `event: message_stop\ndata: {"type":"message_stop"}\n\n`,
-  ].join("");
+  const sse = parts.map((t, i) => `data: ${JSON.stringify({ candidates: [{ content: { role: "model", parts: [{ text: t }] }, ...(i === parts.length - 1 ? { finishReason: "STOP" } : {}) }] })}\r\n\r\n`).join("");
   return new Response(sse, { headers: { "content-type": "text/event-stream" } });
 };
 
@@ -79,7 +75,9 @@ async function open(ctx) {
 }
 
 before(async () => {
-  process.env.ANTHROPIC_API_KEY = "test-key";
+  process.env.GEMINI_API_KEY = "test-key";
+  delete process.env.ANTHROPIC_API_KEY;
+  delete process.env.AI_PROVIDER;
   delete process.env.ACCESS_CODE;
   browser = await chromium.launch();
   context = await browser.newContext({ acceptDownloads: true });
@@ -180,15 +178,15 @@ test("asks for the access code when one is set", async () => {
 });
 
 test("explains when the backend has no API key", async () => {
-  delete process.env.ANTHROPIC_API_KEY;
+  delete process.env.GEMINI_API_KEY;
   await page.reload();
   await page.waitForFunction(() => aiState !== "checking");
   assert.equal(await page.evaluate(() => aiState), "off");
-  process.env.ANTHROPIC_API_KEY = "test-key";
+  process.env.GEMINI_API_KEY = "test-key";
 });
 
 test("makes no requests to other servers and has no errors", () => {
   assert.ok(upstream.calls >= 4, "the AI backend was called");
-  assert.ok(upstream.models.every(m => typeof m === "string" && m.length > 0));
+  assert.ok(upstream.models.every(m => m === "gemini-3.8-flash"), "uses the default Gemini model");
   assert.deepEqual(problems, []);
 });

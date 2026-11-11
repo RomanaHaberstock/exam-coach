@@ -433,6 +433,7 @@ async function aiCall(prompt, { signal, modelTier } = {}) {
     if (e && e.code) throw e;
     throw { code: signal && signal.aborted ? "cancelled" : "upstream_error" };
   }
+  if (stop === "refusal") throw { code: "refused" };
   if (!text.trim()) throw { code: "empty_completion" };
   return { text, truncated: stop === "max_tokens" };
 }
@@ -454,11 +455,12 @@ const AI = {
 };
 function aiError(e) {
   const c = e && e.code;
-  if (c === "not_configured") return "The AI backend has no API key yet. Add ANTHROPIC_API_KEY in your hosting settings (see README).";
-  if (c === "bad_key") return "The AI backend's API key was rejected. Check ANTHROPIC_API_KEY in your hosting settings.";
+  if (c === "not_configured") return "The AI backend has no API key yet. Add GEMINI_API_KEY in the Netlify environment variables (see README).";
+  if (c === "bad_key") return "The AI backend's API key was rejected. Check the key in the Netlify environment variables.";
+  if (c === "model_unavailable") return "The AI model in the settings isn't available. Check GEMINI_MODEL or remove it to use the default (see README).";
   if (c === "access_code") return "Enter the access code at the top of the page to use the AI features.";
   if (c === "empty_completion") return "The AI didn't send an answer. Try again.";
-  if (c === "rate_limited") return "Too many requests right now. Wait a minute and try again.";
+  if (c === "rate_limited") return "The AI's usage limit is reached for now. Wait a minute and try again. If it keeps happening, the daily limit is used up and resets the next morning.";
   if (c === "invalid_json") return "The AI's answer couldn't be read. Try again.";
   if (c === "prompt_too_large") return "The materials are too large for one request. Remove a file and try again.";
   if (c === "cancelled") return "Stopped.";

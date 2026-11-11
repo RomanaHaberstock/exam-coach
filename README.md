@@ -29,7 +29,7 @@ Over time it also learns which study methods, times of day and session lengths w
 
 There are no accounts. Each student's plan, quiz results and uploaded materials are saved in their own browser (IndexedDB) and never stored on a server. Under **Plan → Your data**, students can download a backup file and restore it on another device.
 
-Only the text needed for an AI request is sent to the backend. The backend stores nothing and passes the request to the Anthropic API, which handles it under Anthropic's data policy. The site loads no external fonts, scripts or trackers.
+Only the text needed for an AI request is sent to the backend, which stores nothing and passes it on to the AI provider. With Google Gemini, users in the EU, Switzerland and the UK get Google's paid-tier data protections even on the free tier, so their prompts aren't used to improve Google's products ([Gemini API terms](https://ai.google.dev/gemini-api/terms)). Outside these regions, free-tier requests may be used by Google, so don't upload sensitive material there. The site loads no external fonts, scripts or trackers.
 
 ## How it works
 
@@ -39,18 +39,19 @@ assets/app.js                  the whole app: planner, quizzes, learning profile
 assets/styles.css              styles, with light and dark theme
 assets/fonts/, fonts.css       self-hosted fonts
 assets/vendor/pdfjs/           PDF text extraction (pdf.js)
-netlify/edge-functions/ai.js   AI backend: forwards requests to the Anthropic API
+netlify/edge-functions/ai.js   AI backend: forwards requests to Gemini or Anthropic
 netlify.toml                   Netlify settings and security headers
-tests/app.test.mjs             end-to-end tests
+tests/                         end-to-end and backend tests
 ```
 
-The front end is plain HTML, CSS and JavaScript with no build step. The only server-side code is the small AI backend at `/api/ai`. It keeps the API key secret, streams the AI's answer back to the page and can be protected with an access code.
+The front end is plain HTML, CSS and JavaScript with no build step. The only server-side code is the small AI backend at `/api/ai`. It keeps the API key secret, streams the AI's answer back to the page and can be protected with an access code. It works with **Google Gemini** (free tier, the default) or the **Anthropic API** (paid); you switch with one setting.
 
 ## Getting started
 
 ### Requirements
 
-- An Anthropic API key from [console.anthropic.com](https://console.anthropic.com). Set a monthly spend limit there under Billing.
+- A free Gemini API key from [Google AI Studio](https://aistudio.google.com/apikey). You need a Google account and must be 18 or older; no credit card is required. The free tier has request limits per minute and per day, which you can see in [AI Studio](https://aistudio.google.com/rate-limit).
+- Or, instead: an Anthropic API key from [console.anthropic.com](https://console.anthropic.com) (paid, set a spend limit under Billing).
 - Node.js 20 or newer, for running it locally and for the tests.
 
 ### Run it locally
@@ -69,7 +70,7 @@ The site runs on [Netlify](https://www.netlify.com), which serves the page and r
 
 1. Sign up at Netlify with your GitHub account.
 2. Choose **Add new project → Import an existing project → GitHub** and select this repository. Leave all build settings empty and click **Deploy**.
-3. Go to **Project configuration → Environment variables** and add `ANTHROPIC_API_KEY` (your API key) and, optionally, `ACCESS_CODE`.
+3. Go to **Project configuration → Environment variables** and add `GEMINI_API_KEY` (your free key from Google AI Studio) and, optionally, `ACCESS_CODE`.
 4. Go to **Deploys → Trigger deploy → Deploy project** so the new variables are used.
 5. Open your site's address (something like `your-name.netlify.app`). Under **Exams & materials**, the button "Analyze materials with AI" should now be active.
 
@@ -79,10 +80,16 @@ From then on, every push to GitHub updates the site automatically.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | required | Your Anthropic API key. |
-| `ACCESS_CODE` | none | If set, the AI features only work after entering this code, so strangers who find the link can't use your credit. |
-| `ANTHROPIC_MODEL` | `claude-sonnet-5-5` | Model for analysing materials, quizzes, grading and study sessions. |
-| `ANTHROPIC_MODEL_QUICK` | `claude-haiku-5-5` | Model for short requests. |
+| `GEMINI_API_KEY` | none | Your Gemini API key. Needed when using Gemini. |
+| `ANTHROPIC_API_KEY` | none | Your Anthropic API key. Needed when using Anthropic. |
+| `AI_PROVIDER` | automatic | `gemini` or `anthropic`. If not set, Gemini is used when `GEMINI_API_KEY` exists, otherwise Anthropic. |
+| `ACCESS_CODE` | none | If set, the AI features only work after entering this code, so strangers who find the link can't use up your limits or credit. |
+| `GEMINI_MODEL` | `gemini-3.8-flash` | Gemini model for analysing materials, quizzes, grading and study sessions. |
+| `GEMINI_MODEL_QUICK` | `gemini-3.5-flash-lite` | Gemini model for short requests. |
+| `ANTHROPIC_MODEL` | `claude-sonnet-5-5` | Anthropic model for the main requests. |
+| `ANTHROPIC_MODEL_QUICK` | `claude-haiku-5-5` | Anthropic model for short requests. |
+
+If Google retires a model, set `GEMINI_MODEL` to a current one from the [Gemini models list](https://ai.google.dev/gemini-api/docs/models) and redeploy.
 
 ## Tests
 
@@ -92,7 +99,7 @@ npx playwright install chromium
 npm test
 ```
 
-The tests open the real page in Chromium with the site's security headers and run through the main features: building a plan, uploading and reading a PDF, generating and grading a quiz, study sessions, the learning profile, calendar export, backup and restore, and the access code. The AI backend runs for real; only the Anthropic API is replaced by a fake, so no API key is needed. GitHub Actions runs the tests on every push.
+The tests open the real page in Chromium with the site's security headers and run through the main features: building a plan, uploading and reading a PDF, generating and grading a quiz, study sessions, the learning profile, calendar export, backup and restore, and the access code. The AI backend runs for real; only the Gemini and Anthropic APIs are replaced by fakes, so no API key is needed. Separate backend tests check both providers, including error handling for free-tier limits. GitHub Actions runs the tests on every push.
 
 ## Credits
 
