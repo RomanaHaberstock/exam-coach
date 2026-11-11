@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Exam Coach</title>
+<link rel="icon" href="assets/icon.svg" type="image/svg+xml">
+<meta name="theme-color" content="#2F4BD8">
+<meta name="description" content="A study planner that builds your plan backwards from the exam date, quizzes you on your own materials and adapts when you fall behind.">
+<link rel="stylesheet" href="assets/fonts.css">
+<link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+<header class="top"><div class="top-in">
+  <div class="brand"><span>Exam</span> Coach</div>
+  <nav id="nav" aria-label="Sections">
+    <button data-view="dashboard">Today</button>
+    <button data-view="plan">Plan</button>
+    <button data-view="exams">Exams &amp; materials</button>
+    <button data-view="quiz">Quiz</button>
+    <button data-view="you">About you</button>
+    <button data-view="history">Plan changes</button>
+  </nav>
+  <button class="streakchip off" id="streakchip" hidden data-goto="dashboard"></button>
+  <div class="savestate" id="savestate">Loading…</div>
+</div></header>
+<main id="main"><div class="panel"><span class="spinner"></span> Loading your plan…</div></main>
+<div class="timer" id="timer" aria-live="polite"></div>
+<div class="toast" id="toast" hidden></div>
+
+<script src="assets/vendor/pdfjs/pdf.min.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>
