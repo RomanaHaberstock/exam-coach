@@ -61,6 +61,8 @@ function normalize() {
     if (b.mock && (typeof b.mock !== "object" || !Array.isArray(b.mock.tasks))) delete b.mock;
     if (b.mock) b.mock.tasks = b.mock.tasks.filter(x => x && typeof x === "object").map(x => ({ ...x, label: String(x.label ?? ""), got: Math.max(0, +x.got || 0), max: Math.max(0, +x.max || 0) }));
     if (b.mock && b.mock.fx != null && (typeof b.mock.fx !== "object" || Array.isArray(b.mock.fx))) delete b.mock.fx;
+    if (b.practice != null) b.practice = b.practice === true && b.type === "mock";
+    if (b.goals != null) b.goals = Array.isArray(b.goals) ? b.goals.map(Number).filter(n => Number.isInteger(n) && n >= 0 && n < 8) : [];
   }
   if (!Array.isArray(S.archive)) S.archive = [];
   S.archive = S.archive.filter(a => a && typeof a === "object");
@@ -77,7 +79,20 @@ function normExam(e) {
   if (e.review && typeof e.review === "object") e.review.gradeNum = gradeNum(e.review.gradeNum);
   else delete e.review;
   e.topics = e.topics.filter(t => t && typeof t === "object");
+  for (const t of e.topics) { t.goals = cleanGoals(t.goals); t.terms = cleanTerms(t.terms); }
   return cleanPrereqs(e);
+}
+// Per topic from the analysis: learning goals / subtopics in material order, each with where it is
+// in the material ({ text, src }), and key terms. Strings from older data or the AI are accepted too.
+function cleanGoals(g) {
+  const seen = new Set();
+  return (Array.isArray(g) ? g : []).map(x => typeof x === "string" ? { text: x } : x)
+    .filter(x => x && typeof x === "object" && String(x.text ?? "").trim())
+    .map(x => ({ text: String(x.text).replace(/\s+/g, " ").trim().slice(0, 160), src: String(x.src ?? x.pages ?? "").replace(/\s+/g, " ").trim().slice(0, 60) }))
+    .filter(x => { const k = x.text.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; }).slice(0, 8);
+}
+function cleanTerms(a) {
+  return [...new Set((Array.isArray(a) ? a : []).filter(x => typeof x === "string" || typeof x === "number").map(x => String(x).replace(/\s+/g, " ").trim().slice(0, 60)).filter(Boolean))].slice(0, 12);
 }
 // Prerequisite links: t.prereqs = ids of topics this topic builds on (learn them first).
 // Drops unknown ids, self-links and duplicates, then breaks cycles: links the student set by hand
@@ -244,7 +259,8 @@ function learnProgress(t) { const base = Math.round((+t.effortH || 0) * 60); ret
 /* ---------- points per hour ---------- */
 // Share of the exam's points per topic (sums to 100). Best source first: old-exam tasks
 // found by the AI, then the latest mock exam the student scored, then old-exam hits, then weights.
-function lastMock(e) { return S.blocks.filter(b => b.examId === e.id && b.mock && b.mock.tasks.length).sort((a, b) => a.mock.at < b.mock.at ? 1 : -1)[0] || null; }
+// A practice exam (all topics) is weighted by these points itself, so it doesn't feed them back.
+function lastMock(e) { return S.blocks.filter(b => b.examId === e.id && b.mock && b.mock.tasks.length && !b.practice).sort((a, b) => a.mock.at < b.mock.at ? 1 : -1)[0] || null; }
 function topicPoints(e) {
   const T = e.topics, raw = {};
   const fromTasks = list => { for (const x of list) if (topicById(e, x.topicId) && x.max > 0) raw[x.topicId] = (raw[x.topicId] || 0) + x.max; return Object.keys(raw).length; };
@@ -322,8 +338,9 @@ function replan() {
       const weakest = [...e.topics].sort((a, b) => eveRank(e, a) - eveRank(e, b) || b.weight - a.weight).slice(0, 2);
       for (const t of weakest) if (cap[eve] >= 30) place(eve, Math.min(60, cap[eve]), { examId: e.id, topicId: t.id, type: "review", label: `Final review: ${t.name}` });
     }
-    // no new mock once the student has done (or scored) one for this exam
-    const mockDone = keep.some(b => b.examId === e.id && b.type === "mock" && (b.status === "done" || b.mock));
+    // no new mock once the student has done (or scored) one for this exam; a practice exam on all topics
+    // (Practice exam button) doesn't count, so the mock a few days before the exam stays
+    const mockDone = keep.some(b => b.examId === e.id && b.type === "mock" && !b.practice && (b.status === "done" || b.mock));
     let mockDay = null;
     if (!mockDone) for (let d = addDays(e.date, -2); d >= t0 && diffDays(d, e.date) <= 7; d = addDays(d, -1)) if (cap[d] >= 60) { mockDay = d; break; }
     if (mockDay) place(mockDay, Math.min(e.format === "oral" ? 60 : 90, cap[mockDay]), { examId: e.id, type: "mock", label: e.format === "oral" ? "Oral practice: explain every topic out loud" : "Mock exam under exam conditions" });
@@ -331,9 +348,10 @@ function replan() {
     // 2) learning chunks: repair topics first, then by the exam's study mode (see learnOrder)
     const order = learnOrder(e);
     queue[e.id] = [];
+    // `from`: where in the topic's learning time (minutes) the chunk starts, so its blocks get the right goals
     for (const t of order) {
-      let r = remainingLearn(t);
-      while (r > 0) { const m = Math.max(15, Math.min(set.blockMin, r)); r -= m; queue[e.id].push({ topicId: t.id, minutes: m, last: r <= 0 }); }
+      let r = remainingLearn(t), from = needLearn(t) - r;
+      while (r > 0) { const m = Math.max(15, Math.min(set.blockMin, r)); r -= m; queue[e.id].push({ topicId: t.id, minutes: m, last: r <= 0, from }); from += m; }
     }
     // 3) reviews already due
     reviews[e.id] = [];
@@ -372,8 +390,8 @@ function replan() {
       const ch = queue[best.id][0], m = Math.min(ch.minutes, cap[d]);
       if (m < 15) break;
       const t = topicById(best, ch.topicId);
-      place(d, m, { examId: best.id, topicId: ch.topicId, type: "learn", method: t.method || null, label: `Learn: ${t.name}${t.method ? " (" + METHODS[t.method].name.toLowerCase() + ")" : ""}` });
-      ch.minutes -= m;
+      place(d, m, { examId: best.id, topicId: ch.topicId, type: "learn", method: t.method || null, goals: goalSpan(t, ch.from, ch.from + m), label: `Learn: ${t.name}${t.method ? " (" + METHODS[t.method].name.toLowerCase() + ")" : ""}` });
+      ch.minutes -= m; ch.from += m;
       if (ch.minutes <= 0) {
         queue[best.id].shift();
         if (ch.last) {
@@ -385,11 +403,39 @@ function replan() {
     }
   }
   for (const e of active) { const left = sum(queue[e.id], c => c.minutes); if (left > 0) S.shortfall[e.id] = left; }
+  // 5) once all learning of an exam is placed, free days before its mock become exam practice:
+  // a block every other day, topics in turn by exam points (old-exam tasks first), so the last weeks aren't empty
+  for (const e of active) {
+    if (queue[e.id].length) continue;
+    const mine = out.filter(b => b.examId === e.id && b.type === "learn").map(b => b.date).sort();
+    const from = mine.length ? addDays(mine[mine.length - 1], 1) : t0, { pts } = topicPoints(e);
+    const turn = [...e.topics].sort((a, b) => (pts[b.id] || 0) - (pts[a.id] || 0) || e.topics.indexOf(a) - e.topics.indexOf(b));
+    let k = 0, lastP = null;
+    for (const d of days) {
+      if (d < from || d > learnEnd[e.id] || d >= addDays(e.date, -1) || cap[d] < 45 || !turn.length || (lastP && diffDays(lastP, d) < 2)) continue;
+      if (out.some(b => b.date === d && b.examId === e.id && b.type === "mock")) continue;
+      const t = turn[k++ % turn.length];
+      place(d, Math.min(60, cap[d]), { examId: e.id, topicId: t.id, type: "review", practice: true, label: `Exam practice: ${t.name}` }); lastP = d;
+    }
+  }
   S.blocks = keep.concat(out).sort((a, b) => (a.date + a.start) < (b.date + b.start) ? -1 : 1);
 }
 // Who gets the final review on the eve: topics behind plan first (most behind first), then
 // not quizzed or on track (by weight), clearly strong ones last. On-track and not-learned-yet
 // results rank like an unquizzed topic, so a quiz that changes nothing doesn't move the eve slot.
+// Indices of the topic's goals a learning chunk covers: the topic's learning time is shared out
+// evenly over its goals in order; a chunk gets every goal it covers a fair part of.
+function goalSpan(t, a, b) {
+  const G = (t.goals || []).length, need = Math.max(1, needLearn(t));
+  if (!G) return [];
+  const out = [];
+  for (let g = 0; g < G; g++) {
+    const s = g * need / G, f = (g + 1) * need / G, ov = Math.min(b, f) - Math.max(a, s);
+    if (ov > 0 && ov >= Math.min(10, (f - s) / 2)) out.push(g);
+  }
+  if (!out.length) out.push(Math.min(G - 1, Math.max(0, Math.floor((a + b) / 2 * G / need))));
+  return out;
+}
 function eveRank(e, t) {
   if (t.mastery == null) return 0;
   const gap = t.mastery - Math.round(e.target * learnProgress(t));
@@ -540,7 +586,7 @@ function applyMockResult(b, tasks) {
     Object.keys(per).length ? "" : "No task was linked to a topic.",
     below.length || above.length ? "" : keepText(ch).trim()
   ].filter(Boolean).join(" ");
-  return commit({ log: { examId: e.id, kind: "mock", title: `${e.subject}: mock exam ${edit ? "corrected to " : ""}${fmtPts(got)}/${fmtPts(max)} points (${pct}%)`,
+  return commit({ log: { examId: e.id, kind: "mock", title: `${e.subject}: ${b.practice ? "practice exam (all topics)" : "mock exam"} ${edit ? "corrected to " : ""}${fmtPts(got)}/${fmtPts(max)} points (${pct}%)`,
     detail: ch => (edit ? "You changed the mock exam results, so the earlier changes were taken back first. " : "") + detail(ch), score: pct } });
 }
 // Takes back what a scored mock changed: its extra study time, and mastery and repair review
@@ -678,7 +724,7 @@ function mergeTopics(results, sharedOld) {
     const k = normName(t.name); if (!k) continue;
     const hits = Math.max(0, +t.oldExamHits || 0), eff = Math.max(0.5, +t.effortH || 3), w = +t.weight || 3;
     let g = by.get(k);
-    if (!g) { g = { name: t.name, summary: t.summary || "", weight: w, oldExamHits: hits, learnH: 0, oldH: 0, sources: [], buildsOn: new Map() }; by.set(k, g); }
+    if (!g) { g = { name: t.name, summary: t.summary || "", weight: w, oldExamHits: hits, learnH: 0, oldH: 0, sources: [], buildsOn: new Map(), goals: [], terms: [] }; by.set(k, g); }
     else {
       g.weight = Math.max(g.weight, w);
       g.oldExamHits = sharedOld ? Math.max(g.oldExamHits, hits) : g.oldExamHits + hits;
@@ -687,8 +733,11 @@ function mergeTopics(results, sharedOld) {
     if (r.oldOnly) g.oldH = Math.max(g.oldH, eff); else g.learnH += eff;
     if (t.sources && !g.sources.includes(String(t.sources))) g.sources.push(String(t.sources));
     for (const n of buildsOnOf(t)) if (normName(n) && !g.buildsOn.has(normName(n))) g.buildsOn.set(normName(n), n);
+    // goals and key terms of all parts, in the order of the material (cleanGoals/cleanTerms drop repeats)
+    if (!r.oldOnly || !g.goals.length) g.goals.push(...cleanGoals(t.goals));
+    g.terms.push(...cleanTerms(t.terms));
   }
-  let list = [...by.values()].map((g, i) => ({ i, name: g.name, summary: g.summary, weight: g.weight, oldExamHits: g.oldExamHits, effortH: g.learnH || g.oldH, sources: g.sources.join("; "), buildsOn: [...g.buildsOn.values()] }));
+  let list = [...by.values()].map((g, i) => ({ i, name: g.name, summary: g.summary, weight: g.weight, oldExamHits: g.oldExamHits, effortH: g.learnH || g.oldH, sources: g.sources.join("; "), buildsOn: [...g.buildsOn.values()], goals: cleanGoals(g.goals), terms: cleanTerms(g.terms) }));
   if (list.length > 14) {
     const keep = new Set([...list].sort((a, b) => b.weight - a.weight || b.oldExamHits - a.oldExamHits || b.effortH - a.effortH).slice(0, 14).map(t => t.i));
     list = list.filter(t => keep.has(t.i));
@@ -827,12 +876,12 @@ ${part.known.length ? `Topics found in earlier parts: ${part.known.join("; ")}. 
 
 Tasks:
 1. Split the content${multi ? " of this part" : ""} into ${multi ? "2–8" : "5–12"} study topics in a sensible learning order.
-2. For each topic give: "name" (short, in the language of the material), "summary" (one sentence), "weight" (1–5: importance for the exam, based mainly on how often it appears in the old exams, secondarily on how much space it takes in the material), "oldExamHits" (how many old-exam tasks touch it; 0 if no old exams), "effortH" (realistic hours for a student to learn ${multi ? "the content of this part on it" : "it properly from the material"}, 1–12, may use .5 steps), "sources" (where it is, e.g. "Script p. 12–20; Slides 4–9"), "buildsOn" (names of the other topics a student must understand before this one${multi && part.known.length ? ", from this part or the topics found in earlier parts" : ""}, using exactly their names; [] if none).
+2. For each topic give: "name" (short, in the language of the material), "summary" (one sentence), "weight" (1–5: importance for the exam, based mainly on how often it appears in the old exams, secondarily on how much space it takes in the material), "oldExamHits" (how many old-exam tasks touch it; 0 if no old exams), "effortH" (realistic hours for a student to learn ${multi ? "the content of this part on it" : "it properly from the material"}, 1–12, may use .5 steps), "sources" (where it is, e.g. "Script p. 12–20; Slides 4–9"), "buildsOn" (names of the other topics a student must understand before this one${multi && part.known.length ? ", from this part or the topics found in earlier parts" : ""}, using exactly their names; [] if none), "goals" (3–6 subtopics${multi ? " in this part" : ""} in the order a student should work through them, each with "text" (what the student must be able to do, concrete, e.g. "Compute a 95% confidence interval for a mean") and "pages" (where it is, with the material's kind and the page markers, e.g. "Slides p. 12–14")), "terms" (3–8 key terms of the topic, as written in the material).
 3. "style": 2–3 sentences in English describing the old exams' question style (task types, typical calculations, point distribution). If there are no old exams, describe what to expect from the material.
 4. "tasks": the tasks of the most recent old exam${multi && !part.shared ? " that are in this part" : ""}, in order, each with "label" (e.g. "Task 1a", as printed in the exam), "topic" (exactly one of your topic names${multi && part.known.length ? " or of the topics found in earlier parts" : ""}) and "points" (points possible; give [] if there are no old exams${multi ? " in this part" : ""} or the points are not shown).
 
 Reply with only JSON in this shape:
-{"topics":[{"name":"","summary":"","weight":3,"oldExamHits":0,"effortH":4,"sources":"","buildsOn":[]}],"style":"","tasks":[{"label":"","topic":"","points":10}]}
+{"topics":[{"name":"","summary":"","weight":3,"oldExamHits":0,"effortH":4,"sources":"","buildsOn":[],"goals":[{"text":"","pages":""}],"terms":[""]}],"style":"","tasks":[{"label":"","topic":"","points":10}]}
 
 MATERIALS:
 ${digest}`;
@@ -924,7 +973,8 @@ async function analyzeMaterials(e) {
   const mats = all.filter(m => !looksEmpty(m.text, m.pages));
   const skipped = all.filter(m => looksEmpty(m.text, m.pages)).map(m => m.name);
   if (!mats.length) return toast(noTextMsg(skipped.length ? skipped : ["These files"]));
-  busy.analyze = e.id; busy.progress = null; render();
+  const first = !e.topics.length;
+  busy.analyze = e.id; busy.progress = null; busy.anErr = null; render();
   aiCtl = new AbortController();
   try {
     let r;
@@ -943,7 +993,10 @@ async function analyzeMaterials(e) {
       return Object.assign(prev || { id: uid(), mastery: null, extraMin: 0, weakConcepts: [], quizzes: [], reviewDue: null, prereqs: [] }, {
         name: String(t.name).slice(0, 80), summary: String(t.summary || "").slice(0, 240),
         weight: Math.min(5, Math.max(1, Math.round(+t.weight || 3))), oldExamHits: Math.max(0, Math.round(+t.oldExamHits || 0)),
-        effortH: Math.min(20, Math.max(0.5, Math.round((+t.effortH || 3) * 2) / 2)), sources: String(t.sources || "").slice(0, 160)
+        effortH: Math.min(20, Math.max(0.5, Math.round((+t.effortH || 3) * 2) / 2)), sources: String(t.sources || "").slice(0, 160),
+        // a re-analysis without goals keeps the ones the topic had
+        goals: cleanGoals(t.goals).length ? cleanGoals(t.goals) : prev ? cleanGoals(prev.goals) : [],
+        terms: cleanTerms(t.terms).length ? cleanTerms(t.terms) : prev ? cleanTerms(prev.terms) : []
       });
     });
     e.style = r.style.slice(0, 600);
@@ -955,12 +1008,20 @@ async function analyzeMaterials(e) {
     e.oldTasks = r.tasks.slice(0, 40).map((x, i) => ({ label: String(x.label || `Task ${i + 1}`).slice(0, 60),
       topicId: [...x.topics].reverse().map(n => byName[normName(n)]).find(Boolean) || null, points: Math.min(200, Math.round(+x.points * 2) / 2) }));
     busy.analyze = null; busy.progress = null;
-    commit({ log: { examId: e.id, kind: "setup", title: `${e.subject}: ${e.topics.length} topics from your materials`, detail: `${r.parts > 1 ? `The AI read your materials in ${r.parts} parts. ` : ""}Total estimated effort ${sum(e.topics, t => t.effortH)} h.${links ? ` The AI found ${links} ${links > 1 ? "links" : "link"} between topics (what builds on what), so those are learned in that order.` : ""} The plan was rebuilt backwards from ${fmtDay(e.date)}.` } });
-    toast("Topics created and plan rebuilt." + (skipped.length ? ` Skipped (no readable text): ${skipped.join(", ")}.` : ""));
+    const goals = sum(e.topics, t => (t.goals || []).length);
+    // The first analysis of an exam opens the plan right away (it was built by commit()).
+    if (first && view === "exams" && selExam === e.id) { view = "plan"; try { history.replaceState(null, "", "#plan"); } catch (x) {} }
+    commit({ log: { examId: e.id, kind: "setup", title: `${e.subject}: ${e.topics.length} topics from your materials`, detail: `${r.parts > 1 ? `The AI read your materials in ${r.parts} parts. ` : ""}Total estimated effort ${sum(e.topics, t => t.effortH)} h.${goals ? ` It also found ${goals} subtopics with their pages, so each study block says what to work through.` : ""}${links ? ` The AI found ${links} ${links > 1 ? "links" : "link"} between topics (what builds on what), so those are learned in that order.` : ""} The plan was rebuilt backwards from ${fmtDay(e.date)}.` } });
+    if (view === "plan") window.scrollTo(0, 0);
+    toast((first && view === "plan" ? "Your study plan is ready." : "Topics created and plan rebuilt.") + (skipped.length ? ` Skipped (no readable text): ${skipped.join(", ")}.` : ""));
   } catch (err) {
-    busy.analyze = null; busy.progress = null; render();
-    if (err.code === "prompt_too_large") toast("The materials are too large for the AI, even in smaller parts. Remove a file and try again.");
-    else if (err.code !== "cancelled") toast(aiError(err) + (err.kept ? ` The AI already read ${err.kept.done > 1 ? `parts 1–${err.kept.done}` : "part 1"} of ${err.kept.n}. Press Analyse again to continue with part ${err.kept.done + 1}.` : ""));
+    busy.analyze = null; busy.progress = null;
+    // The message stays on the page (not only in a toast), so it's clear why there is no plan yet.
+    const msg = err.code === "prompt_too_large" ? "The materials are too large for the AI, even in smaller parts. Remove a file and try again."
+      : err.code === "cancelled" ? "" : aiError(err) + (err.kept ? ` The AI already read ${err.kept.done > 1 ? `parts 1–${err.kept.done}` : "part 1"} of ${err.kept.n}. Press Analyse again to continue with part ${err.kept.done + 1}.` : "");
+    busy.anErr = msg ? { examId: e.id, msg } : null;
+    render();
+    if (msg) toast(msg);
   }
 }
 async function generateQuiz(e, t, n) {
@@ -990,6 +1051,25 @@ Reply with only JSON:
     quiz.questions = qs; quiz.phase = "answer"; render();
   } catch (err) { quiz.phase = "error"; quiz.error = aiError(err); render(); }
 }
+// Grades written answers with the AI. Shared by quizzes and the practice exam (all topics), so
+// every written answer goes through the same grading. `results[i] === null` marks the answers to
+// grade; they are filled in place (0 points if the AI fails, with a toast).
+async function gradeOpenAnswers(questions, answers, results) {
+  const open = questions.map((q, i) => ({ q, i })).filter(x => results[x.i] === null);
+  if (!open.length) return results;
+  try {
+    if (!sample) throw { code: "not_granted" };
+    aiCtl = new AbortController();
+    const prompt = `Grade a student's answers to exam practice questions. Be strict but fair and give partial credit. Write feedback in English, 1–2 sentences, saying what was right and what was missing.
+${open.map(({ q, i }) => `#${i}\nQuestion: ${q.question}\nModel answer: ${q.modelAnswer}\nConcept: ${q.concept}\nStudent answer: ${answers[i]}`).join("\n\n")}
+
+Reply with only JSON: [{"i":0,"score":0.5,"feedback":"","missed":"concept the student did not master, or empty"}]`;
+    const res = await sample.json(prompt, { signal: aiCtl.signal, cache: false, modelTier: "default" });
+    for (const r of (Array.isArray(res) ? res : [])) { const i = +r.i; if (results[i] === null) results[i] = { score: Math.min(1, Math.max(0, +r.score || 0)), feedback: String(r.feedback || ""), missed: String(r.missed || "") }; }
+  } catch (err) { toast(aiError(err) + " Open answers were not graded."); }
+  for (let i = 0; i < results.length; i++) if (results[i] === null) results[i] = { score: 0, feedback: "Could not be graded; counted as 0.", missed: "" };
+  return results;
+}
 async function gradeQuiz() {
   const e = examById(quiz.examId), t = topicById(e, quiz.topicId);
   quiz.phase = "grading"; render();
@@ -999,20 +1079,7 @@ async function gradeQuiz() {
     if (!a || !String(a).trim()) return { score: 0, feedback: "No answer given.", missed: q.concept };
     return null;
   });
-  const open = quiz.questions.map((q, i) => ({ q, i })).filter(x => results[x.i] === null);
-  if (open.length) {
-    try {
-      if (!sample) throw { code: "not_granted" };
-      aiCtl = new AbortController();
-      const prompt = `Grade a student's answers to exam practice questions. Be strict but fair and give partial credit. Write feedback in English, 1–2 sentences, saying what was right and what was missing.
-${open.map(({ q, i }) => `#${i}\nQuestion: ${q.question}\nModel answer: ${q.modelAnswer}\nConcept: ${q.concept}\nStudent answer: ${quiz.answers[i]}`).join("\n\n")}
-
-Reply with only JSON: [{"i":0,"score":0.5,"feedback":"","missed":"concept the student did not master, or empty"}]`;
-      const res = await sample.json(prompt, { signal: aiCtl.signal, cache: false, modelTier: "default" });
-      for (const r of (Array.isArray(res) ? res : [])) { const i = +r.i; if (results[i] === null) results[i] = { score: Math.min(1, Math.max(0, +r.score || 0)), feedback: String(r.feedback || ""), missed: String(r.missed || "") }; }
-    } catch (err) { toast(aiError(err) + " Open answers were not graded."); }
-    for (let i = 0; i < results.length; i++) if (results[i] === null) results[i] = { score: 0, feedback: "Could not be graded; counted as 0.", missed: "" };
-  }
+  await gradeOpenAnswers(quiz.questions, quiz.answers, results);
   quiz.results = results;
   quiz.score = Math.round(100 * sum(results, r => r.score) / results.length);
   quiz.phase = "done";
@@ -1043,7 +1110,7 @@ function icsText() {
     slot[b.date] = (slot[b.date] || 0) + 1;
     const end = fromMin(toMin(b.start) + b.minutes);
     L.push("BEGIN:VEVENT", `UID:examcoach-${b.date}-${slot[b.date]}@exam-coach`, `DTSTAMP:${stamp}`, `DTSTART:${utc(b.date, b.start)}`, `DTEND:${utc(b.date, end)}`,
-      `SUMMARY:${esc2(`${e ? e.subject + " · " : ""}${b.label}`)}`, `DESCRIPTION:${esc2([t && t.sources ? "Where: " + t.sources : "", t && t.weakConcepts && t.weakConcepts.length ? "Focus: " + t.weakConcepts.join(", ") : "", "Planned by Exam Coach"].filter(Boolean).join("\n"))}`, "END:VEVENT");
+      `SUMMARY:${esc2(`${e ? e.subject + " · " : ""}${b.label}`)}`, `DESCRIPTION:${esc2([detailText(blockDetail(b)), t && t.sources ? "Where: " + t.sources : "", t && t.weakConcepts && t.weakConcepts.length ? "Focus: " + t.weakConcepts.join(", ") : "", "Planned by Exam Coach"].filter(Boolean).join("\n"))}`, "END:VEVENT");
   }
   for (const e of S.exams.filter(e => e.date >= t0)) {
     const d = e.date.replace(/-/g, "");
@@ -1058,10 +1125,26 @@ function exportIcs() {
 }
 
 /* ---------- example ---------- */
-function mkTopic(name, weight, effortH, summary = "") { return { id: uid(), name, summary, weight, effortH, sources: "", oldExamHits: 0, mastery: null, extraMin: 0, weakConcepts: [], quizzes: [], reviewDue: null, prereqs: [] }; }
+function mkTopic(name, weight, effortH, summary = "") { return { id: uid(), name, summary, weight, effortH, sources: "", oldExamHits: 0, mastery: null, extraMin: 0, weakConcepts: [], quizzes: [], reviewDue: null, prereqs: [], goals: [], terms: [] }; }
 // Example topics in the order of the material: [name, weight, effort h, names of the topics it builds on]
+// Subtopics and key terms of the example topics, so the example plan shows what each block covers.
+const EXAMPLE_GOALS = {
+  "Descriptive statistics": [["Compute mean, median and standard deviation", "Script p. 3–8"], ["Read box plots and histograms", "Script p. 9–12"]],
+  "Probability basics": [["Use the addition and multiplication rules", "Script p. 14–18"], ["Compute conditional probabilities", "Script p. 19–22"], ["Apply Bayes' theorem", "Script p. 23–26"]],
+  "Random variables & distributions": [["Expected value and variance of a random variable", "Script p. 28–32"], ["Binomial distribution", "Script p. 33–37"], ["Poisson distribution", "Script p. 38–41"]],
+  "Normal distribution & CLT": [["Standardise and read the z-table", "Script p. 43–47"], ["State and apply the central limit theorem", "Script p. 48–52"]],
+  "Confidence intervals": [["Confidence interval for a mean", "Script p. 54–58"], ["Choose the sample size for a given width", "Script p. 59–61"]],
+  "Hypothesis tests": [["Set up H0 and H1 and pick the test", "Script p. 63–66"], ["Compute and read a p-value", "Script p. 67–71"], ["Type I and Type II errors", "Script p. 72–74"]],
+  "Linear regression": [["Fit a least-squares line", "Script p. 76–80"], ["Interpret slope and R squared", "Script p. 81–84"]],
+  "Supply & demand": [["Find the market equilibrium", "Slides 3–9"], ["Shifts of supply and demand curves", "Slides 10–15"]],
+  "Elasticities": [["Price elasticity of demand", "Slides 17–22"], ["Income and cross elasticity", "Slides 23–26"]],
+  "Consumer theory": [["Budget line and indifference curves", "Slides 28–34"], ["The household optimum", "Slides 35–40"]],
+  "Production & costs": [["Production functions", "Slides 42–46"], ["Short- and long-run cost curves", "Slides 47–53"]],
+  "Market forms": [["Perfect competition", "Slides 55–60"], ["Monopoly pricing", "Slides 61–66"], ["Oligopoly basics", "Slides 67–70"]],
+  "Market failure": [["Externalities and Pigou taxes", "Slides 72–77"], ["Public goods", "Slides 78–81"]]
+};
 function exampleTopics(list) {
-  const topics = list.map(([n, w, h]) => mkTopic(n, w, h)), id = Object.fromEntries(topics.map(t => [t.name, t.id]));
+  const topics = list.map(([n, w, h]) => Object.assign(mkTopic(n, w, h), { goals: (EXAMPLE_GOALS[n] || []).map(([text, src]) => ({ text, src })) })), id = Object.fromEntries(topics.map(t => [t.name, t.id]));
   list.forEach(([, , , pre = []], i) => { topics[i].prereqs = pre.map(n => id[n]); });
   return topics;
 }
@@ -1697,7 +1780,7 @@ const ST = {};
 let studyId = null;
 function studyBase(e, t, ctx) {
   return `Exam: "${e.subject}" (${e.format}). Topic: "${t.name}"${t.summary ? " — " + t.summary : ""}.
-${e.style ? "Old-exam style: " + e.style + "\n" : ""}${t.weakConcepts && t.weakConcepts.length ? "The student struggles with: " + t.weakConcepts.join("; ") + ". Cover these.\n" : ""}${ctx ? "Course material excerpts (source in brackets):\n---\n" + ctx + "\n---\n" : "No course material was uploaded; use standard university-level content.\n"}Write in the language of the course material (English if none).
+${e.style ? "Old-exam style: " + e.style + "\n" : ""}${t.goals && t.goals.length ? "Subtopics in learning order: " + t.goals.map(g => g.text + (g.src ? ` (${g.src})` : "")).join("; ") + "\n" : ""}${t.weakConcepts && t.weakConcepts.length ? "The student struggles with: " + t.weakConcepts.join("; ") + ". Cover these.\n" : ""}${ctx ? "Course material excerpts (source in brackets):\n---\n" + ctx + "\n---\n" : "No course material was uploaded; use standard university-level content.\n"}Write in the language of the course material (English if none).
 `;
 }
 async function genStudy(b) {
@@ -1994,6 +2077,7 @@ function vStudy() {
     <div class="section-head"><div class="stack" style="gap:4px; min-width:0"><span class="label">${esc(e.subject)} · ${fmtDay(b.date)} ${esc(b.start)} · ${b.minutes} min</span><h2>${esc(t ? t.name : b.label)}</h2></div><button class="btn sm ghost" data-view="dashboard">Back</button></div>
     <div class="row"><span class="chip method">${M.name}</span>${light ? `<span class="chip review">Lighter session</span><span class="small muted">Flashcards and ${lightFocusMin()} min focus sessions today, because your energy is low.</span>` : `<span class="small muted">${esc(t && t.methodWhy || "")}</span>`}</div>
     <p style="max-width:70ch">${M.how}</p>
+    ${b.status === "planned" ? detailHtml(blockDetail(b)) : ""}
     ${t && t.sources ? `<p class="small"><span class="label">Where</span> ${esc(t.sources)}</p>` : ""}
     <div class="row">${b.status === "planned" ? `<button class="btn" data-act="focus" data-id="${b.id}">Start focus timer</button><button class="btn" data-act="s-done">Mark block done</button>` : `<span class="chip good">${b.status}</span>`}</div>
   </section>
@@ -2128,7 +2212,7 @@ function readiness(e) {
   return { score, quizzed: quizzed.length, total: e.topics.length, learned: need ? Math.round(100 * done / need) : 0 };
 }
 function heatClass(t, target) { if (t.mastery == null) return "h-none"; if (t.mastery >= target) return "h-good"; if (t.mastery >= target - 20) return "h-warn"; return "h-bad"; }
-function blockRow(b, { actions = true, showDate = false } = {}) {
+function blockRow(b, { actions = true, showDate = false, detail = true } = {}) {
   const e = examById(b.examId), t = topicById(e, b.topicId);
   const TYPES = { learn: "Learn", review: "Review", mock: "Mock", check: "Check" };
   const type = Object.hasOwn(TYPES, b.type) ? b.type : "review", typ = TYPES[type];
@@ -2149,22 +2233,159 @@ function blockRow(b, { actions = true, showDate = false } = {}) {
   }
   return `<div class="block ${status}" style="--ec:${e ? examColor(e) : "var(--line)"}">
     <div class="time">${showDate ? fmtDay(b.date) + "<br>" : ""}${esc(b.start)}<br><span class="small">${minutes} min</span></div>
-    <div class="what"><b>${esc(b.label)}</b><div class="meta"><span class="chip ${type}">${typ}</span>${b.method && Object.hasOwn(METHODS, b.method) ? `<span class="chip method" title="${esc(t && t.methodWhy || "")}">${METHODS[b.method].name}</span>` : ""}${e ? esc(e.subject) : ""}${b.focusMin ? ` · <span class="mono">${Math.round(numOr(b.focusMin, 0))}/${minutes} min focused</span>` : ""}${t && t.sources ? ` · ${esc(t.sources)}` : ""}</div></div>
+    <div class="what"><b>${esc(b.label)}</b><div class="meta"><span class="chip ${type}">${typ}</span>${b.method && Object.hasOwn(METHODS, b.method) ? `<span class="chip method" title="${esc(t && t.methodWhy || "")}">${METHODS[b.method].name}</span>` : ""}${e ? esc(e.subject) : ""}${b.focusMin ? ` · <span class="mono">${Math.round(numOr(b.focusMin, 0))}/${minutes} min focused</span>` : ""}${t && t.sources && !(detail && status === "planned") ? ` · ${esc(t.sources)}` : ""}</div>${detail && status === "planned" ? detailHtml(blockDetail(b)) : ""}</div>
     <div class="acts">${acts}</div></div>`;
+}
+// What a block is about, concretely: which goals/pages it covers, what to do and what you should
+// have at the end. Built from the topic's goals and key terms (from the analysis), the study method,
+// the old-exam tasks and the weak concepts from quizzes. Returns { covers: [{ text, src }], todo, result }.
+const DO = {
+  practice: ["Solve exam-style problems on this before you look at any solution. Then redo the ones you got wrong without help.", "Your own written solutions, with every mistake redone."],
+  worked: ["Go through a solved example step by step and say why each step is done. Then solve a similar problem alone.", "One problem solved on your own, without looking."],
+  flashcards: ["Make flashcards for the key ideas and answer each one before you flip it.", "A card for every key term; repeat the missed ones until you know them."],
+  explain: ["Read the pages once, close them, then explain the content in writing as if to a classmate who missed the lecture.", "A half-page explanation in your own words; the AI points out what's missing."],
+  summary: ["Read the pages and write down the key points in your own words.", "A one-page summary of these pages."]
+};
+const list3 = (a, n = 3) => a.slice(0, n).join(", ") + (a.length > n ? " …" : "");
+function reviewKind(b) {
+  if (b.practice) return "practice";
+  const m = /^(Final review|Retention check|Spaced review|Repair review|Review \+ quiz|Exam practice)/.exec(String(b.label || ""));
+  return m ? { "Final review": "final", "Retention check": "check", "Spaced review": "spaced", "Repair review": "repair", "Review + quiz": "quiz", "Exam practice": "practice" }[m[1]] : b.type;
+}
+function oldTasksOf(e, t) { return e && t ? e.oldTasks.filter(x => x.topicId === t.id) : []; }
+const taskList = tasks => tasks.map(x => `${x.label} (${fmtPts(+x.points || +x.max || 0)} points)`);
+function blockDetail(b) {
+  const e = examById(b.examId), t = topicById(e, b.topicId);
+  if (b.type === "mock") {
+    if (b.practice) return { covers: [], todo: "A practice exam on all topics, written by the AI.", result: "Your points per topic; the plan reacts to them." };
+    const tasks = e ? e.oldTasks : [];
+    return { covers: [],
+      todo: e && e.format === "oral" ? `Explain every topic out loud in about ${b.minutes} min, as in the oral exam.`
+        : tasks.length ? `Do the most recent old exam in ${b.minutes} min, no notes: ${list3(taskList(tasks), 6)}.` : `Do a full practice exam in ${b.minutes} min, no notes. Use "Practice exam (all topics)" to get one from the AI.`,
+      result: "Your points per task. Enter them here so the plan can react." };
+  }
+  if (!t) return null;
+  const goals = t.goals || [], terms = t.terms || [], weak = t.weakConcepts || [], tasks = oldTasksOf(e, t);
+  const where = t.sources ? ` (${t.sources})` : "";
+  if (b.type === "learn") {
+    const covers = (Array.isArray(b.goals) && b.goals.length ? b.goals.map(i => goals[i]).filter(Boolean) : []);
+    const m = Object.hasOwn(DO, b.method) ? b.method : "summary";
+    const last = !S.blocks.some(x => x !== b && x.topicId === b.topicId && x.type === "learn" && x.status === "planned" && (x.date + x.start) > (b.date + b.start));
+    let todo = DO[m][0], result = DO[m][1];
+    if (!covers.length) todo += goals.length ? "" : ` Material: ${t.sources || "your notes on this topic"}.`;
+    if (m === "flashcards" && terms.length) todo = `Make flashcards for the key terms (${list3(terms, 6)}) and answer each one before you flip it.`;
+    if (m === "practice" && tasks.length) result = `Your own solutions, including old-exam ${list3(tasks.map(x => x.label), 2)}; every mistake redone.`;
+    if (last) result += tasks.length && m !== "practice" ? ` Then solve old-exam ${list3(tasks.map(x => x.label), 2)} and take the quiz on ${t.name}.` : ` Then take the quiz on ${t.name}.`;
+    return { covers, todo, result, terms: m === "flashcards" ? [] : terms };
+  }
+  const k = reviewKind(b), names = goals.map(g => g.text);
+  if (k === "check") return { covers: [], todo: "No notes: answer a short quiz from memory.", result: `Your retention score after 2 days; it shows the coach how well ${t.method && METHODS[t.method] ? METHODS[t.method].name.toLowerCase() : "your study method"} works for you.` };
+  if (k === "repair") return { covers: [], todo: weak.length ? `Go back to what you got wrong: ${list3(weak, 4)}. Re-read those parts${where}.` : `Re-read the parts you found hard${where}.`, result: "Redo the questions you missed, then a quiz to see if it's fixed." };
+  if (k === "final") return { covers: [], todo: `Go over your summary or cards for ${t.name}${weak.length ? `, mainly ${list3(weak)}` : names.length ? `: ${list3(names)}` : ""}. No new material.`, result: tasks.length ? `Redo old-exam ${list3(tasks.map(x => x.label), 2)} once more.` : "A short list of what you still mix up, to read once more before the exam." };
+  if (k === "practice") return { covers: [], todo: tasks.length ? `Solve old-exam ${list3(taskList(tasks), 3)} with a timer, then check against the material${where}.` : `Answer exam-style questions on ${names.length ? list3(names) : t.name} with a timer: take a quiz, then redo what you got wrong.`, result: "Your solutions checked; anything you got wrong goes on your list for the final review." };
+  if (k === "spaced") return { covers: [], todo: `From memory, write down what you know about ${names.length ? list3(names) : t.name}. Then check it against the material${where}.`, result: "What you had forgotten, marked, and a short quiz." };
+  return { covers: [], todo: `Go over ${names.length ? list3(names) : t.name}${where}${weak.length ? `, mainly ${list3(weak)}` : ""}.`, result: `A quiz at or above your target of ${e.target}%.` };
+}
+function detailHtml(d) {
+  if (!d) return "";
+  return `<div class="detail">${d.covers.length ? `<div><span class="label">Covers</span><ul>${d.covers.map(g => `<li>${esc(g.text)}${g.src ? ` <span class="muted">· ${esc(g.src)}</span>` : ""}</li>`).join("")}</ul></div>` : ""}
+    <div><span class="label">Do</span> ${esc(d.todo)}</div>${d.terms && d.terms.length ? `<div><span class="label">Key terms</span> ${esc(list3(d.terms, 8))}</div>` : ""}<div><span class="label">Result</span> ${esc(d.result)}</div></div>`;
+}
+const detailText = d => d ? [d.covers.length ? "Covers: " + d.covers.map(g => g.text + (g.src ? ` (${g.src})` : "")).join("; ") : "", "Do: " + d.todo, "Result: " + d.result].filter(Boolean).join("\n") : "";
+// Short note on what this does that a one-off chatbot plan doesn't (empty state and Plan page).
+function chatbotNote() {
+  return `<details class="small" id="why"><summary>Why not just ask a chatbot for a plan?</summary>
+    <p class="muted" style="max-width:70ch">A chatbot writes a plan once and then forgets it. Exam Coach keeps your plan and your results. After every quiz it compares your score with where you should be by now and changes the plan by itself (see Plan changes). It puts spaced reviews and 2-day retention checks at the right time, and it measures which study methods work for you instead of guessing.</p></details>`;
 }
 function vEmpty() {
   return `<section class="panel hero">
     <p class="label">Exam Coach</p>
     <h1>Upload your materials, set the exam date, and get a study plan that <mark>adjusts to your quiz results</mark>.</h1>
     <ol class="steps">
-      <li><b>Add exams and materials</b><span class="muted small">Scripts, slides and old exams as PDF. The AI finds the topics and how often each comes up in old exams.</span></li>
-      <li><b>Get a backwards plan</b><span class="muted small">Final review the evening before, a mock exam before that, learning and spaced reviews spread over the days you have.</span></li>
+      <li><b>Add your exam and its date</b><span class="muted small">One exam at a time. You can add more later.</span></li>
+      <li><b>Upload scripts, slides and old exams</b><span class="muted small">PDF, TXT or MD. The AI finds the topics, their subtopics with page numbers, and how often each comes up in old exams.</span></li>
+      <li><b>Get your plan right away</b><span class="muted small">Week by week, and for each study block: which pages, what to do and what you should have at the end.</span></li>
       <li><b>Quiz yourself after each block</b><span class="muted small">If you score below where the plan expects you to be, it adds study time and moves blocks around, and tells you why.</span></li>
     </ol>
     <div class="row"><button class="btn primary" data-act="new-exam">Add your first exam</button><button class="btn" data-act="example">Try it with example exams</button></div>
     ${S.archive.length ? `<p class="small">Welcome back. Your learning profile from ${S.archive.length === 1 ? "last semester" : "earlier semesters"} is kept, so your new plan starts from what already worked for you.</p>` : ""}
     <p class="small muted">Your plan and materials are saved in this browser only. Nobody else can see them. Download a backup under Plan if you want to move to another device.</p>
+    ${chatbotNote()}
   </section>`;
+}
+// Setup path for an exam that has no plan yet: one step at a time, one primary button for the next step.
+function setupSteps(e) {
+  const mats = e.materials.filter(m => !m.empty).length, named = e.subject !== "New exam", has = e.topics.length > 0;
+  const planned = S.blocks.some(b => b.examId === e.id && b.status === "planned");
+  const left = diffDays(today(), e.date);
+  const steps = [
+    { done: named && left > 0, title: "Name the exam and check its date", text: left > 0 ? `Exam on ${fmtLong(e.date)}, in ${left} day${left === 1 ? "" : "s"}. Change the date below if that's not right.` : "The exam date is today or already past. Set the real date below.", btn: `<button class="btn sm {p}" data-act="focus-field" data-f="${named ? "f-date" : "f-subject"}">${named ? "Set the date" : "Name the exam"}</button>` },
+    { done: mats > 0, title: "Upload your materials", text: "Scripts, slides and old exams (pick “Old exams” for those, so the plan knows what counts most).", btn: `<label class="btn sm {p}" for="mat-file">Choose files</label>` },
+    { done: has, title: "Let the AI find the topics", text: "It reads everything and makes topics with subtopics, pages and key terms. Long materials are read in parts. Or add topics by hand below.", btn: `<button class="btn sm {p}" data-act="analyze" ${mats && sample && busy.analyze !== e.id ? "" : "disabled"}>Analyze materials</button>` },
+    { done: planned, title: "Get your study plan", text: has ? "The plan is built as soon as there are topics." : "Appears here as soon as there are topics.", btn: `<button class="btn sm {p}" data-view="plan" ${has ? "" : "disabled"}>See your study plan</button>` }
+  ];
+  const next = steps.findIndex(x => !x.done);
+  return `<section class="panel stack" id="setup"><h2>${next < 0 ? "Your plan is ready" : "Get your study plan in 4 steps"}</h2><ol class="setup">${steps.map((x, i) => `<li class="${x.done ? "done" : i === next ? "next" : ""}"><div><b>${x.done ? "✓ " : ""}${x.title}</b><span class="small muted">${x.text}</span></div>${x.done && i < 3 ? "" : x.btn.replace("{p}", i === next || (next < 0 && i === 3) ? "primary" : "")}</li>`).join("")}</ol></section>`;
+}
+// The block to do now: the first open block today (or the next one), with what to do and one button.
+function nowCard() {
+  const t0 = today(), ahead = b => { const e = examById(b.examId); return e && e.date > t0; };
+  const open = S.blocks.filter(b => b.status === "planned" && b.date === t0 && ahead(b));
+  const b = open[0], next = b ? null : S.blocks.find(x => x.status === "planned" && x.date > t0 && ahead(x));
+  if (!b && !next) return "";
+  if (!b) {
+    const doneToday = S.blocks.some(x => x.date === t0 && x.status === "done");
+    return `<section class="panel now" id="now"><span class="label">${doneToday ? "Done for today" : "Nothing planned today"}</span><p>Next: <b>${esc(next.label)}</b> on ${fmtDay(next.date)} at ${esc(next.start)}.</p></section>`;
+  }
+  const e = examById(b.examId), t = topicById(e, b.topicId);
+  const studyable = b.type === "learn" && b.method && Object.hasOwn(METHODS, b.method);
+  const btn = b.type === "mock" ? `<button class="btn primary" data-act="mock" data-id="${esc(b.id)}">Enter results</button><button class="btn" data-act="px" data-exam="${esc(e.id)}">Practice exam (all topics)</button>`
+    : studyable ? `<button class="btn primary" data-act="study" data-id="${esc(b.id)}">Start this block</button>`
+    : t ? `<button class="btn primary" data-act="quiz" data-exam="${esc(e.id)}" data-topic="${esc(t.id)}"${b.type === "check" ? ` data-n="4"` : ""}>${b.type === "check" ? "Take check" : "Quiz"}</button><button class="btn" data-act="focus" data-id="${esc(b.id)}">Focus timer</button>` : "";
+  return `<section class="panel now" id="now" style="--ec:${examColor(e)}">
+    <span class="label">Do this now · ${esc(b.start)} · ${Math.round(numOr(b.minutes, 0))} min · ${esc(e.subject)} · ${diffDays(t0, e.date)} days to the exam</span>
+    <h2>${esc(b.label)}</h2>${detailHtml(blockDetail(b))}
+    <div class="row">${btn}<button class="btn ghost" data-act="done" data-id="${esc(b.id)}">Done</button></div>
+    ${open.length > 1 ? `<span class="small muted">Then ${open.length - 1} more block${open.length > 2 ? "s" : ""} today.</span>` : ""}</section>`;
+}
+// Week-by-week overview from today to the last exam: what is learned, practised and tested each week.
+function weekPlan() {
+  const t0 = today(), up = S.exams.filter(e => e.date >= t0 && e.topics.length);
+  if (!up.length) return [];
+  const last = up.map(e => e.date).sort().pop(), weeks = [];
+  const learnDates = {}; for (const b of S.blocks) if (b.type === "learn" && b.status !== "skipped") (learnDates[b.topicId] = learnDates[b.topicId] || []).push(b.date);
+  for (let w = 0; addDays(t0, 7 * w) <= last; w++) {
+    const from = addDays(t0, 7 * w), to = addDays(from, 6);
+    const bl = S.blocks.filter(b => b.date >= from && b.date <= to && b.status !== "skipped" && up.some(e => e.id === b.examId));
+    const items = [];
+    for (const e of up) {
+      const mine = bl.filter(b => b.examId === e.id), pre = up.length > 1 ? `${e.subject}: ` : "";
+      const learn = [...new Set(mine.filter(b => b.type === "learn").map(b => b.topicId))].map(id => {
+        const t = topicById(e, id), d = learnDates[id] || [], before = d.some(x => x < from), after = d.some(x => x > to);
+        return t ? t.name + (before && after ? " (continued)" : after ? " (starts)" : before ? " (finished)" : "") : null;
+      }).filter(Boolean);
+      if (learn.length) items.push(`${pre}learn ${learn.join(", ")}`);
+      const prac = [...new Set(mine.filter(b => b.practice && b.type !== "mock").map(b => (topicById(e, b.topicId) || {}).name).filter(Boolean))];
+      if (prac.length) items.push(`${pre}exam practice on ${prac.join(", ")}`);
+      const rv = mine.filter(b => (b.type === "review" && !b.practice) || b.type === "check");
+      const checks = rv.filter(b => b.type === "check").length, revs = rv.length - checks;
+      if (rv.length) items.push(`${pre}${[revs ? `${revs} review${revs > 1 ? "s" : ""}` : "", checks ? `${checks} retention check${checks > 1 ? "s" : ""}` : ""].filter(Boolean).join(" and ")}`);
+      for (const b of mine.filter(b => b.type === "mock")) items.push(`${b.practice ? "practice exam" : "mock exam"}${up.length > 1 ? ` for ${e.subject}` : ""} on ${fmtDay(b.date)}`);
+      if (e.date >= from && e.date <= to) items.push(`EXAM: ${e.subject} on ${fmtDay(e.date)}`);
+    }
+    const lm = sum(bl.filter(b => b.type === "learn"), b => b.minutes), all = sum(bl, b => b.minutes);
+    const phase = bl.some(b => b.type === "mock") || up.some(e => e.date >= from && e.date <= to) ? "Final stretch" : lm > all / 2 ? "Learning" : all ? "Practice and review" : "Free";
+    weeks.push({ n: w + 1, from, to, minutes: all, phase, items });
+  }
+  return weeks;
+}
+function weeksHtml() {
+  const W = weekPlan();
+  if (!W.length) return "";
+  const short = d => pd(d).toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+  return `<section class="panel stack" id="weeks"><div class="section-head"><h2>Week by week</h2><span class="small muted">${W.length} week${W.length > 1 ? "s" : ""} until ${W.length > 1 ? "your last exam" : "the exam"}</span></div>
+    <ol class="weeks">${W.map(w => `<li><div class="wk"><b>Week ${w.n}</b><span class="small muted">${short(w.from)}–${short(w.to)}</span><span class="chip ${w.phase === "Final stretch" ? "mock" : w.phase === "Learning" ? "learn" : "review"}">${w.phase}</span><span class="small muted mono">${hrs(w.minutes)}</span></div>
+      <span>${w.items.length ? esc(w.items.map(x => x[0].toUpperCase() + x.slice(1)).join(" · ")) : `<span class="muted">Nothing planned.</span>`}</span></li>`).join("")}</ol></section>`;
 }
 function vDashboard() {
   if (!S.exams.length) return vEmpty();
@@ -2175,11 +2396,14 @@ function vDashboard() {
   const next = S.blocks.filter(b => b.status === "planned" && b.date > t0).slice(0, 4);
   const upcoming = S.exams.filter(e => e.date >= t0).sort((a, b) => a.date < b.date ? -1 : 1);
   const short = upcoming.filter(e => S.shortfall[e.id]);
+  const noPlan = upcoming.filter(e => !e.topics.length && e.date > t0).slice(0, 2);
   return `
-  ${pending.length ? `<section class="alert mark"><div class="section-head"><h3>Did you do these?</h3><span class="small">${pending.length} block${pending.length > 1 ? "s" : ""} from earlier days. Missed blocks get rescheduled.</span></div><div class="blocks">${pending.slice(0, 6).map(b => blockRow(b, { showDate: true })).join("")}</div></section>` : ""}
+  ${pending.length ? `<section class="alert mark"><div class="section-head"><h3>Did you do these?</h3><span class="small">${pending.length} block${pending.length > 1 ? "s" : ""} from earlier days. Missed blocks get rescheduled.</span></div><div class="blocks">${pending.slice(0, 6).map(b => blockRow(b, { showDate: true, detail: false })).join("")}</div></section>` : ""}
   ${short.map(e => `<section class="alert bad"><b>Not enough time for ${esc(e.subject)}</b><span class="small">${hrs(S.shortfall[e.id])} of learning doesn't fit before ${fmtDay(e.date)}. Add study hours under Plan → Availability, or lower the effort of less important topics.</span></section>`).join("")}
   ${reviewPrompts()}
   ${rateCard()}
+  ${nowCard()}
+  ${noPlan.map(e => `<section class="alert mark" id="noplan"><b>${esc(e.subject)} has no study plan yet</b><span class="small">${e.materials.length ? "Your materials are uploaded. Next: let the AI find the topics, and the plan is built right away." : "Next: upload your scripts, slides and old exams, so the AI can find the topics and build the plan."}</span><div><button class="btn primary" data-act="edit" data-exam="${esc(e.id)}">${e.materials.length ? "Analyze materials" : "Upload materials"}</button></div></section>`).join("")}
   ${streakPanel()}
   ${S.exams.length ? fpTeaser() : ""}
   <section class="section">
@@ -2204,7 +2428,7 @@ function examCard(e) {
       <div class="bar" title="Weighted quiz mastery"><i style="width:${Math.min(100, r.score)}%; background:${r.score >= e.target ? "var(--good)" : "var(--accent)"}"></i><em style="left:${e.target}%"></em></div>
       <span class="small muted">${r.quizzed} of ${r.total} topics quizzed · ${r.learned}% of study time done · ${hrs(planned)} planned</span></div>
     <div class="stack" style="gap:6px"><span class="label">Topics by mastery</span><div class="heat">${e.topics.map(t => `<span class="${heatClass(t, e.target)}" title="${esc(t.name)}: ${t.mastery == null ? "not quizzed yet" : t.mastery + "%"}"></span>`).join("")}</div></div>
-    <div class="row"><button class="btn sm" data-act="goquiz" data-exam="${e.id}">Quiz a topic</button><button class="btn sm ghost" data-act="edit" data-exam="${e.id}">Edit</button></div>`
+    <div class="row"><button class="btn sm" data-act="goquiz" data-exam="${e.id}">Quiz a topic</button><button class="btn sm" data-act="px" data-exam="${e.id}">Practice exam (all topics)</button><button class="btn sm ghost" data-act="edit" data-exam="${e.id}">Edit</button></div>`
     : `<p class="small muted">No topics yet. Upload materials and let the AI find the topics, or add them by hand.</p><div><button class="btn sm primary" data-act="edit" data-exam="${e.id}">Set up topics</button></div>`}
   </article>`;
 }
@@ -2226,12 +2450,26 @@ function vPlan() {
   const days = [...new Set([...Object.keys(byDay), ...Object.keys(examsOn).filter(d => d >= t0 && d <= horizon)])].sort();
   const set = S.settings;
   const wd = [["Mon", 1], ["Tue", 2], ["Wed", 3], ["Thu", 4], ["Fri", 5], ["Sat", 6], ["Sun", 0]];
+  const short = S.exams.filter(e => e.date > t0 && S.shortfall[e.id]);
+  const noTopics = S.exams.find(e => e.date > t0 && !e.topics.length);
+  const dayList = days.length ? days.map(d => `<div class="stack" style="gap:6px">
+      <div class="row" style="justify-content:space-between"><h3>${d === t0 ? "Today · " : ""}${fmtLong(d)}</h3><span class="small muted mono">${byDay[d] ? hrs(sum(byDay[d], b => b.minutes)) : ""}</span></div>
+      ${(examsOn[d] || []).map(e => `<div class="alert info" style="--ec:${examColor(e)}"><b>Exam: ${esc(e.subject)}</b></div>`).join("")}
+      <div class="blocks">${(byDay[d] || []).map(b => blockRow(b)).join("")}</div></div>`).join("")
+    : `<div class="panel stack muted" id="plan-empty">No study blocks yet. The plan is built as soon as an exam has topics.${noTopics ? `<div><button class="btn primary" data-act="edit" data-exam="${esc(noTopics.id)}">Set up ${esc(noTopics.subject)}</button></div>` : ""}</div>`;
   return `
   ${rateCard()}
   <section class="section">
     <div class="section-head"><h2>Study plan</h2>
-      <div class="row"><button class="btn sm" data-act="replan">Re-plan now</button><button class="btn sm primary" data-act="ics">Export to calendar</button></div></div>
-    <p class="small muted">Import the calendar file into a separate calendar called “Exam Coach”. When the plan changes, export again: Apple Calendar and Outlook update the existing blocks; in Google Calendar, delete and re-create that calendar first.</p>
+      <div class="row"><button class="btn sm" data-act="replan">Re-plan now</button><button class="btn sm" data-act="ics">Export to calendar</button></div></div>
+  </section>
+  ${nowCard()}
+  ${short.map(e => `<section class="alert bad"><b>Not enough time for ${esc(e.subject)}</b><span class="small">${hrs(S.shortfall[e.id])} of learning doesn't fit before ${fmtDay(e.date)}. Add study hours under Availability below, or lower the effort of less important topics.</span></section>`).join("")}
+  ${weeksHtml()}
+  <section class="section" id="days">
+    <div class="section-head"><h2>Day by day</h2><span class="small muted">${busy.planAll ? "Everything until the exam" : "Next 3 weeks"}</span></div>
+    ${dayList}
+    ${!busy.planAll && S.blocks.some(b => b.date > horizon) ? `<div><button class="btn" data-act="plan-all">Show the full plan</button></div>` : ""}
   </section>
   <details class="panel" ${busy.openSettings ? "open" : ""} id="settings">
     <summary>Availability &amp; focus timer</summary>
@@ -2253,18 +2491,13 @@ function vPlan() {
     </div>
   </details>
   <section class="panel stack">
-    <div class="section-head"><h3>Your data</h3><span class="small muted">Saved in this browser only</span></div>
+    <div class="section-head"><h3>Calendar and your data</h3><span class="small muted">Saved in this browser only</span></div>
+    <p class="small muted" style="max-width:70ch">Import the calendar file into a separate calendar called “Exam Coach”. When the plan changes, export again: Apple Calendar and Outlook update the existing blocks; in Google Calendar, delete and re-create that calendar first.</p>
     <p class="small muted" style="max-width:70ch">Exam Coach has no accounts, so your plan, results and materials stay on this device. Download a backup to keep a copy or to move to another browser or computer.</p>
     ${busy.restore ? `<div class="alert mark"><b>Replace your current plan with the backup from ${esc(new Date(busy.restore.exportedAt).toLocaleDateString("en-GB"))}?</b><span class="small">Everything you have in this browser now is replaced.</span><div class="row"><button class="btn primary" data-act="restore-yes">Replace with backup</button><button class="btn ghost" data-act="restore-no">Cancel</button></div></div>` : ""}
     <div class="row"><button class="btn" data-act="backup">Download backup</button><label class="btn">Restore from backup<input type="file" id="restore-file" accept=".json,application/json" hidden></label></div>
   </section>
-  <section class="section">
-    ${days.length ? days.map(d => `<div class="stack" style="gap:6px">
-      <div class="row" style="justify-content:space-between"><h3>${d === t0 ? "Today · " : ""}${fmtLong(d)}</h3><span class="small muted mono">${byDay[d] ? hrs(sum(byDay[d], b => b.minutes)) : ""}</span></div>
-      ${(examsOn[d] || []).map(e => `<div class="alert info" style="--ec:${examColor(e)}"><b>Exam: ${esc(e.subject)}</b></div>`).join("")}
-      <div class="blocks">${(byDay[d] || []).map(b => blockRow(b)).join("")}</div></div>`).join("") : `<div class="panel muted">No blocks planned. Add topics to an exam to get a plan.</div>`}
-    ${!busy.planAll && S.blocks.some(b => b.date > horizon) ? `<div><button class="btn" data-act="plan-all">Show the full plan</button></div>` : ""}
-  </section>`;
+  ${chatbotNote()}`;
 }
 function vExams() {
   if (!S.exams.length) return vEmpty();
@@ -2277,6 +2510,7 @@ function vExams() {
     <button class="btn" data-act="new-exam">Add exam</button>
   </aside>
   <div class="stack" style="gap:20px; min-width:0">
+    ${T.length ? "" : setupSteps(e)}
     <section class="panel stack">
       <h2>Exam details</h2>
       <div class="fields">
@@ -2304,6 +2538,7 @@ function vExams() {
           : `<button class="btn primary" data-act="analyze" ${e.materials.length && sample ? "" : "disabled"}>${T.length ? "Re-analyze materials" : "Analyze materials with AI"}</button>
              ${!sample ? `<span class="small muted">${aiOffMsg()}</span>` : !e.materials.length ? `<span class="small muted">Add at least one file first.</span>` : T.length ? `<span class="small muted">Replaces the topic list. Quiz results stay with topics of the same name.</span>` : ""}`}
       </div>
+      ${busy.anErr && busy.anErr.examId === e.id && busy.analyze !== e.id ? `<div class="alert bad" id="analyze-error"><b>The AI couldn't finish reading your materials, so there are no topics and no plan yet.</b><span class="small">${esc(busy.anErr.msg)}</span><span class="small">Your files are kept. Press Analyze again, or add topics by hand under Topics.</span></div>` : ""}
       ${e.style ? `<div class="fb"><span class="label">Old-exam style</span><span>${esc(e.style)}</span></div>` : ""}
     </section>
     <section class="panel stack">
@@ -2311,7 +2546,7 @@ function vExams() {
       ${T.length ? `<div class="tablewrap"><table>
         <thead><tr><th>Topic</th><th>Weight</th><th>Effort (h)</th><th>Mastery</th><th>Method</th><th>Builds on</th><th>Where</th><th></th></tr></thead>
         <tbody>${T.map(t => `<tr>
-          <td><input type="text" id="t-name-${t.id}" data-topic="${t.id}" data-tf="name" value="${esc(t.name)}" aria-label="Topic name" style="min-width:170px">${t.extraMin > 0 ? `<div class="small" style="color:var(--warn)">+${hrs(t.extraMin)} added after quizzes</div>` : ""}</td>
+          <td><input type="text" id="t-name-${t.id}" data-topic="${t.id}" data-tf="name" value="${esc(t.name)}" aria-label="Topic name" style="min-width:170px">${cleanGoals(t.goals).length ? `<div class="small muted" title="${esc(cleanGoals(t.goals).map(g => g.text).join("\n"))}">${cleanGoals(t.goals).length} subtopics${cleanTerms(t.terms).length ? ` · ${cleanTerms(t.terms).length} key terms` : ""}</div>` : ""}${t.extraMin > 0 ? `<div class="small" style="color:var(--warn)">+${hrs(t.extraMin)} added after quizzes</div>` : ""}</td>
           <td><select id="t-w-${t.id}" data-topic="${t.id}" data-tf="weight" aria-label="Weight">${[1, 2, 3, 4, 5].map(w => `<option ${t.weight == w ? "selected" : ""}>${w}</option>`).join("")}</select>${t.oldExamHits ? `<div class="small muted">${t.oldExamHits}× in old exams</div>` : ""}</td>
           <td><input type="number" id="t-e-${t.id}" min="0.5" max="20" step="0.5" data-topic="${t.id}" data-tf="effortH" value="${t.effortH}" aria-label="Effort in hours"></td>
           <td class="mono">${t.mastery == null ? `<span class="muted">—</span>` : `<span class="chip ${t.mastery >= e.target ? "good" : t.mastery >= e.target - 20 ? "warn" : "bad"}">${t.mastery}%</span>`}</td>
@@ -2322,6 +2557,7 @@ function vExams() {
       <div class="row"><input type="text" id="new-topic" placeholder="New topic name" style="flex:1; min-width:180px"><button class="btn" data-act="add-topic">Add topic</button></div>
       <p class="small muted">Weight: how important the topic is for the exam (5 = comes up in almost every old exam). Effort: hours you need to learn it the first time. Builds on: topics you need to understand first, so the plan puts them earlier (Ctrl or Cmd + click to pick more than one).</p>
     </section>
+    ${T.length ? `<section class="panel row" id="px-entry"><div class="stack" style="gap:4px; flex:1; min-width:220px"><b>Practice exam (all topics)</b><span class="small muted">The AI writes a full exam across all ${T.length} topics, weighted like the real one. Your points per topic go into the plan.</span></div><button class="btn" data-act="px" data-exam="${esc(e.id)}">Start a practice exam</button></section>` : ""}
     ${T.length ? pphPanel(e) : ""}
     <div><button class="btn danger" data-act="rm-exam">${confirmKey === "exam" + e.id ? "Click again to delete this exam and its materials" : "Delete exam"}</button></div>
   </div></div>`;
@@ -2392,8 +2628,9 @@ function quizSummary(e, t) {
 function pphPanel(e) {
   const P = pointsTable(e), pass = e.mode === "pass", f1 = n => (Math.round(n * 10) / 10).toFixed(1);
   const pill = (v, label) => `<label class="cpill"><input type="radio" name="mode-${e.id}" id="mode-${v}" data-mode="1" value="${v}" ${e.mode === v ? "checked" : ""}>${label}</label>`;
-  return `<section class="panel stack" id="pph">
-    <div class="section-head"><h2>Where your time pays off</h2><span class="small muted">Exam points estimated from ${esc(P.source)}</span></div>
+  return `<details class="panel stack" id="pph" ${busy.pphOpen ? "open" : ""}>
+    <summary>Pass or top grade? Where your time pays off <span class="small muted">· aiming for ${pass ? "a pass" : "a top grade"}</span></summary>
+    <span class="small muted">Exam points estimated from ${esc(P.source)}</span>
     <div class="conf"><span class="label">I'm aiming for</span>${pill("pass", "Pass")}${pill("top", "Top grade")}</div>
     <p class="small muted" style="max-width:70ch">${pass ? `Pass: the plan picks the topics with the most points per hour until you reach the pass mark (${e.passPct}%) and learns those first, in the order of your material. Change the pass mark under Exam details.` : "Top grade: the plan goes through your material in order and aims at full mastery of every topic."}${e.topics.some(t => t.prereqs.length) ? " Either way, a topic is only learned after the topics it builds on." : ""}</p>
     <p class="small" id="pph-sum">You have about ${Math.round(P.have)} of 100 points now. ${pass
@@ -2406,7 +2643,7 @@ function pphPanel(e) {
         <td class="mono">${r.hours ? f1(r.hours) : "—"}</td><td class="mono"><b>${r.hours ? f1(r.pph) : "—"}</b></td>
         ${pass ? `<td>${r.needed ? `<span class="chip good">Needed</span>${r.first ? `<div class="small muted">${esc(r.first)} builds on it</div>` : ""}` : `<span class="chip">After the pass</span>`}</td>` : ""}</tr>`).join("")}</tbody></table></div>
     <p class="small muted">"You have" uses your quiz and mock results, or the progress the plan expects if a topic wasn't quizzed yet.</p>
-  </section>`;
+  </details>`;
 }
 /* mock exam scoring */
 let MK = null;
@@ -2431,7 +2668,7 @@ function mkTotal() {
 function vMock() {
   const b = MK && S.blocks.find(x => x.id === MK.blockId), e = b && examById(b.examId);
   if (!e) return `<div class="panel">This mock exam is no longer in your plan. <button class="btn sm" data-view="dashboard">Back to today</button></div>`;
-  const head = `<div class="section-head"><h2>Mock exam results</h2><span class="small muted">${esc(e.subject)} · ${fmtDay(b.date)}</span></div>`;
+  const head = `<div class="section-head"><h2>${b.practice ? "Practice exam results" : "Mock exam results"}</h2><span class="small muted">${esc(e.subject)} · ${fmtDay(b.date)}</span></div>`;
   if (b.mock && !MK.editing) {
     const c = MK.change;
     return `<section class="panel stack" style="border-top:4px solid ${examColor(e)}">${head}
@@ -2456,13 +2693,161 @@ function vMock() {
     <div class="row"><button class="btn primary" data-act="mk-save">Save results</button><button class="btn ghost" data-act="mk-cancel">Cancel</button></div>
   </section>`;
 }
+/* practice exam (all topics) */
+// The AI writes one exam across all topics of an exam. Questions per topic follow the exam points
+// (topicPoints(): old-exam tasks, else last mock, else old-exam hits, else weights), each topic's
+// questions share its points, so the exam has about 100 points. Material: a sample per topic via
+// topicContext(), PX_CTX characters in total. Multiple choice is checked here, written answers go
+// through gradeOpenAnswers() like quiz answers. The result is saved as a done "mock" block with
+// practice: true and scored by applyMockResult(), so each topic's percentage goes through
+// quizEffect() like a mock exam and the whole result is one plan change ("Edit results" works too).
+// A practice exam doesn't replace the planned mock exam and doesn't feed topicPoints() (lastMock()).
+let PX = null;
+const PX_CTX = 40000, PX_SIZES = [8, 12, 16];
+function pxAllocate(e, n) {
+  const { pts } = topicPoints(e);
+  let T = e.topics.filter(t => pts[t.id] > 0).sort((a, b) => pts[b.id] - pts[a.id] || e.topics.indexOf(a) - e.topics.indexOf(b));
+  if (!T.length) T = [...e.topics];
+  const count = new Map();
+  if (T.length >= n) T.slice(0, n).forEach(t => count.set(t.id, 1));
+  else {
+    const tot = sum(T, t => pts[t.id] || 1), rest = n - T.length, raw = T.map(t => ({ t, q: rest * (pts[t.id] || 1) / tot }));
+    raw.forEach(x => count.set(x.t.id, 1 + Math.floor(x.q)));
+    let left = n - sum([...count.values()]);
+    [...raw].sort((a, b) => (b.q % 1) - (a.q % 1)).forEach(x => { if (left > 0) { count.set(x.t.id, count.get(x.t.id) + 1); left--; } });
+  }
+  return e.topics.filter(t => count.has(t.id)).map((t, i) => ({ key: `T${i + 1}`, t, n: count.get(t.id), points: pts[t.id] || 100 / n * count.get(t.id) }));
+}
+// Suggested time: 2 min per multiple-choice question, 6 per short answer, 10 per calculation.
+const pxMinutes = qs => Math.min(180, Math.max(15, Math.ceil(sum(qs, q => q.type === "mc" ? 2 : q.type === "calc" ? 10 : 6) / 5) * 5));
+function openPractice(e) {
+  if (!e || !e.topics.length) return toast("Add topics to this exam first.");
+  if (!PX || PX.examId !== e.id || PX.phase === "done") PX = { examId: e.id, phase: "intro", n: e.topics.length > 8 ? 16 : 12 };
+  go("practice");
+}
+function pxPrompt(e, alloc, n, ctx) {
+  const mix = e.format === "multiple-choice" ? `mostly multiple choice ("mc", exactly 4 options, one correct), a few "short" (short written answer)`
+    : e.format === "oral" ? `mostly "short" (a short answer, as you would give it in the oral exam), a few multiple choice ("mc", exactly 4 options, one correct)`
+    : `about half multiple choice ("mc", exactly 4 options, one correct), the rest "short" (short written answer) or "calc" (a calculation task, only if the subject is quantitative)`;
+  const tasks = e.oldTasks.length ? e.oldTasks.slice(0, 20).map(x => `${x.label} (${fmtPts(x.points)} points${topicById(e, x.topicId) ? ", " + topicById(e, x.topicId).name : ""})`).join("; ") : "";
+  return `You write a full practice exam for a university student. It covers all topics of the course at once and is weighted like the real exam.
+Exam: "${e.subject}" — format: ${e.format}.
+${e.style ? `Old-exam style: ${e.style}\n` : ""}${tasks ? `Tasks of the most recent old exam: ${tasks}\n` : ""}
+Write exactly ${n} questions. Questions per topic (use the topic key in "topic"):
+${alloc.map(a => `${a.key} "${a.t.name}": ${a.n} question${a.n > 1 ? "s" : ""}${cleanGoals(a.t.goals).length ? ` — subtopics: ${cleanGoals(a.t.goals).map(g => g.text).join("; ")}` : ""}${a.t.weakConcepts && a.t.weakConcepts.length ? ` — the student recently got wrong: ${a.t.weakConcepts.join("; ")}` : ""}`).join("\n")}
+Mix the question types like a real exam: ${mix}. Mix easier and harder questions. Match the old-exam style where known. Write the questions in the language of the course material (English if none).
+For each give "topic" (the topic key, e.g. "T1"), "type", "question", "options" and "answer" (index of the correct option; mc only), "modelAnswer" (the correct answer with a brief explanation), "concept" (the specific concept tested, 2–5 words) and "source" (the bracketed source it is based on, or "general").
+${ctx ? `Course material excerpts per topic (source in brackets):\n---${ctx}\n---` : "No course material was uploaded; use standard university-level content for these topics."}
+
+Reply with only JSON:
+{"questions":[{"topic":"T1","type":"mc","question":"","options":["","","",""],"answer":0,"modelAnswer":"","concept":"","source":""}]}`;
+}
+async function genPractice() {
+  const e = PX && examById(PX.examId); if (!e) return;
+  if (!sample) return toast(aiOffMsg());
+  const n = PX_SIZES.includes(+PX.n) ? +PX.n : 12, alloc = pxAllocate(e, n);
+  Object.assign(PX, { n, phase: "loading", error: null, questions: [], answers: {}, results: null, change: null, blockId: null });
+  render();
+  aiCtl = new AbortController();
+  try {
+    let ctx = "";
+    const per = Math.min(8000, Math.floor(PX_CTX / alloc.length));
+    if (e.materials.length) for (const a of alloc) { const c = await topicContext(e, a.t, per); if (c) ctx += `\n### ${a.key}: ${a.t.name}\n${c}`; }
+    const res = await sample.json(pxPrompt(e, alloc, n, ctx), { signal: aiCtl.signal, cache: false });
+    const byKey = new Map(alloc.map(a => [a.key.toLowerCase(), a])), per2 = {};
+    let qs = (Array.isArray(res && res.questions) ? res.questions : []).filter(q => q && q.question).map(q => {
+      const a = byKey.get(String(q.topic || "").trim().toLowerCase()) || alloc.find(x => normName(x.t.name) === normName(q.topic));
+      const mc = q.type === "mc" && Array.isArray(q.options) && q.options.length >= 2 && Number.isInteger(+q.answer) && +q.answer >= 0 && +q.answer < q.options.length;
+      return a && { topicId: a.t.id, type: mc ? "mc" : (q.type === "calc" ? "calc" : "short"), question: String(q.question), options: mc ? q.options.map(String) : null, answer: mc ? +q.answer : null, modelAnswer: String(q.modelAnswer || ""), concept: String(q.concept || ""), source: String(q.source || "") };
+    }).filter(q => q && (per2[q.topicId] = (per2[q.topicId] || 0) + 1) <= alloc.find(a => a.t.id === q.topicId).n + 2).slice(0, n + 4);
+    if (!qs.length) throw { code: "invalid_json" };
+    // each topic's points are shared by its questions, so the exam is weighted like the real one
+    const cnt = {}; for (const q of qs) cnt[q.topicId] = (cnt[q.topicId] || 0) + 1;
+    for (const q of qs) q.points = Math.max(1, Math.round(2 * alloc.find(a => a.t.id === q.topicId).points / cnt[q.topicId]) / 2);
+    Object.assign(PX, { phase: "answer", questions: qs, minutes: pxMinutes(qs), startedAt: Date.now() });
+  } catch (err) { Object.assign(PX, err.code === "cancelled" ? { phase: "intro" } : { phase: "error", error: aiError(err) }); }
+  render();
+}
+async function submitPractice() {
+  const e = PX && examById(PX.examId); if (!e || PX.phase !== "answer") return;
+  PX.phase = "grading"; render();
+  const results = PX.questions.map((q, i) => {
+    const a = PX.answers[i];
+    if (q.type === "mc") return { score: a === q.answer ? 1 : 0, feedback: "", missed: a === q.answer ? "" : q.concept };
+    if (!a || !String(a).trim()) return { score: 0, feedback: "No answer given.", missed: q.concept };
+    return null;
+  });
+  await gradeOpenAnswers(PX.questions, PX.answers, results);
+  if (!PX || PX.phase !== "grading" || !examById(e.id)) return;
+  PX.results = results;
+  // what was missed becomes the topics' focus for the next quizzes and repair reviews
+  for (const t of e.topics) {
+    const miss = PX.questions.map((q, i) => q.topicId === t.id && results[i].score < 0.7 ? (results[i].missed || q.concept) : "").filter(Boolean);
+    if (miss.length) t.weakConcepts = [...new Set([...miss, ...(t.weakConcepts || [])])].filter(Boolean).slice(0, 6);
+  }
+  const st = new Date(PX.startedAt), used = Math.round((Date.now() - PX.startedAt) / 60000);
+  const b = { id: uid(), examId: e.id, date: today(), start: fromMin(st.getHours() * 60 + st.getMinutes()), minutes: Math.max(5, Math.min(PX.minutes, used)), status: "done", type: "mock", practice: true, label: "Practice exam (all topics)" };
+  S.blocks.push(b);
+  bumpActivity("quiz", 1);
+  const tasks = PX.questions.map((q, i) => ({ label: `Question ${i + 1}`, topicId: q.topicId, max: q.points, got: Math.round(results[i].score * q.points * 2) / 2 }));
+  Object.assign(PX, { phase: "done", blockId: b.id });
+  PX.change = applyMockResult(b, tasks);
+  render(); window.scrollTo(0, 0);
+}
+const pxClock = () => PX && PX.startedAt ? `${Math.max(0, Math.round((Date.now() - PX.startedAt) / 60000))} of ${PX.minutes} min used` : "";
+setInterval(() => { const c = document.getElementById("px-clock"); if (c && PX && PX.phase === "answer") c.textContent = pxClock(); }, 20000);
+function vPractice() {
+  const e = PX && examById(PX.examId);
+  if (!e) return `<div class="panel row">No practice exam open. <button class="btn sm" data-view="dashboard">Back to Today</button></div>`;
+  const head = `<div class="section-head"><div class="stack" style="gap:4px; min-width:0"><span class="label">${esc(e.subject)} · ${Math.max(0, diffDays(today(), e.date))} days to the exam</span><h2>Practice exam (all topics)</h2></div><button class="btn sm ghost" data-act="px-close">${PX.phase === "answer" ? "End without saving" : "Back"}</button></div>`;
+  if (["intro", "loading", "error"].includes(PX.phase)) {
+    const alloc = pxAllocate(e, PX.n), { source } = topicPoints(e);
+    return `<section class="panel stack" id="px" style="border-top:4px solid ${examColor(e)}">${head}
+      <p style="max-width:70ch">The AI writes one exam across all your topics. Topics that bring more points in the real exam get more questions (estimated from ${esc(source)}). Multiple-choice answers are checked right away, written answers by the AI. Your points per topic go into your plan like a mock exam.</p>
+      <div class="fields"><label class="field"><span>Questions</span><select id="px-n" ${PX.phase === "loading" ? "disabled" : ""}>${PX_SIZES.map(n => `<option ${n === PX.n ? "selected" : ""}>${n}</option>`).join("")}</select></label></div>
+      <p class="small" id="px-alloc"><span class="label">Questions per topic</span> ${alloc.map(a => `${esc(a.t.name)}: ${a.n}`).join(" · ")}</p>
+      ${PX.phase === "loading" ? `<div class="row"><span class="spinner"></span> Writing your practice exam… <button class="btn sm" data-act="stop">Stop</button></div>`
+        : `<div class="row"><button class="btn primary" data-act="px-gen" ${sample ? "" : "disabled"}>${PX.phase === "error" ? "Try again" : "Write my practice exam"}</button>${sample ? `<span class="small muted">Made from your materials${e.materials.length ? "" : " (none uploaded, so general questions)"}.</span>` : `<span class="small muted">${aiOffMsg()}</span>`}</div>`}
+      ${PX.phase === "error" ? `<div class="alert bad">${esc(PX.error)}</div>` : ""}
+    </section>`;
+  }
+  const done = PX.phase === "done", R = PX.results, qs = PX.questions, total = sum(qs, q => q.points);
+  const topicName = id => { const t = topicById(e, id); return t ? t.name : "Removed topic"; };
+  let top = "";
+  if (done) {
+    const got = sum(qs.map((q, i) => Math.round(R[i].score * q.points * 2) / 2)), c = PX.change;
+    const per = e.topics.map(t => { const ix = qs.map((q, i) => i).filter(i => qs[i].topicId === t.id); if (!ix.length) return null; const g = sum(ix, i => Math.round(R[i].score * qs[i].points * 2) / 2), m = sum(ix, i => qs[i].points); return { t, n: ix.length, g, m }; }).filter(Boolean);
+    top = `<section class="panel stack" style="border-top:4px solid ${examColor(e)}">${head}
+      <div><span class="label">Your score</span><div class="score-big mono">${fmtPts(got)}/${fmtPts(total)} points · ${Math.round(100 * got / (total || 1))}%</div></div>
+      <div class="tablewrap"><table id="px-topics"><thead><tr><th>Topic</th><th>Questions</th><th>Points</th><th>Score</th></tr></thead><tbody>${per.map(x => { const pct = Math.round(100 * x.g / (x.m || 1)); return `<tr><td>${esc(x.t.name)}</td><td class="mono">${x.n}</td><td class="mono">${fmtPts(x.g)}/${fmtPts(x.m)}</td><td><span class="chip ${pct >= e.target ? "good" : pct >= e.target - 20 ? "warn" : "bad"}">${pct}%</span></td></tr>`; }).join("")}</tbody></table></div>
+      ${c ? `<div class="fb"><b>What the coach changed</b><span>${esc(c.detail)}</span>
+        ${c.changes.slice(0, 6).map(x => `<div class="change"><span>${esc(x.name)} <span class="muted">· ${esc(x.exam)}</span></span><span class="${x.delta > 0 ? "plus" : "minus"}">${x.delta > 0 ? "+" : "−"}${hrs(Math.abs(x.delta))}</span></div>`).join("")}</div>` : ""}
+      <div class="row"><button class="btn sm primary" data-view="plan">See updated plan</button><button class="btn sm" data-act="px" data-exam="${esc(e.id)}">New practice exam</button></div></section>`;
+  } else top = `<section class="panel stack" id="px" style="border-top:4px solid ${examColor(e)}">${head}
+      <p><b>Suggested time: ${PX.minutes} min</b> · ${qs.length} questions · ${fmtPts(total)} points · <span class="mono" id="px-clock">${pxClock()}</span></p>
+      <p class="small muted">Answer without notes, as in the real exam.</p></section>`;
+  const lock = PX.phase !== "answer";
+  return top + `<section class="stack" id="px-questions">${qs.map((q, i) => {
+    const r = done ? R[i] : null;
+    return `<div class="panel q">
+      <div class="row" style="justify-content:space-between"><span class="label">Question ${i + 1} · ${esc(topicName(q.topicId))} · ${q.type === "mc" ? "multiple choice" : q.type === "calc" ? "calculation" : "short answer"} · ${fmtPts(q.points)} points</span>${r ? `<span class="chip ${r.score >= .8 ? "good" : r.score >= .4 ? "warn" : "bad"}">${Math.round(r.score * 100)}%</span>` : ""}</div>
+      <div class="qtext">${esc(q.question)}</div>
+      ${q.type === "mc" ? `<div class="opts">${q.options.map((o, j) => `<label class="opt ${done && j === q.answer ? "right" : ""} ${done && PX.answers[i] === j && j !== q.answer ? "wrong" : ""}"><input type="radio" name="px${i}" id="px${i}-${j}" data-pans="${i}" value="${j}" ${PX.answers[i] === j ? "checked" : ""} ${lock ? "disabled" : ""}><span>${esc(o)}</span></label>`).join("")}</div>`
+        : `<textarea id="px-a-${i}" data-pans="${i}" placeholder="Your answer" ${lock ? "disabled" : ""}>${esc(PX.answers[i] || "")}</textarea>`}
+      ${done ? `<div class="fb">${r.feedback ? `<span>${esc(r.feedback)}</span>` : ""}<span><b>Model answer:</b> ${esc(q.modelAnswer)}</span><span class="small muted">Concept: ${esc(q.concept)}${q.source ? ` · Source: ${esc(q.source)}` : ""}</span></div>` : ""}
+    </div>`; }).join("")}
+    ${PX.phase === "answer" ? `<div class="row"><button class="btn primary" data-act="px-submit">Hand in</button><span class="small muted" id="px-count">${Object.keys(PX.answers).length} of ${qs.length} answered</span></div>` : ""}
+    ${PX.phase === "grading" ? `<div class="panel row"><span class="spinner"></span> Checking your answers and updating the plan…</div>` : ""}
+  </section>`;
+}
+function pxCount() { const c = $("#px-count"); if (c && PX) c.textContent = `${Object.keys(PX.answers).length} of ${PX.questions.length} answered`; }
 function vHistory() {
   return `<section class="section"><div class="section-head"><h2>Plan changes</h2><span class="small muted">Every time the coach changed your plan, and why</span></div>
   <div class="panel log">${S.log.length ? S.log.map(logItem).join("") : `<p class="muted">No changes yet. They appear here after quizzes, skipped blocks and edits.</p>`}</div></section>`;
 }
 function render() {
   document.querySelectorAll("#nav button").forEach(b => b.setAttribute("aria-current", b.dataset.view === view ? "page" : "false"));
-  const v = { dashboard: vDashboard, plan: vPlan, exams: vExams, quiz: vQuiz, you: vYou, study: vStudy, mock: vMock, history: vHistory }[view] || vDashboard;
+  const v = { dashboard: vDashboard, plan: vPlan, exams: vExams, quiz: vQuiz, you: vYou, study: vStudy, mock: vMock, practice: vPractice, history: vHistory }[view] || vDashboard;
   $("#main").innerHTML = aiBanner() + v();
   const st = streakInfo(), chip = $("#streakchip");
   chip.hidden = !S.exams.length && !st.current;
@@ -2567,6 +2952,11 @@ $("#main").addEventListener("click", async ev => {
     case "add-off": { const v = $("#set-off").value; if (v && !S.settings.blackout.includes(v)) { S.settings.blackout.push(v); busy.openSettings = true; commit(); } break; }
     case "rm-off": S.settings.blackout = S.settings.blackout.filter(d => d !== el.dataset.date); busy.openSettings = true; commit(); break;
     case "analyze": analyzeMaterials(e); break;
+    case "focus-field": { const f = $("#" + el.dataset.f); if (f) { f.focus(); if (f.select) f.select(); } break; }
+    case "px": openPractice(e); break;
+    case "px-gen": genPractice(); break;
+    case "px-submit": submitPractice(); break;
+    case "px-close": PX = null; go("dashboard"); break;
     case "stop": aiCtl && aiCtl.abort(); break;
     case "rm-mat": {
       const id = el.dataset.id;
@@ -2639,6 +3029,8 @@ $("#main").addEventListener("change", ev => {
       detail: el.value === "pass" ? `Learning now starts with the topics that give the most points per hour until you reach the pass mark of ${e.passPct}%, in the order of your material.` : "Learning now follows the order of your material, aiming at full mastery of every topic." } });
     return;
   }
+  if (el.id === "px-n" && PX) { PX.n = +el.value; render(); return; }
+  if (el.dataset.pans != null && el.type === "radio" && PX && PX.phase === "answer") { PX.answers[+el.dataset.pans] = +el.value; pxCount(); return; }
   if (el.id === "restore-file") { if (el.files[0]) readBackup(el.files[0]); el.value = ""; return; }
   if (el.id === "mat-file" && e) { addFiles(e, [...el.files], $("#mat-kind").value); el.value = ""; return; }
   if (el.dataset.q === "exam") { quiz = { examId: el.value, topicId: null, phase: "pick" }; render(); return; }
@@ -2656,13 +3048,17 @@ $("#main").addEventListener("input", ev => {
   if (el.dataset.rv) { (busy.rv[el.dataset.rv] = busy.rv[el.dataset.rv] || {})[el.dataset.k] = el.value; return; }
   if (el.id === "study-text" && studyId) { (ST[studyId] = ST[studyId] || {}).text = el.value; return; }
   if (el.id === "mode-text" && SM[studyTopic]) { SM[studyTopic].text = el.value; return; }
+  if (el.dataset.pans != null && el.tagName === "TEXTAREA" && PX && PX.phase === "answer") {
+    if (el.value.trim()) PX.answers[+el.dataset.pans] = el.value; else delete PX.answers[+el.dataset.pans];
+    pxCount(); return;
+  }
   if (el.dataset.ans != null && el.tagName === "TEXTAREA" && quiz) {
     const had = Object.keys(quiz.answers).length;
     if (el.value.trim()) quiz.answers[+el.dataset.ans] = el.value; else delete quiz.answers[+el.dataset.ans];
     const c = document.querySelector('[data-act="submit"] + .small'); if (c && had !== Object.keys(quiz.answers).length) c.textContent = `${Object.keys(quiz.answers).length} of ${quiz.questions.length} answered`;
   }
 });
-$("#main").addEventListener("toggle", ev => { if (ev.target.id === "settings") busy.openSettings = ev.target.open; }, true);
+$("#main").addEventListener("toggle", ev => { if (ev.target.id === "settings") busy.openSettings = ev.target.open; if (ev.target.id === "pph") busy.pphOpen = ev.target.open; }, true);
 ["dragover", "dragenter"].forEach(t => $("#main").addEventListener(t, ev => { const d = ev.target.closest && ev.target.closest("#drop"); if (d) { ev.preventDefault(); d.classList.add("over"); } }));
 $("#main").addEventListener("dragleave", ev => { const d = ev.target.closest && ev.target.closest("#drop"); if (d && !d.contains(ev.relatedTarget)) d.classList.remove("over"); });
 $("#main").addEventListener("drop", ev => {

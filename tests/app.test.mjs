@@ -36,6 +36,9 @@ function fakeAnswer(prompt) {
     const h = topics[0];
     h.buildsOn = mat.includes("ALPHAWORD") ? ["sampling"] : mat.includes("BETAWORD") ? ["Regression models"] : ["Hypothesis tests"];
     if (mat.includes("BETAWORD")) topics[topics.length - 1].buildsOn = ["hypothesis-tests", "Not a topic"];
+    // Subtopics and key terms per part; one goal and one term come up in every part (kept once).
+    h.goals = [{ text: `Goal from part ${part[1]}`, pages: `Slides p. ${part[1]}` }, { text: "Shared goal", pages: "Slides p. 1" }];
+    h.terms = ["p-value", `term ${part[1]}`];
     // Old-exam tasks on the pages of this part; label spelling differs between parts. Task 4's topic
     // is only known once the part with BETAWORD was read.
     const tasks = [...mat.matchAll(/Task (\d+): test H0/g)].map(m => ({ label: +part[1] % 2 ? `Task ${m[1]}` : `task ${m[1]} `,
@@ -56,11 +59,25 @@ function fakeAnswer(prompt) {
   }
   if (prompt.includes("study topics in a sensible learning order"))
     return { topics: [
-      { name: "Hypothesis tests", summary: "H0, H1, p-values, error types.", weight: 5, oldExamHits: 3, effortH: 4, sources: "Script p. 1" },
-      { name: "Linear regression", summary: "Least squares and R squared.", weight: 3, oldExamHits: 1, effortH: 3, sources: "Script p. 1", buildsOn: ["Hypothesis tests", "Unknown topic"] }],
+      { name: "Hypothesis tests", summary: "H0, H1, p-values, error types.", weight: 5, oldExamHits: 3, effortH: 4, sources: "Script p. 1",
+        goals: [{ text: "Set up H0 and H1", pages: "Script p. 1" }, { text: "Compute a p-value", pages: "Script p. 2" }, { text: "Tell Type I from Type II errors", pages: "Script p. 3" }, { text: "Pick the right test", pages: "Script p. 4" }],
+        terms: ["null hypothesis", "p-value", "alpha"] },
+      { name: "Linear regression", summary: "Least squares and R squared.", weight: 3, oldExamHits: 1, effortH: 3, sources: "Script p. 1", buildsOn: ["Hypothesis tests", "Unknown topic"],
+        goals: ["Fit a least-squares line", { text: "Read R squared", pages: "Script p. 6" }, { text: "" }], terms: ["slope", "R squared", 7, null] }],
       style: "Mostly calculations with short definitions.",
       tasks: [{ label: "Task 1", topic: "Hypothesis tests", points: 30 }, { label: "Task 2", topic: "Linear regression", points: 20 }] };
-  if (prompt.includes("Grade a student")) return [{ i: 1, score: 0.5, feedback: "Half right.", missed: "Type II error" }];
+  if (prompt.includes("full practice exam")) {
+    // As many questions per topic key as asked for: the first one multiple choice, the rest short answers;
+    // plus one question for a topic key that doesn't exist (dropped by the page).
+    const qs = [];
+    for (const m of prompt.matchAll(/^(T\d+) "([^"]+)": (\d+) question/gm))
+      for (let k = 0; k < +m[3]; k++) qs.push(k === 0 ? { topic: m[1], type: "mc", question: `${m[2]}: pick the right one`, options: ["Wrong", "Right", "Wrong too", "Also wrong"], answer: 1, modelAnswer: "Right.", concept: `${m[2]} basics`, source: "Script p. 1" }
+        : { topic: m[1], type: "short", question: `${m[2]}: explain part ${k}`, modelAnswer: "An explanation.", concept: `${m[2]} part ${k}`, source: "general" });
+    qs.push({ topic: "T99", type: "short", question: "Not a topic", modelAnswer: "", concept: "" });
+    return { questions: qs };
+  }
+  // Grading: half points for every written answer (one entry per "#i" in the prompt).
+  if (prompt.includes("Grade a student")) return [...prompt.matchAll(/^#(\d+)$/gm)].map(m => ({ i: +m[1], score: 0.5, feedback: "Half right.", missed: +m[1] === 1 ? "Type II error" : "" }));
   if (prompt.includes("practice questions"))
     return { questions: [
       { type: "mc", question: "What is a Type I error?", options: ["Keeping H0", "Rejecting a true H0", "A wrong model", "A small sample"], answer: 1, modelAnswer: "Rejecting a true H0.", concept: "Type I error", source: "Script p. 1" },
@@ -304,6 +321,9 @@ const learnSeq = examIndex => page.evaluate(i => {
 test("shows points per hour and plans by pass or top-grade mode", async () => {
   await page.evaluate(() => { const e = S.exams[1]; delete e.mode; delete e.passPct; normalize(); selExam = e.id; go("exams"); });
   assert.deepEqual(await page.evaluate(() => [S.exams[1].mode, S.exams[1].passPct]), ["top", 50]);
+  // the points-per-hour panel is folded away by default, so it doesn't crowd out the plan
+  assert.equal(await page.isVisible("#pph-table"), false);
+  await page.click("#pph summary");
   const firstLearn = () => page.evaluate(() => {
     const e = S.exams[1], b = S.blocks.find(x => x.examId === e.id && x.type === "learn" && x.status === "planned");
     return topicById(e, b.topicId).name;
@@ -426,6 +446,10 @@ test("splits long materials into parts, shows progress and merges the topics", a
   assert.equal(h.hits, 2, "old-exam hits are not counted twice when every part saw the old exams");
   assert.equal(h.effortH, 6, "effort adds up over the parts");
   assert.equal(e.style, "Old exam: calculations.");
+  // subtopics and key terms of all parts, in material order, each only once
+  assert.deepEqual(await page.evaluate(id => { const t = examById(id).topics[0]; return [t.goals.map(g => g.text + " @ " + g.src), t.terms]; }, id),
+    [["Goal from part 1 @ Slides p. 1", "Shared goal @ Slides p. 1", "Goal from part 2 @ Slides p. 2", "Goal from part 3 @ Slides p. 3"], ["p-value", "term 1", "term 2", "term 3"]]);
+  assert.ok(parts.every(p => p.includes('"goals"') && p.includes('"terms"')), "every part asks for subtopics and key terms");
   // every part saw the same old exam: its tasks are merged, not multiplied
   assert.deepEqual(await page.evaluate(id => { const e = examById(id); return e.oldTasks.map(x => [x.label, topicById(e, x.topicId)?.name || null, x.points]); }, id),
     [["Task 1", "Hypothesis tests", 10], ["Task 2", "Hypothesis tests", 10], ["Task 3", "Hypothesis tests", 10], ["Task 4", "Regression models", 10]]);
@@ -867,17 +891,19 @@ test("fills defaults for new fields in older saved states and backups", async ()
   const r = await page.evaluate(() => {
     const keep = S;
     S = { exams: [{ id: "x", subject: "Old", date: "2026-01-01", target: 80, materials: [], review: { grade: "ok", gradeNum: "7", stats: {} },
-        topics: [{ id: "a", name: "A", prereqs: ["b"] }, { id: "b", name: "B", prereqs: ["a", "b", "zz"] }, { id: "c", name: "C" }] }],
+        topics: [{ id: "a", name: "A", prereqs: ["b"], goals: ["<img id=pwn5>", { text: "Goal", src: "<b>p. 1</b>" }, 5, { text: " " }], terms: "bad" }, { id: "b", name: "B", prereqs: ["a", "b", "zz"] }, { id: "c", name: "C" }] }],
       blocks: [{ id: "b1", examId: "x", type: "mock", status: "done", date: "2025-12-30", minutes: 90, mock: { at: "x" } }],
       fp: { quizLog: [] }, archive: [{ name: "Old semester", exams: [{ subject: "A", date: "2025-06-01", review: { grade: "2", gradeNum: 2 } }] }] };
     normalize();
     const out = { mode: S.exams[0].mode, pass: S.exams[0].passPct, oldTasks: S.exams[0].oldTasks, gradeNum: S.exams[0].review.gradeNum, mock: "mock" in S.blocks[0],
-      energy: S.fp.energy, realismPast: S.fp.realismPast, prereqs: S.exams[0].topics.map(t => t.prereqs), arch: S.archive[0].exams[0], html: statsList(S.archive[0].exams[0].stats, S.archive[0].exams[0].review) };
+      energy: S.fp.energy, realismPast: S.fp.realismPast, prereqs: S.exams[0].topics.map(t => t.prereqs), goals: S.exams[0].topics.map(t => [t.goals, t.terms]), arch: S.archive[0].exams[0], html: statsList(S.archive[0].exams[0].stats, S.archive[0].exams[0].review) };
     // numbers and status values from a crafted backup are coerced or escaped
     S.blocks = [{ id: '"><img id=pwn1>', examId: "x", type: "<img id=pwn2>", status: "<img id=pwn3>", date: "2026-01-02", start: "<b>9</b>", minutes: "<img id=pwn4>", label: "L", focusMin: "<i>" },
-      { id: "m", examId: "x", type: "mock", status: "done", date: "2026-01-02", minutes: 90, mock: { at: "x", tasks: [{ label: "<b>", got: "<img>", max: "x" }, 5], fx: "bad" } }];
+      { id: "m", examId: "x", type: "mock", status: "done", date: "2026-01-02", minutes: 90, mock: { at: "x", tasks: [{ label: "<b>", got: "<img>", max: "x" }, 5], fx: "bad" } },
+      { id: "l", examId: "x", topicId: "a", type: "learn", status: "planned", date: "2026-01-02", start: "09:00", minutes: 60, label: "L", method: "summary", goals: [0, "1", 99, "<b>"], practice: "yes" }];
     normalize();
-    out.blocks = S.blocks.map(b => [b.type, b.status, b.minutes]);
+    out.blocks = S.blocks.slice(0, 2).map(b => [b.type, b.status, b.minutes]);
+    out.lblock = [S.blocks[2].goals, S.blocks[2].practice];
     out.fx = "fx" in S.blocks[1].mock;
     out.tasks = S.blocks[1].mock.tasks;
     out.rows = S.blocks.map(b => blockRow(b, { showDate: true })).join("") + blockRow({ id: "z", examId: "x", type: "<u>", status: "<s>", date: "2026-01-02", start: "9", minutes: "<em>", label: "z" });
@@ -886,6 +912,10 @@ test("fills defaults for new fields in older saved states and backups", async ()
     return out;
   });
   assert.deepEqual(r.blocks, [["review", "planned", 0], ["mock", "done", 90]]);
+  assert.deepEqual(r.lblock, [[0, 1], false], "block goals are indices, practice only on mock blocks");
+  assert.deepEqual(r.goals[0], [[{ text: "<img id=pwn5>", src: "" }, { text: "Goal", src: "<b>p. 1</b>" }], []], "goals and key terms are cleaned");
+  assert.deepEqual(r.goals[2], [[], []], "missing goals and key terms default to []");
+  assert.match(r.rows, /Covers[\s\S]*&lt;img id=pwn5&gt;[\s\S]*&lt;b&gt;p\. 1/, "block details show the goals, escaped");
   assert.equal(r.fx, false);
   assert.deepEqual(r.tasks.map(x => [x.label, x.got, x.max]), [["<b>", 0, 0]]);
   for (const html of [r.rows, r.stats]) {
@@ -1027,6 +1057,133 @@ test("explains when the backend has no API key", async () => {
   process.env.GEMINI_API_KEY = "test-key";
 });
 
+// A new student with a real exam 1.5 months away: first visit → exam → upload → analysis → full plan.
+let fresh = null, fp = null;
+test("guides from the first visit to a full, concrete plan: steps, week overview, today card, block content", async () => {
+  fresh = await browser.newContext(); await serve(fresh); fp = await open(fresh);
+  const p = fp;
+  assert.match(await p.textContent("main"), /Why not just ask a chatbot for a plan\?/);
+  await p.click('[data-act="new-exam"]');
+  assert.equal(await p.evaluate(() => view), "exams");
+  assert.match(await p.textContent("#setup li.next"), /Name the exam/, "step 1 is next");
+  assert.equal(await p.locator("#setup .btn.primary").count(), 1, "one primary button: the next step");
+  await p.fill("#f-subject", "Statistics"); await p.press("#f-subject", "Tab");
+  const examDate = await p.evaluate(() => addDays(today(), 45));
+  await p.fill("#f-date", examDate); await p.press("#f-date", "Tab");
+  assert.match(await p.textContent("#setup li.next"), /Upload your materials/);
+  // the Today page says why there is no plan yet and what to do next
+  await p.click('#nav [data-view="dashboard"]');
+  assert.match(await p.textContent("#noplan"), /Statistics has no study plan yet/);
+  await p.click('#noplan [data-act="edit"]');
+  assert.equal(await p.evaluate(() => view), "exams");
+  await p.setInputFiles("#mat-file", path.join(ROOT, "tests/fixtures/statistics-script.pdf"));
+  await p.waitForFunction(() => S.exams[0].materials.length === 1, null, { timeout: 15000 });
+  assert.match(await p.textContent("#setup li.next"), /Let the AI find the topics/);
+
+  // a failed analysis says so on the page (not only in a toast) and keeps the files
+  upstream.fail = 400;
+  await p.click('#setup [data-act="analyze"]');
+  await p.waitForSelector("#analyze-error");
+  upstream.fail = null;
+  assert.match(await p.textContent("#analyze-error"), /no topics and no plan yet[\s\S]*Your files are kept/);
+  assert.equal(await p.evaluate(() => view), "exams");
+
+  // a successful analysis builds the plan and opens it, without another click
+  await p.click('#setup [data-act="analyze"]');
+  await p.waitForFunction(() => view === "plan" && S.exams[0].topics.length === 2);
+  assert.equal(await p.locator("#analyze-error").count(), 0);
+  const ht = await p.evaluate(() => { const t = S.exams[0].topics[0]; return { goals: t.goals.length, terms: t.terms, lr: S.exams[0].topics[1].goals.map(g => g.text + "|" + g.src), lrTerms: S.exams[0].topics[1].terms }; });
+  assert.equal(ht.goals, 4);
+  assert.deepEqual(ht.terms, ["null hypothesis", "p-value", "alpha"]);
+  assert.deepEqual(ht.lr, ["Fit a least-squares line|", "Read R squared|Script p. 6"], "goals as plain text are accepted, empty ones dropped");
+  assert.deepEqual(ht.lrTerms, ["slope", "R squared", "7"]);
+  assert.match(await p.evaluate(() => S.log[0].detail), /6 subtopics with their pages/);
+
+  // week by week until the exam: learning first, then practice and reviews, the mock and the exam at the end
+  const weeks = await p.locator("#weeks .weeks > li").allTextContents();
+  assert.equal(weeks.length, 7, "45 days = 7 weeks");
+  assert.match(weeks[0], /Week 1[\s\S]*Learn Hypothesis tests/);
+  assert.match(weeks[6], /EXAM: Statistics/);
+  assert.ok(weeks.some(w => /Mock exam on/.test(w)), "the mock exam is in the overview");
+  assert.ok(weeks.slice(1, 5).every(w => /Exam practice on|review/i.test(w)), "no empty weeks once the topics are learned");
+
+  // "do this now" card on the Plan page (late in the day there may be nothing left today: then it names the next block)
+  assert.match(await p.textContent("#now"), /Do this now[\s\S]*Do[\s\S]*Result|Next: /);
+
+  // each learning block covers its own share of the topic's subtopics, in order
+  const lb = await p.evaluate(() => { const e = S.exams[0], t = e.topics[0];
+    return S.blocks.filter(b => b.topicId === t.id && b.type === "learn").map(b => b.goals); });
+  assert.ok(lb.length >= 4);
+  assert.deepEqual([...new Set(lb.flat())].sort(), [0, 1, 2, 3], "every subtopic is covered");
+  assert.equal(lb[0][0], 0); assert.ok(lb.at(-1).includes(3)); assert.ok(!lb[0].includes(3));
+  const row = p.locator(".block", { hasText: "Learn: Hypothesis tests" }).first();
+  const txt = await row.textContent();
+  assert.match(txt, /Covers\s*Set up H0 and H1 · Script p\. 1/);
+  assert.match(txt, /Do\s*\S/); assert.match(txt, /Result\s*\S/);
+  // mock and review blocks say what to do too
+  const det = await p.evaluate(() => { const e = S.exams[0], mock = S.blocks.find(b => b.examId === e.id && b.type === "mock"), prac = S.blocks.find(b => b.practice && b.type === "review");
+    return { mock: blockDetail(mock).todo, prac: blockDetail(prac).todo, ics: icsText().replace(/\r\n /g, "") }; });
+  assert.match(det.mock, /Task 1 \(30 points\), Task 2 \(20 points\)/);
+  assert.match(det.prac, /Solve old-exam Task \d \(\d+ points\)/);
+  assert.match(det.ics, /Covers: Set up H0 and H1 \(Script p\. 1\)/);
+  assert.match(await p.textContent("main"), /Why not just ask a chatbot for a plan\?/);
+  await p.click('#nav [data-view="dashboard"]');
+  assert.equal(await p.locator("#now").count(), 1);
+  assert.equal(await p.locator("#noplan").count(), 0);
+});
+
+test("practice exam on all topics: weighted questions, local and AI grading, per-topic results feed the plan", async () => {
+  const p = fp;
+  await p.click('.exam [data-act="px"]');
+  assert.equal(await p.evaluate(() => view), "practice");
+  await p.selectOption("#px-n", "8");
+  // old-exam tasks: 30 points Hypothesis tests, 20 Linear regression → 5 and 3 questions
+  assert.match(await p.textContent("#px-alloc"), /Hypothesis tests: 5 · Linear regression: 3/);
+  upstream.prompts = [];
+  await p.click('[data-act="px-gen"]');
+  await p.waitForSelector('[data-act="px-submit"]');
+  const gen = upstream.prompts.find(x => x.includes("full practice exam"));
+  assert.ok(gen && gen.length < 60000, "the request stays small");
+  assert.match(gen, /T1 "Hypothesis tests": 5 questions — subtopics: Set up H0 and H1/);
+  assert.match(gen, /Tasks of the most recent old exam: Task 1 \(30 points, Hypothesis tests\)/);
+  const qs = await p.evaluate(() => PX.questions.map(q => [topicById(S.exams[0], q.topicId).name, q.type, q.points]));
+  assert.equal(qs.length, 8, "the question for an unknown topic is dropped");
+  assert.deepEqual(qs.map(q => q[2]), [12, 12, 12, 12, 12, 13.5, 13.5, 13.5], "each topic's questions share its exam points");
+  assert.match(await p.textContent("#px"), /Suggested time: \d+ min/);
+  await p.check("#px0-1");          // right
+  await p.check("#px5-0");          // wrong
+  for (const i of [1, 2, 3, 4, 6, 7]) await p.fill(`#px-a-${i}`, "My answer " + i);
+  assert.equal(await p.textContent("#px-count"), "8 of 8 answered");
+  upstream.prompts = [];
+  await p.click('[data-act="px-submit"]');
+  await p.waitForFunction(() => PX.phase === "done");
+  const grade = upstream.prompts.filter(x => x.includes("Grade a student"));
+  assert.equal(grade.length, 1, "written answers are graded in one request, by the quiz grading");
+  assert.ok(/^#1$/m.test(grade[0]) && /^#7$/m.test(grade[0]) && !/^#0$/m.test(grade[0]) && !/^#5$/m.test(grade[0]), "multiple choice is graded on the page");
+  const r = await p.evaluate(() => { const e = S.exams[0], b = S.blocks.find(x => x.practice && x.type === "mock");
+    return { log: S.log[0], b: b && { status: b.status, tasks: b.mock.tasks.length, fx: !!b.mock.fx }, mockPlanned: S.blocks.some(x => x.examId === e.id && x.type === "mock" && !x.practice && x.status === "planned"),
+      quizzes: e.topics.map(t => t.quizzes.filter(q => q.mock).map(q => q.score)), source: topicPoints(e).source, weak: e.topics[1].weakConcepts }; });
+  assert.equal(r.log.kind, "mock");
+  assert.match(r.log.title, /Statistics: practice exam \(all topics\) 50\/100\.5 points \(50%\)/);
+  assert.match(r.log.detail, /Not learned yet: Hypothesis tests 60%, Linear regression 35%/);
+  assert.deepEqual(r.b, { status: "done", tasks: 8, fx: true });
+  assert.deepEqual(r.quizzes, [[60], [35]], "each topic gets its percentage");
+  assert.ok(r.mockPlanned, "the planned mock exam stays in the plan");
+  assert.equal(r.source, "old-exam tasks", "a practice exam doesn't change the exam weighting");
+  assert.ok(r.weak.includes("Linear regression basics"), "missed concepts become the topic's focus");
+  const main = await p.textContent("main");
+  assert.match(main, /What the coach changed/);
+  assert.equal(await p.locator("#px-topics tbody tr").count(), 2);
+  assert.match(main, /Model answer/);
+  // the result is in the plan as a done block; it opens as "Practice exam results"
+  await p.evaluate(() => { go("plan"); busy.planAll = true; render(); });
+  const id = await p.evaluate(() => S.blocks.find(x => x.practice && x.type === "mock").id);
+  await p.evaluate(id => openMock(S.blocks.find(b => b.id === id)), id);
+  assert.match(await p.textContent("main"), /Practice exam results/);
+  assert.deepEqual(problems, []);
+  await fresh.close();
+});
+
 test("works on a 375 px phone screen", async () => {
   const phone = await browser.newContext({ viewport: { width: 375, height: 740 } });
   await serve(phone);
@@ -1055,6 +1212,10 @@ test("works on a 375 px phone screen", async () => {
   assert.ok(fit.inputs, "every field is fully on screen");
   await p.fill("#mk-got-0", "1");
   assert.match(await p.textContent("#mk-total"), /^1 of/);
+  // the plan with its week overview and block details fits too
+  await p.evaluate(() => go("plan"));
+  assert.ok(await p.evaluate(() => document.documentElement.scrollWidth) <= 375);
+  assert.ok(await p.locator("#weeks").count() === 1);
   await phone.close();
 });
 
