@@ -3,15 +3,21 @@
 
 import { test, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
-import { handle, provider, geminiToEvents, resetLimits, RATE, CODE_RATE } from "../netlify/edge-functions/ai.js";
+import { handle, provider, geminiToEvents, resetLimits, RATE, CODE_RATE, RETRY, STREAM } from "../netlify/edge-functions/ai.js";
 
 const realFetch = globalThis.fetch;
 let next = null, lastCall = null, calls = 0;
 globalThis.fetch = async (url, init) => { calls++; lastCall = { url: String(url), init }; return next(); };
 after(() => { globalThis.fetch = realFetch; });
 
-const VARS = ["AI_PROVIDER", "GEMINI_API_KEY", "ANTHROPIC_API_KEY", "ACCESS_CODE", "GEMINI_MODEL", "GEMINI_MODEL_QUICK", "ANTHROPIC_MODEL", "ALLOWED_ORIGINS"];
-beforeEach(() => { for (const v of VARS) delete process.env[v]; next = null; lastCall = null; calls = 0; resetLimits(); });
+// No real waiting between retries: the waits are recorded instead.
+const realSleep = RETRY.sleep;
+let waits = [];
+RETRY.sleep = async ms => { waits.push(ms); };
+after(() => { RETRY.sleep = realSleep; });
+
+const VARS = ["AI_PROVIDER", "GEMINI_API_KEY", "ANTHROPIC_API_KEY", "ACCESS_CODE", "GEMINI_MODEL", "GEMINI_MODEL_QUICK", "ANTHROPIC_MODEL", "ANTHROPIC_MODEL_QUICK", "ALLOWED_ORIGINS"];
+beforeEach(() => { for (const v of VARS) delete process.env[v]; next = null; lastCall = null; calls = 0; waits = []; resetLimits(); });
 
 const post = (body, headers = {}, context) => handle(new Request("http://x/api/ai", { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) }), context);
 const get = (headers = {}, context) => handle(new Request("http://x/api/ai", { headers }), context);
@@ -89,19 +95,80 @@ test("Gemini: maps finish reasons and errors", async () => {
   }
 });
 
-test("Gemini: retries once when the service is busy", async () => {
+const busy503 = () => new Response(JSON.stringify({ error: { code: 503, message: "The model is overloaded." } }), { status: 503 });
+const geminiOk = () => new Response(streamOf('data: {"candidates":[{"content":{"parts":[{"text":"{}"}]},"finishReason":"STOP"}]}\n\n'));
+const modelOf = url => decodeURIComponent(url.match(/models\/([^:]+):/)[1]);
+
+test("Gemini: retries with growing waits when the service is busy", async () => {
   process.env.GEMINI_API_KEY = "g";
   let n = 0;
-  next = () => ++n === 1 ? new Response(JSON.stringify({ error: { code: 503, message: "The model is overloaded." } }), { status: 503 })
-    : new Response(streamOf('data: {"candidates":[{"content":{"parts":[{"text":"{}"}]},"finishReason":"STOP"}]}\n\n'));
+  next = () => ++n <= 2 ? busy503() : geminiOk();
   const events = await readEvents(await post({ prompt: "x" }));
-  assert.equal(calls, 2);
+  assert.equal(calls, 3, "two busy answers, then success");
   assert.equal(events.find(e => e.type === "content_block_delta").delta.text, "{}");
-  n = 0; calls = 0;
-  next = () => new Response(JSON.stringify({ error: { code: 503, message: "The model is overloaded." } }), { status: 503 });
+  assert.equal(waits.length, 2);
+  assert.ok(waits[0] >= 2000 && waits[0] <= 2500 && waits[1] >= 5000 && waits[1] <= 5500, `backoff with a little jitter: ${waits}`);
+  assert.match(lastCall.url, /gemini-3\.8-flash:/, "still the default model");
+});
+
+test("Gemini: falls back to the quick model once when the default stays busy", async () => {
+  process.env.GEMINI_API_KEY = "g";
+  const models = [];
+  next = () => { const m = modelOf(lastCall.url); models.push(m); return m === "gemini-3.5-flash-lite" ? geminiOk() : busy503(); };
+  const events = await readEvents(await post({ prompt: "x" }));
+  assert.deepEqual(models, ["gemini-3.8-flash", "gemini-3.8-flash", "gemini-3.8-flash", "gemini-3.8-flash", "gemini-3.5-flash-lite"], "4 tries, then the quick model");
+  assert.equal(events.find(e => e.type === "content_block_delta").delta.text, "{}");
+  assert.equal(waits.length, 3);
+  assert.ok(waits.reduce((a, b) => a + b) < 20000, "worst-case waiting stays well under Netlify's limits");
+
+  // both stay busy: the first model's busy error is reported
+  calls = 0; waits = []; models.length = 0;
+  next = () => { models.push(modelOf(lastCall.url)); return models.at(-1) === "gemini-3.5-flash-lite" ? new Response('{"error":{"code":404,"message":"not found"}}', { status: 404 }) : busy503(); };
   const err = await lastError(await post({ prompt: "x" }));
-  assert.equal(calls, 2);
-  assert.equal(err.type, "busy");
+  assert.equal(calls, 5);
+  assert.equal(err.type, "busy", "a failing fallback doesn't hide that the service is busy");
+  assert.match(err.message, /^503 unavailable: The model is overloaded/);
+
+  // a quick request has no other model to fall back to
+  calls = 0; models.length = 0;
+  next = () => { models.push(modelOf(lastCall.url)); return busy503(); };
+  assert.equal((await lastError(await post({ prompt: "x", tier: "quick" }))).type, "busy");
+  assert.deepEqual(models, Array(4).fill("gemini-3.5-flash-lite"), "no fallback to the same model");
+
+  // the same when GEMINI_MODEL_QUICK is set to the default model
+  calls = 0; models.length = 0; process.env.GEMINI_MODEL_QUICK = "gemini-3.8-flash";
+  await (await post({ prompt: "x" })).text();
+  assert.equal(calls, 4);
+
+  // other errors are not retried
+  calls = 0;
+  next = () => new Response('{"error":{"code":429,"message":"Quota"}}', { status: 429 });
+  assert.equal((await lastError(await post({ prompt: "x" }))).type, "rate_limited");
+  assert.equal(calls, 1);
+});
+
+test("Anthropic: retries when overloaded and falls back to its quick model", async () => {
+  process.env.ANTHROPIC_API_KEY = "a"; process.env.ANTHROPIC_MODEL_QUICK = "claude-quick-test";
+  const models = [];
+  const sse = 'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"{}"}}\n\n';
+  next = () => { const m = JSON.parse(lastCall.init.body).model; models.push(m);
+    return m === "claude-quick-test" ? new Response(streamOf(sse)) : new Response('{"error":{"type":"overloaded_error","message":"Overloaded"}}', { status: 529 }); };
+  const text = await (await post({ prompt: "x" })).text();
+  assert.deepEqual(models, ["claude-sonnet-5-5", "claude-sonnet-5-5", "claude-sonnet-5-5", "claude-sonnet-5-5", "claude-quick-test"]);
+  assert.ok(text.endsWith(sse));
+});
+
+test("keeps the stream alive while waiting between retries", async () => {
+  process.env.GEMINI_API_KEY = "g";
+  const fake = RETRY.sleep, delays = RETRY.delaysMs, ping = STREAM.keepAliveMs;
+  RETRY.sleep = realSleep; RETRY.delaysMs = [300]; STREAM.keepAliveMs = 50;
+  let n = 0;
+  next = () => ++n === 1 ? busy503() : geminiOk();
+  try {
+    const text = await (await post({ prompt: "x" })).text();
+    assert.ok((text.match(/: keep-alive/g) || []).length >= 2, "keep-alive comments are sent during the wait");
+    assert.match(text, /"text":"\{\}"/);
+  } finally { RETRY.sleep = fake; RETRY.delaysMs = delays; STREAM.keepAliveMs = ping; }
 });
 
 test("starts the stream right away, before the AI answers", async () => {

@@ -23,8 +23,14 @@ const DEFAULT_MODELS = {
   gemini: { default: "gemini-3.8-flash", quick: "gemini-3.5-flash-lite" },
   anthropic: { default: "claude-sonnet-5-5", quick: "claude-haiku-5-5" },
 };
-const KEEPALIVE_MS = 5000;
-const RETRY_DELAY_MS = 2000;
+// Keep-alive comment interval (changeable by the tests).
+export const STREAM = { keepAliveMs: 5000 };
+// Temporary provider errors (500/502/503/529, e.g. the free tier is overloaded) are retried
+// up to 3 times after these waits (plus up to `jitterMs`), then the quick model is tried once
+// if it differs. Worst case about 18 s of waiting; keep-alive comments keep the stream open.
+// `sleep` can be replaced by the tests.
+export const RETRY = { delaysMs: [2000, 5000, 10000], jitterMs: 500, sleep: ms => new Promise(r => setTimeout(r, ms)) };
+const TEMPORARY = new Set([500, 502, 503, 529]);
 // Request size: the page's largest request is a material-analysis part of about 90,000 characters
 // (ANALYZE_CHARS = 80,000 plus instructions and topic names); quizzes send at most ~50,000.
 // The limits leave room for that, also when every character needs several bytes as JSON/UTF-8.
@@ -44,7 +50,6 @@ function env(name) {
 }
 const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
 const sseHeaders = { "content-type": "text/event-stream", "cache-control": "no-store", "x-accel-buffering": "no" };
-const sleep = ms => new Promise(r => setTimeout(r, ms));
 const event = obj => `data: ${JSON.stringify(obj)}\n\n`;
 const errorEvent = (code, message = "") => event({ type: "error", error: { type: code, message: String(message).slice(0, 300) } });
 
@@ -91,9 +96,11 @@ export async function handle(request, context) {
 
   const tier = body.tier === "quick" ? "quick" : "default";
   const prefix = prov === "gemini" ? "GEMINI" : "ANTHROPIC";
-  const model = env(tier === "quick" ? `${prefix}_MODEL_QUICK` : `${prefix}_MODEL`) || DEFAULT_MODELS[prov][tier];
+  const modelFor = t => env(t === "quick" ? `${prefix}_MODEL_QUICK` : `${prefix}_MODEL`) || DEFAULT_MODELS[prov][t];
+  // The model asked for, then the quick model as a fallback when the first stays busy.
+  const models = [...new Set([modelFor(tier), modelFor("quick")])];
 
-  return streamResponse(send => prov === "gemini" ? runGemini(send, key, model, prompt) : runAnthropic(send, key, model, prompt));
+  return streamResponse(send => prov === "gemini" ? runGemini(send, key, models, prompt) : runAnthropic(send, key, models, prompt));
 }
 
 // ---- request checks ---------------------------------------------------------------
@@ -167,7 +174,7 @@ function streamResponse(run) {
       let open = true;
       const send = s => { if (open) { try { ctrl.enqueue(enc.encode(s)); } catch (e) { open = false; } } };
       send(": connected\n\n");
-      const ping = setInterval(() => send(": keep-alive\n\n"), KEEPALIVE_MS);
+      const ping = setInterval(() => send(": keep-alive\n\n"), STREAM.keepAliveMs);
       try { await run(send); }
       catch (e) {
         console.log("Exam Coach AI error:", e && e.message ? e.message : e);
@@ -182,13 +189,26 @@ function streamResponse(run) {
   return new Response(stream, { headers: sseHeaders });
 }
 
-// Calls the provider once more if it answers with a temporary server error.
-async function fetchWithRetry(url, init) {
-  let res = await fetch(url, init);
-  if (res.status === 500 || res.status === 502 || res.status === 503 || res.status === 529) {
-    await sleep(RETRY_DELAY_MS);
-    res = await fetch(url, init);
+// Calls the provider with `request(model)`. On a temporary server error it waits and tries
+// again (RETRY.delaysMs). If the model still fails that way, the quick model (when it is a
+// different one) gets one try; if that fails too, the first model's error is reported.
+const drop = res => { try { res.body?.cancel(); } catch (e) {} };
+async function fetchWithRetry(name, models, request) {
+  const [model, fallback] = models;
+  let res = await request(model);
+  for (let i = 0; i < RETRY.delaysMs.length && TEMPORARY.has(res.status); i++) {
+    const wait = RETRY.delaysMs[i] + Math.round(Math.random() * RETRY.jitterMs);
+    console.log(`Exam Coach AI retry: ${name} ${model} answered ${res.status}; try ${i + 2} of ${RETRY.delaysMs.length + 1} in ${wait} ms`);
+    drop(res);
+    await RETRY.sleep(wait);
+    res = await request(model);
   }
+  if (!TEMPORARY.has(res.status) || !fallback) return res;
+  console.log(`Exam Coach AI retry: ${name} ${model} still answers ${res.status}; trying ${fallback} instead`);
+  const alt = await request(fallback);
+  if (alt.ok) { drop(res); return alt; }
+  console.log(`Exam Coach AI retry: ${name} ${fallback} answered ${alt.status} too`);
+  drop(alt);
   return res;
 }
 
@@ -219,12 +239,12 @@ async function pipe(res, onText) {
 }
 
 // ---- Anthropic: its stream already has the format the page reads -------------------
-async function runAnthropic(send, key, model, prompt) {
-  const res = await fetchWithRetry("https://api.anthropic.com/v1/messages", {
+async function runAnthropic(send, key, models, prompt) {
+  const res = await fetchWithRetry("Anthropic", models, model => fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: { "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json" },
     body: JSON.stringify({ model, max_tokens: 16000, stream: true, system: SYSTEM, messages: [{ role: "user", content: prompt }] }),
-  });
+  }));
   if (!res.ok) {
     const msg = await readError(res);
     console.log(`Exam Coach AI error: Anthropic ${res.status} ${msg}`);
@@ -235,17 +255,17 @@ async function runAnthropic(send, key, model, prompt) {
 }
 
 // ---- Gemini: convert its stream into the same format ---------------------------------
-async function runGemini(send, key, model, prompt) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
-  const res = await fetchWithRetry(url, {
+async function runGemini(send, key, models, prompt) {
+  const body = JSON.stringify({
+    systemInstruction: { parts: [{ text: SYSTEM }] },
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    generationConfig: { maxOutputTokens: 32768, responseMimeType: "application/json" },
+  });
+  const res = await fetchWithRetry("Gemini", models, model => fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`, {
     method: "POST",
     headers: { "x-goog-api-key": key, "content-type": "application/json" },
-    body: JSON.stringify({
-      systemInstruction: { parts: [{ text: SYSTEM }] },
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
-      generationConfig: { maxOutputTokens: 32768, responseMimeType: "application/json" },
-    }),
-  });
+    body,
+  }));
   if (!res.ok) {
     const msg = await readError(res);
     console.log(`Exam Coach AI error: Gemini ${res.status} ${msg}`);

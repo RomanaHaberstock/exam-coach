@@ -11,7 +11,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
-import { handle } from "../netlify/edge-functions/ai.js";
+import { handle, RETRY } from "../netlify/edge-functions/ai.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ORIGIN = "http://exam-coach.test";
@@ -20,7 +20,9 @@ const TYPES = { ".html": "text/html", ".css": "text/css", ".js": "text/javascrip
 
 // ---- fake Anthropic API -------------------------------------------------------
 const realFetch = globalThis.fetch;
-const upstream = { calls: 0, models: [], fail: null, prompts: [], maxPrompt: 0, delay: 0 };
+const upstream = { calls: 0, models: [], fail: null, failWhen: null, answered: [], prompts: [], maxPrompt: 0, delay: 0 };
+// The backend waits between retries of a busy provider; no real waiting in the tests.
+RETRY.sleep = async () => {};
 function fakeAnswer(prompt) {
   const part = prompt.match(/This is part (\d+) of (\d+)/);
   if (part && prompt.includes("study topics in a sensible learning order")) {
@@ -74,6 +76,8 @@ globalThis.fetch = async (url, init) => {
   if (init.headers["x-goog-api-key"] !== "test-key") return new Response(JSON.stringify({ error: { code: 400, message: "API key not valid" } }), { status: 400 });
   const body = JSON.parse(init.body), prompt = body.contents[0].parts[0].text;
   upstream.prompts.push(prompt);
+  if (upstream.failWhen && upstream.failWhen(prompt)) return new Response(JSON.stringify({ error: { code: 503, message: "The model is overloaded." } }), { status: 503 });
+  upstream.answered.push(upstream.models.at(-1));
   if (upstream.delay) await new Promise(r => setTimeout(r, upstream.delay));
   if (upstream.maxPrompt && prompt.length > upstream.maxPrompt) return new Response(JSON.stringify({ error: { code: 400, message: "The input token count exceeds the maximum number of tokens allowed" } }), { status: 400 });
   const text = JSON.stringify(fakeAnswer(prompt));
@@ -466,6 +470,49 @@ test("tries again with smaller parts when a request is too large", async () => {
   const retried = upstream.prompts.slice(1);
   assert.ok(retried.length > 3 && retried.every(p => p.length <= 50000), "second try used smaller parts");
   assert.deepEqual(await page.evaluate(id => examById(id).topics.map(t => t.name), id), ["Hypothesis tests", "Sampling", "Regression models"]);
+});
+
+test("waits and tries a busy part again, and resumes from the failed part later", async () => {
+  const mats = [{ name: "slides.pdf", kind: "slides", text: longMaterial() }, { name: "old.pdf", kind: "oldexam", text: oldExamText() }];
+  const id = await examWithMaterials(mats);
+  await page.evaluate(() => { ANALYZE_BUSY.waitS = 1; });
+  const partOf = p => +(p.match(/This is part (\d) of 3/) || [])[1];
+  // part 2 is busy once (all backend retries and the quick model), then works
+  let busyLeft = 5;
+  upstream.prompts = []; upstream.models = []; upstream.failWhen = p => partOf(p) === 2 && busyLeft-- > 0;
+  await page.evaluate(id => { analyzeMaterials(examById(id)); }, id);
+  await page.waitForFunction(() => /The AI is busy — trying part 2 again in 1 s…/.test(document.querySelector("#analyze-progress")?.textContent || ""));
+  await page.waitForFunction(() => !busy.analyze, null, { timeout: 20000 });
+  assert.deepEqual(upstream.prompts.map(partOf), [1, 2, 2, 2, 2, 2, 2, 3], "backend: 4 tries + quick model; then the page tries part 2 again");
+  assert.deepEqual(upstream.models.slice(1, 6), ["gemini-3.8-flash", "gemini-3.8-flash", "gemini-3.8-flash", "gemini-3.8-flash", "gemini-3.5-flash-lite"]);
+  assert.deepEqual(await page.evaluate(id => examById(id).topics.map(t => t.name), id), ["Hypothesis tests", "Sampling", "Regression models"]);
+
+  // part 2 stays busy: the parts read so far are kept and Analyse continues from part 2
+  await page.evaluate(id => { const e = examById(id); e.topics = []; }, id);
+  upstream.prompts = []; upstream.failWhen = p => partOf(p) === 2;
+  await page.evaluate(id => analyzeMaterials(examById(id)), id);
+  assert.deepEqual([...new Set(upstream.prompts.map(partOf))], [1, 2], "part 3 isn't read after part 2 failed");
+  assert.equal(upstream.prompts.filter(p => partOf(p) === 2).length, 15, "3 tries by the page, 5 requests each by the backend");
+  const msg = await page.textContent("#toast");
+  assert.match(msg, /overloaded right now \(this happens on the free plan at busy times\)\. Your work is kept — try again in a minute\./);
+  assert.match(msg, /already read part 1 of 3\. Press Analyse again to continue with part 2\./);
+  assert.doesNotMatch(msg, /gemini|google|netlify/i);
+  assert.equal(await page.evaluate(id => examById(id).topics.length, id), 0);
+  upstream.prompts = []; upstream.failWhen = null;
+  await page.evaluate(id => analyzeMaterials(examById(id)), id);
+  assert.deepEqual(upstream.prompts.map(partOf), [2, 3], "resumes with part 2, part 1 isn't read again");
+  assert.match(upstream.prompts[0], /Topics found in earlier parts: Hypothesis tests; Sampling/, "knows the topics of part 1");
+  const e = await page.evaluate(id => { const e = examById(id); return e.topics.map(t => [t.name, t.effortH]); }, id);
+  assert.deepEqual(e, [["Hypothesis tests", 6], ["Sampling", 1.5], ["Regression models", 3]], "same result as reading all parts at once");
+
+  // changed materials: no resume, all parts are read again
+  upstream.prompts = []; upstream.failWhen = p => partOf(p) === 2;
+  await page.evaluate(id => analyzeMaterials(examById(id)), id);
+  upstream.failWhen = null; upstream.prompts = [];
+  await page.evaluate(async id => { const e = examById(id), m = e.materials[0]; await putMaterial(m.id, { name: m.name, kind: m.kind, text: (await getMaterial(m.id)) + " more" }); }, id);
+  await page.evaluate(id => analyzeMaterials(examById(id)), id);
+  assert.deepEqual(upstream.prompts.map(partOf), [1, 2, 3]);
+  await page.evaluate(() => { ANALYZE_BUSY.waitS = 20; });
 });
 
 test("explains that scanned PDFs can't be read instead of asking the AI", async () => {
@@ -944,6 +991,7 @@ test("works on a 375 px phone screen", async () => {
 
 test("makes no requests to other servers and has no errors", () => {
   assert.ok(upstream.calls >= 4, "the AI backend was called");
-  assert.ok(upstream.models.every(m => m === "gemini-3.8-flash"), "uses the default Gemini model");
+  assert.ok(upstream.answered.every(m => m === "gemini-3.8-flash"), "uses the default Gemini model");
+  assert.ok(upstream.models.every(m => m === "gemini-3.8-flash" || m === "gemini-3.5-flash-lite"), "the quick model only as a fallback when the default is busy");
   assert.deepEqual(problems, []);
 });

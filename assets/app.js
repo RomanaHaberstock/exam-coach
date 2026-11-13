@@ -803,7 +803,7 @@ function aiError(e) {
   if (c === "forbidden") return "This page isn't allowed to use the AI. Open Exam Coach from its own website.";
   if (c === "access_code") return "Enter the access code at the top of the page to use the AI features.";
   if (c === "empty_completion") return "The AI didn't send an answer. Try again.";
-  if (c === "busy") return "The AI service is busy right now. Wait a minute and try again.";
+  if (c === "busy") return "The AI service is overloaded right now (this happens on the free plan at busy times). Your work is kept — try again in a minute.";
   if (c === "rate_limited") return "The AI's usage limit is reached for now. Wait a minute and try again. If it keeps happening, the daily limit is used up and resets the next morning.";
   if (c === "invalid_json") return "The AI's answer couldn't be read. Try again.";
   if (c === "prompt_too_large") return "The materials are too large for one request. Remove a file and try again.";
@@ -832,15 +832,50 @@ Reply with only JSON in this shape:
 MATERIALS:
 ${digest}`;
 }
+// When the AI is busy (after the backend's own retries), a part is tried again after a wait.
+// Parts already read are kept: if a part still fails, pressing Analyse again continues there,
+// as long as the materials haven't changed (`key`). Tests may shorten `waitS`.
+const ANALYZE_BUSY = { waitS: 20, tries: 2 };
+const analysisKey = (e, mats, budget) => JSON.stringify([e.id, budget, mats.map(m => [m.id, m.kind, m.text.length])]);
+let analysisResume = null; // { key, results, n }
+function waitAbortable(ms, signal) {
+  return new Promise((res, rej) => {
+    if (signal.aborted) return rej({ code: "cancelled" });
+    const t = setTimeout(() => { signal.removeEventListener("abort", stop); res(); }, ms);
+    const stop = () => { clearTimeout(t); rej({ code: "cancelled" }); };
+    signal.addEventListener("abort", stop, { once: true });
+  });
+}
+const progressText = p => !p ? "The AI is reading your materials. This can take a minute or two."
+  : p.wait ? `The AI is busy — trying ${p.n > 1 ? `part ${p.i} ` : ""}again in ${p.wait} s…`
+  : p.n > 1 ? `${p.retry ? "That was too much at once, so the AI is trying smaller parts. " : p.resumed ? `Continuing where it stopped (parts 1–${p.resumed} are already read). ` : "Your materials are long, so the AI reads them in parts. "}Reading part ${p.i} of ${p.n}…`
+  : "The AI is reading your materials. This can take a minute or two.";
+function showProgress() { const el = $("#analyze-progress .ptext"); if (el) el.textContent = progressText(busy.progress); else render(); }
 async function runAnalysis(e, mats, budget, signal, retry) {
   const { parts, shared } = splitMaterials(mats, budget);
-  const n = parts.length, results = [];
-  for (let i = 0; i < n; i++) {
+  const n = parts.length, key = analysisKey(e, mats, budget);
+  const results = analysisResume && analysisResume.key === key && analysisResume.n === n ? analysisResume.results : [];
+  const resumed = results.length;
+  analysisResume = null;
+  for (let i = results.length; i < n; i++) {
     if (signal.aborted) throw { code: "cancelled" };
-    busy.progress = n > 1 ? { i: i + 1, n, retry } : null; render();
     const known = [...new Set(results.flatMap(r => r.topics.map(t => String(t.name))))].slice(0, 40);
     const digest = digestOf([...shared, ...parts[i]]);
-    const res = await sample.json(analysisPrompt(e, digest, { i: i + 1, n, shared: shared.length > 0, known }), { signal, modelTier: "default" });
+    let res;
+    for (let attempt = 0; ; attempt++) {
+      busy.progress = n > 1 || attempt ? { i: i + 1, n, retry, resumed } : null; showProgress();
+      try { res = await sample.json(analysisPrompt(e, digest, { i: i + 1, n, shared: shared.length > 0, known }), { signal, modelTier: "default" }); break; }
+      catch (err) {
+        const temporary = err && (err.code === "busy" || err.code === "rate_limited");
+        if (temporary && attempt < ANALYZE_BUSY.tries) {
+          for (let s = ANALYZE_BUSY.waitS; s > 0; s--) { busy.progress = { i: i + 1, n, wait: s }; showProgress(); await waitAbortable(1000 * Math.min(1, s), signal); }
+          continue;
+        }
+        if (results.length) analysisResume = { key, results, n };
+        if (temporary && results.length) err.kept = { done: results.length, n };
+        throw err;
+      }
+    }
     const topics = Array.isArray(res && res.topics) ? res.topics.filter(t => t && t.name) : [];
     const tasks = Array.isArray(res && res.tasks) ? res.tasks : [];
     results.push({ topics, tasks, style: String((res && res.style) || ""), old: shared.length > 0 || parts[i].some(m => m.kind === "oldexam"), oldOnly: parts[i].every(m => m.kind === "oldexam") });
@@ -860,9 +895,11 @@ async function analyzeMaterials(e) {
   aiCtl = new AbortController();
   try {
     let r;
-    try { r = await runAnalysis(e, mats, ANALYZE_CHARS, aiCtl.signal, false); }
+    // A stopped analysis with smaller parts continues with smaller parts.
+    const small = analysisResume && analysisResume.key === analysisKey(e, mats, ANALYZE_RETRY_CHARS);
+    try { r = small ? await runAnalysis(e, mats, ANALYZE_RETRY_CHARS, aiCtl.signal, true) : await runAnalysis(e, mats, ANALYZE_CHARS, aiCtl.signal, false); }
     catch (err) {
-      if (err.code !== "prompt_too_large") throw err;
+      if (err.code !== "prompt_too_large" || small) throw err;
       r = await runAnalysis(e, mats, ANALYZE_RETRY_CHARS, aiCtl.signal, true);
     }
     const old = Object.fromEntries(e.topics.map(t => [normName(t.name), t]));
@@ -888,7 +925,7 @@ async function analyzeMaterials(e) {
   } catch (err) {
     busy.analyze = null; busy.progress = null; render();
     if (err.code === "prompt_too_large") toast("The materials are too large for the AI, even in smaller parts. Remove a file and try again.");
-    else if (err.code !== "cancelled") toast(aiError(err));
+    else if (err.code !== "cancelled") toast(aiError(err) + (err.kept ? ` The AI already read ${err.kept.done > 1 ? `parts 1–${err.kept.done}` : "part 1"} of ${err.kept.n}. Press Analyse again to continue with part ${err.kept.done + 1}.` : ""));
   }
 }
 async function generateQuiz(e, t, n) {
@@ -2228,7 +2265,7 @@ function vExams() {
       ${e.materials.length ? `<div class="mats">${e.materials.map(m => `<div class="mat"><span class="chip ${m.kind === "oldexam" ? "mock" : m.kind === "slides" ? "review" : "learn"}">${{ script: "Script", slides: "Slides", oldexam: "Old exam" }[m.kind]}</span><b>${esc(m.name)}</b><span class="small muted mono">${m.pages} ${/\.pdf$/i.test(m.name) ? "pages" : "parts"}${m.truncated ? " · shortened" : ""}</span>${m.empty ? `<span class="chip warn" title="${isPdf(m.name) ? "Scanned PDFs without a text layer can't be read yet" : "This file has almost no text"}">${isPdf(m.name) ? "scanned? no text found" : "little text found"}</span>` : ""}<button class="btn sm ghost" data-act="rm-mat" data-id="${m.id}">${confirmKey === "mat" + m.id ? "Click to remove" : "Remove"}</button></div>`).join("")}</div>` : ""}
       <div class="row">
         ${busy.analyze === e.id
-          ? `<span id="analyze-progress"><span class="spinner"></span> ${busy.progress ? `${busy.progress.retry ? "That was too much at once, so the AI is trying smaller parts. " : "Your materials are long, so the AI reads them in parts. "}Reading part ${busy.progress.i} of ${busy.progress.n}…` : "The AI is reading your materials. This can take a minute or two."}</span><button class="btn sm" data-act="stop">Stop</button>`
+          ? `<span id="analyze-progress"><span class="spinner"></span> <span class="ptext">${esc(progressText(busy.progress))}</span></span><button class="btn sm" data-act="stop">Stop</button>`
           : `<button class="btn primary" data-act="analyze" ${e.materials.length && sample ? "" : "disabled"}>${T.length ? "Re-analyze materials" : "Analyze materials with AI"}</button>
              ${!sample ? `<span class="small muted">${aiOffMsg()}</span>` : !e.materials.length ? `<span class="small muted">Add at least one file first.</span>` : T.length ? `<span class="small muted">Replaces the topic list. Quiz results stay with topics of the same name.</span>` : ""}`}
       </div>
