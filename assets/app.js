@@ -712,7 +712,7 @@ async function topicContext(e, t, budget = 45000) {
 
 /* ---------- AI backend ---------- */
 const AI_URL = "/api/ai";
-const AI_CODES = ["rate_limited", "busy", "bad_key", "model_unavailable", "prompt_too_large", "refused", "not_configured", "access_code", "upstream_error"];
+const AI_CODES = ["rate_limited", "busy", "stream_broken", "bad_key", "model_unavailable", "prompt_too_large", "refused", "not_configured", "access_code", "upstream_error"];
 const aiCode = () => { try { return localStorage.getItem("examcoach-code") || ""; } catch (e) { return ""; } };
 async function checkAI() {
   aiState = "checking";
@@ -764,14 +764,17 @@ async function aiCall(prompt, { signal, modelTier } = {}) {
         else if (d.type === "message_delta" && d.delta) stop = d.delta.stop_reason;
         else if (d.type === "error") {
           const t = d.error && d.error.type;
-          throw { code: t === "overloaded_error" ? "busy" : AI_CODES.includes(t) ? t : "upstream_error", detail: d.error && d.error.message };
+          throw { code: t === "overloaded_error" ? "busy" : AI_CODES.includes(t) ? t : "upstream_error", detail: d.error && d.error.message, fallbackTried: !!(d.error && d.error.fallback) };
         }
       }
     }
   } catch (e) {
     if (e && e.code) throw e;
-    throw { code: signal && signal.aborted ? "cancelled" : "upstream_error", detail: "The connection broke off while the AI was answering." };
+    // The stream was reset half-way (network, or the hosting stopped the backend).
+    throw { code: signal && signal.aborted ? "cancelled" : "stream_broken", detail: "The connection broke off while the AI was answering." };
   }
+  // The backend always ends with a stop reason or an error; a stream that just ends was cut off.
+  if (!stop) throw { code: signal && signal.aborted ? "cancelled" : "stream_broken", detail: "The AI's answer ended early." };
   if (stop === "refusal") throw { code: "refused" };
   if (!text.trim()) throw { code: "empty_completion" };
   return { text, truncated: stop === "max_tokens" };
@@ -804,6 +807,8 @@ function aiError(e) {
   if (c === "access_code") return "Enter the access code at the top of the page to use the AI features.";
   if (c === "empty_completion") return "The AI didn't send an answer. Try again.";
   if (c === "busy") return "The AI service is overloaded right now (this happens on the free plan at busy times). Your work is kept — try again in a minute.";
+  if (c === "stream_broken") return "The connection to the AI broke off. Your work is kept — try again.";
+  if (c === "rate_limited" && e.fallbackTried) return "The free AI quota is used up for now (a quicker backup model was tried too). Your work is kept — wait a minute and try again. If it keeps happening, the daily quota is used up and resets the next day.";
   if (c === "rate_limited") return "The AI's usage limit is reached for now. Wait a minute and try again. If it keeps happening, the daily limit is used up and resets the next morning.";
   if (c === "invalid_json") return "The AI's answer couldn't be read. Try again.";
   if (c === "prompt_too_large") return "The materials are too large for one request. Remove a file and try again.";
@@ -832,12 +837,16 @@ Reply with only JSON in this shape:
 MATERIALS:
 ${digest}`;
 }
-// When the AI is busy (after the backend's own retries), a part is tried again after a wait.
-// Parts already read are kept: if a part still fails, pressing Analyse again continues there,
-// as long as the materials haven't changed (`key`). Tests may shorten `waitS`.
+// When the AI is busy or its quota is used up (after the backend's own retries and the quick
+// model), a part is tried again after a wait. When the connection broke off half-way
+// ("stream_broken"), the part is tried again after the wait too, but in smaller pieces:
+// the failed part and all later ones are split again with ANALYZE_RETRY_CHARS, so each request
+// is answered sooner and uses less of the per-minute quota. Parts already read are kept.
+// If a part still fails, pressing Analyse again continues there (with the same, possibly
+// smaller, parts), as long as the materials haven't changed (`key`). Tests may shorten `waitS`.
 const ANALYZE_BUSY = { waitS: 20, tries: 2 };
-const analysisKey = (e, mats, budget) => JSON.stringify([e.id, budget, mats.map(m => [m.id, m.kind, m.text.length])]);
-let analysisResume = null; // { key, results, n }
+const analysisKey = (e, mats) => JSON.stringify([e.id, mats.map(m => [m.id, m.kind, m.text.length])]);
+let analysisResume = null; // { key, parts, shared, results, smaller, retry }
 function waitAbortable(ms, signal) {
   return new Promise((res, rej) => {
     if (signal.aborted) return rej({ code: "cancelled" });
@@ -847,32 +856,55 @@ function waitAbortable(ms, signal) {
   });
 }
 const progressText = p => !p ? "The AI is reading your materials. This can take a minute or two."
-  : p.wait ? `The AI is busy — trying ${p.n > 1 ? `part ${p.i} ` : ""}again in ${p.wait} s…`
-  : p.n > 1 ? `${p.retry ? "That was too much at once, so the AI is trying smaller parts. " : p.resumed ? `Continuing where it stopped (parts 1–${p.resumed} are already read). ` : "Your materials are long, so the AI reads them in parts. "}Reading part ${p.i} of ${p.n}…`
+  : p.wait ? (p.broken ? `The connection to the AI broke off — trying ${p.n > 1 ? `part ${p.i} ` : ""}again${p.split ? " in smaller parts" : ""} in ${p.wait} s…` : `The AI is busy — trying ${p.n > 1 ? `part ${p.i} ` : ""}again in ${p.wait} s…`)
+  : p.n > 1 ? `${p.retry ? "That was too much at once, so the AI is trying smaller parts. " : p.resumed ? `Continuing where it stopped (parts 1–${p.resumed} are already read). ` : p.smaller ? "The connection broke off, so the AI reads the rest in smaller parts. " : "Your materials are long, so the AI reads them in parts. "}Reading part ${p.i} of ${p.n}…`
   : "The AI is reading your materials. This can take a minute or two.";
 function showProgress() { const el = $("#analyze-progress .ptext"); if (el) el.textContent = progressText(busy.progress); else render(); }
+// Splits parts i, i+1, … again into smaller ones (old exams shared into every part stay shared).
+function smallerParts(parts, i, shared) {
+  const room = Math.max(10000, ANALYZE_RETRY_CHARS - sum(shared, m => m.text.length)), out = [];
+  let cur = [], used = 0;
+  for (const p of parts.slice(i).flat().flatMap(m => pagesOf(m, room))) {
+    if (cur.length && used + p.text.length > room) { out.push(cur); cur = []; used = 0; }
+    const last = cur[cur.length - 1];
+    if (last && last.id === p.id) last.text += "\n" + p.text; else cur.push({ ...p });
+    used += p.text.length;
+  }
+  if (cur.length) out.push(cur);
+  return [...parts.slice(0, i), ...out];
+}
 async function runAnalysis(e, mats, budget, signal, retry) {
-  const { parts, shared } = splitMaterials(mats, budget);
-  const n = parts.length, key = analysisKey(e, mats, budget);
-  const results = analysisResume && analysisResume.key === key && analysisResume.n === n ? analysisResume.results : [];
-  const resumed = results.length;
+  const key = analysisKey(e, mats);
+  const saved = analysisResume && analysisResume.key === key ? analysisResume : null;
   analysisResume = null;
-  for (let i = results.length; i < n; i++) {
+  let { parts, shared } = saved || splitMaterials(mats, budget);
+  let smaller = saved ? saved.smaller : budget <= ANALYZE_RETRY_CHARS;
+  retry = saved ? saved.retry : retry;
+  const results = saved ? saved.results : [], resumed = results.length;
+  for (let i = results.length; i < parts.length; i++) {
     if (signal.aborted) throw { code: "cancelled" };
     const known = [...new Set(results.flatMap(r => r.topics.map(t => String(t.name))))].slice(0, 40);
-    const digest = digestOf([...shared, ...parts[i]]);
     let res;
     for (let attempt = 0; ; attempt++) {
-      busy.progress = n > 1 || attempt ? { i: i + 1, n, retry, resumed } : null; showProgress();
-      try { res = await sample.json(analysisPrompt(e, digest, { i: i + 1, n, shared: shared.length > 0, known }), { signal, modelTier: "default" }); break; }
+      const n = parts.length;
+      busy.progress = n > 1 || attempt ? { i: i + 1, n, retry, resumed, smaller: smaller && !retry } : null; showProgress();
+      try { res = await sample.json(analysisPrompt(e, digestOf([...shared, ...parts[i]]), { i: i + 1, n, shared: shared.length > 0, known }), { signal, modelTier: "default" }); break; }
       catch (err) {
-        const temporary = err && (err.code === "busy" || err.code === "rate_limited");
+        const broken = err && err.code === "stream_broken";
+        const temporary = broken || (err && (err.code === "busy" || err.code === "rate_limited"));
+        const split = broken && !smaller;
         if (temporary && attempt < ANALYZE_BUSY.tries) {
-          for (let s = ANALYZE_BUSY.waitS; s > 0; s--) { busy.progress = { i: i + 1, n, wait: s }; showProgress(); await waitAbortable(1000 * Math.min(1, s), signal); }
+          for (let s = ANALYZE_BUSY.waitS; s > 0; s--) { busy.progress = { i: i + 1, n, wait: s, broken, split }; showProgress(); await waitAbortable(1000 * Math.min(1, s), signal); }
+          if (split) {
+            // Nothing read yet: start over with the smaller plan (as for a too-large request).
+            if (i === 0) ({ parts, shared } = splitMaterials(mats, ANALYZE_RETRY_CHARS));
+            else parts = smallerParts(parts, i, shared);
+            smaller = true;
+          }
           continue;
         }
-        if (results.length) analysisResume = { key, results, n };
-        if (temporary && results.length) err.kept = { done: results.length, n };
+        if (results.length || smaller) analysisResume = { key, parts, shared, results, smaller, retry };
+        if (temporary && results.length) err.kept = { done: results.length, n: parts.length };
         throw err;
       }
     }
@@ -880,6 +912,7 @@ async function runAnalysis(e, mats, budget, signal, retry) {
     const tasks = Array.isArray(res && res.tasks) ? res.tasks : [];
     results.push({ topics, tasks, style: String((res && res.style) || ""), old: shared.length > 0 || parts[i].some(m => m.kind === "oldexam"), oldOnly: parts[i].every(m => m.kind === "oldexam") });
   }
+  const n = parts.length;
   const list = n === 1 ? results[0].topics.slice(0, 14) : mergeTopics(results, shared.length > 0);
   if (!list.length) throw { code: "invalid_json" };
   const styled = results.find(r => r.old && r.style) || results.find(r => r.style);
@@ -895,11 +928,13 @@ async function analyzeMaterials(e) {
   aiCtl = new AbortController();
   try {
     let r;
-    // A stopped analysis with smaller parts continues with smaller parts.
-    const small = analysisResume && analysisResume.key === analysisKey(e, mats, ANALYZE_RETRY_CHARS);
-    try { r = small ? await runAnalysis(e, mats, ANALYZE_RETRY_CHARS, aiCtl.signal, true) : await runAnalysis(e, mats, ANALYZE_CHARS, aiCtl.signal, false); }
+    // A stopped analysis continues with the parts it had (also when they were made smaller).
+    const resume = !!(analysisResume && analysisResume.key === analysisKey(e, mats));
+    const small = resume && analysisResume.smaller;
+    try { r = await runAnalysis(e, mats, ANALYZE_CHARS, aiCtl.signal, false); }
     catch (err) {
       if (err.code !== "prompt_too_large" || small) throw err;
+      analysisResume = null;
       r = await runAnalysis(e, mats, ANALYZE_RETRY_CHARS, aiCtl.signal, true);
     }
     const old = Object.fromEntries(e.topics.map(t => [normName(t.name), t]));

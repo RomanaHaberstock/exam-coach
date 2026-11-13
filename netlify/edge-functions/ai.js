@@ -28,6 +28,8 @@ export const STREAM = { keepAliveMs: 5000 };
 // Temporary provider errors (500/502/503/529, e.g. the free tier is overloaded) are retried
 // up to 3 times after these waits (plus up to `jitterMs`), then the quick model is tried once
 // if it differs. Worst case about 18 s of waiting; keep-alive comments keep the stream open.
+// A 429 (quota or rate limit) is not retried with the same model, because those limits last a
+// minute or a day; the quick model has its own quota on the free tier, so it gets one try.
 // `sleep` can be replaced by the tests.
 export const RETRY = { delaysMs: [2000, 5000, 10000], jitterMs: 500, sleep: ms => new Promise(r => setTimeout(r, ms)) };
 const TEMPORARY = new Set([500, 502, 503, 529]);
@@ -51,7 +53,20 @@ function env(name) {
 const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
 const sseHeaders = { "content-type": "text/event-stream", "cache-control": "no-store", "x-accel-buffering": "no" };
 const event = obj => `data: ${JSON.stringify(obj)}\n\n`;
-const errorEvent = (code, message = "") => event({ type: "error", error: { type: code, message: String(message).slice(0, 300) } });
+// `fallback`: the quick model was tried too and didn't help (the page says so).
+const errorEvent = (code, message = "", fallback = false) => event({ type: "error", error: { type: code, message: String(message).slice(0, 300), ...(fallback ? { fallback: true } : {}) } });
+
+// CPU budget: Netlify stops an edge function that uses more than 50 ms of CPU time per request
+// (waiting for the AI doesn't count), and the page then only sees the connection break off.
+// So the body is read and parsed once, the request to the provider is built once per model
+// (retries reuse it), and the stream conversion does constant work per piece of text
+// (no re-scanning of a growing buffer). Measured locally for the largest allowed request
+// (~280 kB body) plus a 120,000-character answer: about 3-12 ms CPU per request.
+// An unhandled promise rejection would end the whole isolate, and with it every answer it
+// is streaming at that moment; log it instead.
+if (typeof globalThis.addEventListener === "function" && typeof Deno !== "undefined") {
+  globalThis.addEventListener("unhandledrejection", ev => { ev.preventDefault(); console.log("Exam Coach AI error: unhandled", ev.reason && ev.reason.message ? ev.reason.message : ev.reason); });
+}
 
 export function provider() {
   const p = String(env("AI_PROVIDER") || "").trim().toLowerCase();
@@ -100,7 +115,7 @@ export async function handle(request, context) {
   // The model asked for, then the quick model as a fallback when the first stays busy.
   const models = [...new Set([modelFor(tier), modelFor("quick")])];
 
-  return streamResponse(send => prov === "gemini" ? runGemini(send, key, models, prompt) : runAnthropic(send, key, models, prompt));
+  return streamResponse((send, signal) => prov === "gemini" ? runGemini(send, key, models, prompt, signal) : runAnthropic(send, key, models, prompt, signal));
 }
 
 // ---- request checks ---------------------------------------------------------------
@@ -147,18 +162,23 @@ function limited(map, ip, { windowMs, max }, count) {
 export function resetLimits() { requests.clear(); codeFails.clear(); }
 
 // Reads the body as text, or returns null as soon as it is larger than `max` bytes.
+// The bytes are collected and decoded once at the end.
 async function readLimited(request, max) {
   if (!request.body) return "";
-  const reader = request.body.getReader(), dec = new TextDecoder();
-  let size = 0, out = "";
+  const reader = request.body.getReader(), chunks = [];
+  let size = 0;
   for (;;) {
     const { value, done } = await reader.read();
     if (done) break;
     size += value.byteLength;
     if (size > max) { try { await reader.cancel(); } catch (e) {} return null; }
-    out += dec.decode(value, { stream: true });
+    chunks.push(value);
   }
-  return out + dec.decode();
+  if (chunks.length === 1) return new TextDecoder().decode(chunks[0]);
+  const all = new Uint8Array(size);
+  let at = 0;
+  for (const c of chunks) { all.set(c, at); at += c.byteLength; }
+  return new TextDecoder().decode(all);
 }
 
 // Error details for the page name the HTTP status, not the provider; the log keeps the provider.
@@ -166,33 +186,40 @@ const STATUS_TEXT = { 400: "bad request", 401: "unauthorized", 403: "forbidden",
 const statusLabel = status => `${status} ${STATUS_TEXT[status] || "error"}`;
 
 // Starts the response immediately, keeps it alive while waiting, and turns any
-// failure into an error event the page can show.
+// failure into an error event the page can show. When the page goes away (tab closed,
+// connection lost), the request to the provider is aborted, so no more CPU time is spent
+// reading an answer nobody receives.
 function streamResponse(run) {
-  const enc = new TextEncoder();
+  const enc = new TextEncoder(), gone = new AbortController();
+  let open = true;
   const stream = new ReadableStream({
     async start(ctrl) {
-      let open = true;
-      const send = s => { if (open) { try { ctrl.enqueue(enc.encode(s)); } catch (e) { open = false; } } };
+      const send = s => { if (open) { try { ctrl.enqueue(enc.encode(s)); } catch (e) { open = false; gone.abort(); } } };
       send(": connected\n\n");
       const ping = setInterval(() => send(": keep-alive\n\n"), STREAM.keepAliveMs);
-      try { await run(send); }
+      try { await run(send, gone.signal); }
       catch (e) {
-        console.log("Exam Coach AI error:", e && e.message ? e.message : e);
-        send(errorEvent("upstream_error", e && e.message ? e.message : "The request to the AI failed."));
+        const msg = e && e.message ? e.message : "The request to the AI failed.";
+        if (gone.signal.aborted) console.log("Exam Coach AI: the page closed the connection");
+        else if (e && e.broken) { console.log("Exam Coach AI error: the provider's answer broke off:", msg); send(errorEvent("stream_broken", `The AI's answer broke off: ${msg}`)); }
+        else { console.log("Exam Coach AI error:", msg); send(errorEvent("upstream_error", msg)); }
       } finally {
         clearInterval(ping);
         open = false;
         try { ctrl.close(); } catch (e) {}
       }
     },
+    cancel() { open = false; gone.abort(); },
   });
   return new Response(stream, { headers: sseHeaders });
 }
 
 // Calls the provider with `request(model)`. On a temporary server error it waits and tries
-// again (RETRY.delaysMs). If the model still fails that way, the quick model (when it is a
-// different one) gets one try; if that fails too, the first model's error is reported.
-const drop = res => { try { res.body?.cancel(); } catch (e) {} };
+// again (RETRY.delaysMs). If the model still fails that way, or it answers 429 (quota or rate
+// limit), the quick model (when it is a different one) gets one try; if that fails too, the
+// first model's error is reported, with `fallbackTried` set.
+// cancel() returns a promise; a rejection must not go unhandled (that would end the isolate).
+const drop = res => { try { const p = res.body && res.body.cancel(); if (p && p.catch) p.catch(() => {}); } catch (e) {} };
 async function fetchWithRetry(name, models, request) {
   const [model, fallback] = models;
   let res = await request(model);
@@ -203,13 +230,15 @@ async function fetchWithRetry(name, models, request) {
     await RETRY.sleep(wait);
     res = await request(model);
   }
-  if (!TEMPORARY.has(res.status) || !fallback) return res;
-  console.log(`Exam Coach AI retry: ${name} ${model} still answers ${res.status}; trying ${fallback} instead`);
+  const quota = res.status === 429;
+  if (!(TEMPORARY.has(res.status) || quota) || !fallback) return { res, fallbackTried: false };
+  console.log(quota ? `Exam Coach AI retry: ${name} ${model} answered 429 (quota or rate limit); trying ${fallback} instead`
+    : `Exam Coach AI retry: ${name} ${model} still answers ${res.status}; trying ${fallback} instead`);
   const alt = await request(fallback);
-  if (alt.ok) { drop(res); return alt; }
+  if (alt.ok) { drop(res); return { res: alt, fallbackTried: true }; }
   console.log(`Exam Coach AI retry: ${name} ${fallback} answered ${alt.status} too`);
   drop(alt);
-  return res;
+  return { res, fallbackTried: true };
 }
 
 async function readError(res) {
@@ -228,60 +257,70 @@ function errorCode(status, message) {
   return "upstream_error";
 }
 
-async function pipe(res, onText) {
+// Passes the provider's answer on as text. If reading it fails half-way (the provider's
+// connection broke off), the error is marked so the page gets the code "stream_broken".
+async function pipe(res, onText, signal) {
   const reader = res.body.getReader(), dec = new TextDecoder();
+  const stop = () => { try { reader.cancel().catch(() => {}); } catch (e) {} };
+  if (signal) { if (signal.aborted) stop(); else signal.addEventListener("abort", stop, { once: true }); }
   for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    onText(dec.decode(value, { stream: true }));
+    let r;
+    try { r = await reader.read(); }
+    catch (e) { if (!(signal && signal.aborted)) e.broken = true; throw e; }
+    if (r.done) break;
+    onText(dec.decode(r.value, { stream: true }));
   }
   onText(dec.decode());
 }
 
+async function sendError(send, name, res, fallbackTried) {
+  const msg = await readError(res);
+  console.log(`Exam Coach AI error: ${name} ${res.status} ${msg}${fallbackTried ? " (the quick model was tried too)" : ""}`);
+  send(errorEvent(errorCode(res.status, msg), `${statusLabel(res.status)}: ${msg}`, fallbackTried));
+}
+
 // ---- Anthropic: its stream already has the format the page reads -------------------
-async function runAnthropic(send, key, models, prompt) {
-  const res = await fetchWithRetry("Anthropic", models, model => fetch("https://api.anthropic.com/v1/messages", {
+async function runAnthropic(send, key, models, prompt, signal) {
+  // The request body names the model, so it is built once per model (not once per retry).
+  const bodies = new Map();
+  const bodyFor = model => bodies.get(model) || bodies.set(model, JSON.stringify({ model, max_tokens: 16000, stream: true, system: SYSTEM, messages: [{ role: "user", content: prompt }] })).get(model);
+  const { res, fallbackTried } = await fetchWithRetry("Anthropic", models, model => fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: { "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json" },
-    body: JSON.stringify({ model, max_tokens: 16000, stream: true, system: SYSTEM, messages: [{ role: "user", content: prompt }] }),
+    body: bodyFor(model), signal,
   }));
-  if (!res.ok) {
-    const msg = await readError(res);
-    console.log(`Exam Coach AI error: Anthropic ${res.status} ${msg}`);
-    send(errorEvent(errorCode(res.status, msg), `${statusLabel(res.status)}: ${msg}`));
-    return;
-  }
-  await pipe(res, send);
+  if (!res.ok) return sendError(send, "Anthropic", res, fallbackTried);
+  await pipe(res, send, signal);
 }
 
 // ---- Gemini: convert its stream into the same format ---------------------------------
-async function runGemini(send, key, models, prompt) {
+async function runGemini(send, key, models, prompt, signal) {
   const body = JSON.stringify({
     systemInstruction: { parts: [{ text: SYSTEM }] },
     contents: [{ role: "user", parts: [{ text: prompt }] }],
     generationConfig: { maxOutputTokens: 32768, responseMimeType: "application/json" },
   });
-  const res = await fetchWithRetry("Gemini", models, model => fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`, {
+  const { res, fallbackTried } = await fetchWithRetry("Gemini", models, model => fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`, {
     method: "POST",
     headers: { "x-goog-api-key": key, "content-type": "application/json" },
-    body,
+    body, signal,
   }));
-  if (!res.ok) {
-    const msg = await readError(res);
-    console.log(`Exam Coach AI error: Gemini ${res.status} ${msg}`);
-    send(errorEvent(errorCode(res.status, msg), `${statusLabel(res.status)}: ${msg}`));
-    return;
-  }
+  if (!res.ok) return sendError(send, "Gemini", res, fallbackTried);
   const parser = geminiParser(send);
-  await pipe(res, parser.push);
+  await pipe(res, parser.push, signal);
   parser.end();
 }
 
 const FINISH = { STOP: "end_turn", MAX_TOKENS: "max_tokens", SAFETY: "refusal", RECITATION: "refusal", PROHIBITED_CONTENT: "refusal", BLOCKLIST: "refusal", SPII: "refusal" };
 
 // Reads Gemini's server-sent events (in any chunk sizes) and sends page events.
+// Linear in the size of the stream: each new piece of text is searched once for the end of an
+// event ("\n\n"); pieces of an unfinished event are collected and joined once it is complete.
+// (Appending to one buffer and searching/slicing it again for every piece costs time
+// proportional to the square of an event's size: ~30-60 ms CPU for one 200 kB event that
+// arrives in 256-byte pieces, more than Netlify allows.)
 export function geminiParser(send) {
-  let buf = "", stop = null;
+  let pending = [], cr = false, stop = null;
   const handleEvent = raw => {
     const line = raw.split("\n").find(l => l.startsWith("data:"));
     if (!line) return;
@@ -300,13 +339,27 @@ export function geminiParser(send) {
   };
   return {
     push(text) {
-      buf = (buf + text).replace(/\r\n/g, "\n");
-      let i;
-      while ((i = buf.indexOf("\n\n")) >= 0) { handleEvent(buf.slice(0, i)); buf = buf.slice(i + 2); }
+      // "\r\n" line ends may be split between pieces: a trailing "\r" waits for the next piece.
+      if (cr) { text = "\r" + text; cr = false; }
+      if (text.endsWith("\r")) { cr = true; text = text.slice(0, -1); }
+      if (text.includes("\r")) text = text.replace(/\r\n/g, "\n");
+      if (!text) return;
+      let from = 0, i;
+      // an event end split between pieces: the last piece ended with "\n", this one starts with it
+      if (text[0] === "\n" && pending.length && pending[pending.length - 1].endsWith("\n")) {
+        handleEvent(pending.join("")); pending = []; from = 1;
+      }
+      while ((i = text.indexOf("\n\n", from)) >= 0) {
+        pending.push(text.slice(from, i));
+        handleEvent(pending.join("")); pending = [];
+        from = i + 2;
+      }
+      if (from < text.length) pending.push(from ? text.slice(from) : text);
     },
     end() {
-      if (buf.trim()) handleEvent(buf);
-      buf = "";
+      const rest = pending.join("") + (cr ? "\r" : "");
+      if (rest.trim()) handleEvent(rest);
+      pending = []; cr = false;
       send(event({ type: "message_delta", delta: { stop_reason: stop || "end_turn" } }));
     },
   };

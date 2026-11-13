@@ -3,7 +3,7 @@
 
 import { test, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
-import { handle, provider, geminiToEvents, resetLimits, RATE, CODE_RATE, RETRY, STREAM } from "../netlify/edge-functions/ai.js";
+import { handle, provider, geminiToEvents, geminiParser, resetLimits, RATE, CODE_RATE, RETRY, STREAM } from "../netlify/edge-functions/ai.js";
 
 const realFetch = globalThis.fetch;
 let next = null, lastCall = null, calls = 0;
@@ -145,6 +145,93 @@ test("Gemini: falls back to the quick model once when the default stays busy", a
   next = () => new Response('{"error":{"code":429,"message":"Quota"}}', { status: 429 });
   assert.equal((await lastError(await post({ prompt: "x" }))).type, "rate_limited");
   assert.equal(calls, 1);
+});
+
+test("falls back to the quick model once when the default model's quota is used up (429)", async () => {
+  process.env.GEMINI_API_KEY = "g";
+  const quota = () => new Response(JSON.stringify({ error: { code: 429, message: "You exceeded your current quota. Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_input_token_count" } }), { status: 429 });
+  const models = [], logs = [], log = console.log;
+  console.log = (...a) => logs.push(a.join(" "));
+  try {
+    next = () => { models.push(modelOf(lastCall.url)); return models.at(-1) === "gemini-3.5-flash-lite" ? geminiOk() : quota(); };
+    const events = await readEvents(await post({ prompt: "x" }));
+    assert.deepEqual(models, ["gemini-3.8-flash", "gemini-3.5-flash-lite"], "no waiting retries on a quota error, straight to the quick model");
+    assert.deepEqual(waits, []);
+    assert.equal(events.find(e => e.type === "content_block_delta").delta.text, "{}");
+    assert.ok(logs.some(l => /gemini-3\.8-flash answered 429 \(quota or rate limit\); trying gemini-3\.5-flash-lite instead/.test(l)), logs.join("\n"));
+
+    // both quotas used up: the first error is reported and says the fallback was tried
+    models.length = 0; logs.length = 0;
+    next = () => { models.push(modelOf(lastCall.url)); return quota(); };
+    const err = await lastError(await post({ prompt: "x" }));
+    assert.deepEqual(models, ["gemini-3.8-flash", "gemini-3.5-flash-lite"]);
+    assert.equal(err.type, "rate_limited");
+    assert.equal(err.fallback, true);
+    assert.match(err.message, /^429 rate limit: You exceeded your current quota/);
+    assert.ok(logs.some(l => /gemini-3\.5-flash-lite answered 429 too/.test(l)));
+
+    // a quick request has no other model: no fallback flag
+    models.length = 0;
+    const quick = await lastError(await post({ prompt: "x", tier: "quick" }));
+    assert.deepEqual(models, ["gemini-3.5-flash-lite"]);
+    assert.equal(quick.type, "rate_limited");
+    assert.equal(quick.fallback, undefined);
+  } finally { console.log = log; }
+});
+
+test("reports a provider answer that breaks off half-way as stream_broken", async () => {
+  process.env.GEMINI_API_KEY = "g";
+  let n = 0;
+  next = () => new Response(new ReadableStream({ pull(c) {
+    if (n++) throw new TypeError("error reading a body from connection: connection reset");
+    c.enqueue(new TextEncoder().encode('data: {"candidates":[{"content":{"parts":[{"text":"{\\"topics\\":"}]}}]}\r\n\r\n'));
+  } }));
+  const events = await readEvents(await post({ prompt: "x" }));
+  assert.equal(events[0].delta.text, '{"topics":');
+  assert.equal(events.at(-1).type, "error");
+  assert.equal(events.at(-1).error.type, "stream_broken");
+  assert.match(events.at(-1).error.message, /answer broke off: .*connection reset/);
+});
+
+test("stops asking the provider when the page closes the connection", async () => {
+  process.env.GEMINI_API_KEY = "g";
+  let signal;
+  next = () => { signal = lastCall.init.signal; return new Response(new ReadableStream({ pull: () => new Promise(() => {}) })); };
+  const res = await post({ prompt: "x" });
+  const reader = res.body.getReader();
+  await reader.read();
+  for (let i = 0; i < 5 && !signal; i++) await new Promise(r => setTimeout(r, 5));
+  assert.ok(signal && !signal.aborted);
+  await reader.cancel();
+  assert.equal(signal.aborted, true, "the request to the provider is aborted");
+});
+
+test("Gemini stream conversion stays linear for big events in small pieces", () => {
+  const text = "y\"ä".repeat(70000);
+  const sse = `data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text }] }, finishReason: "STOP" }] })}\r\n\r\n`;
+  const pieces = []; for (let i = 0; i < sse.length; i += 256) pieces.push(sse.slice(i, i + 256));
+  const run = () => { const out = []; const p = geminiParser(s => out.push(s)); for (const x of pieces) p.push(x); p.end(); return out; };
+  run();
+  const t0 = performance.now(), out = run(), ms = performance.now() - t0;
+  assert.equal(out.length, 2);
+  assert.equal(JSON.parse(out[0].slice(6)).delta.text, text);
+  assert.ok(ms < 25, `one 200 kB event in 256-byte pieces took ${ms.toFixed(1)} ms (budget: 50 ms CPU per request)`);
+  // "\r\n\r\n" split at every possible place
+  const two = 'data: {"candidates":[{"content":{"parts":[{"text":"a"}]}}]}\r\n\r\ndata: {"candidates":[{"content":{"parts":[{"text":"b"}]}}]}\r\n\r\n';
+  for (let cut = 1; cut < two.length; cut++) {
+    const got = []; const p = geminiParser(s => got.push(s)); p.push(two.slice(0, cut)); p.push(two.slice(cut)); p.end();
+    assert.deepEqual(got.slice(0, 2).map(e => JSON.parse(e.slice(6)).delta.text), ["a", "b"], `cut at ${cut}`);
+  }
+});
+
+test("builds the request to the provider once per model, not once per retry", async () => {
+  process.env.ANTHROPIC_API_KEY = "a";
+  const bodies = [];
+  let n = 0;
+  next = () => { bodies.push(lastCall.init.body); return ++n <= 3 ? new Response('{"error":{"type":"overloaded_error","message":"Overloaded"}}', { status: 529 }) : new Response(streamOf("")); };
+  await (await post({ prompt: "p".repeat(100000) })).text();
+  assert.equal(bodies.length, 4);
+  assert.ok(bodies.every(b => b === bodies[0]), "the same string is sent again");
 });
 
 test("Anthropic: retries when overloaded and falls back to its quick model", async () => {

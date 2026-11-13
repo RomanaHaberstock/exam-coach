@@ -20,7 +20,7 @@ const TYPES = { ".html": "text/html", ".css": "text/css", ".js": "text/javascrip
 
 // ---- fake Anthropic API -------------------------------------------------------
 const realFetch = globalThis.fetch;
-const upstream = { calls: 0, models: [], fail: null, failWhen: null, answered: [], prompts: [], maxPrompt: 0, delay: 0 };
+const upstream = { calls: 0, models: [], fail: null, failWhen: null, answered: [], prompts: [], maxPrompt: 0, delay: 0, cutWhen: null };
 // The backend waits between retries of a busy provider; no real waiting in the tests.
 RETRY.sleep = async () => {};
 function fakeAnswer(prompt) {
@@ -96,7 +96,11 @@ async function serve(ctx) {
     if (url.origin !== ORIGIN) { problems.push("external request: " + url.href); return route.abort(); }
     if (url.pathname === "/api/ai") {
       const res = await handle(new Request(req.url(), { method: req.method(), headers: req.headers(), body: req.method() === "POST" ? req.postData() : undefined }));
-      return route.fulfill({ status: res.status, headers: Object.fromEntries(res.headers), body: await res.text() });
+      let body = await res.text();
+      // A connection that breaks off half-way: the answer stops after its first piece of text.
+      if (upstream.cutWhen && req.method() === "POST" && upstream.cutWhen(JSON.parse(req.postData()).prompt))
+        body = body.slice(0, body.indexOf("\n\n", body.indexOf("content_block_delta")) + 2);
+      return route.fulfill({ status: res.status, headers: Object.fromEntries(res.headers), body });
     }
     const file = path.join(ROOT, url.pathname === "/" ? "index.html" : decodeURIComponent(url.pathname));
     if (!file.startsWith(ROOT) || !fs.existsSync(file)) return route.fulfill({ status: 404, body: "not found" });
@@ -512,6 +516,49 @@ test("waits and tries a busy part again, and resumes from the failed part later"
   await page.evaluate(async id => { const e = examById(id), m = e.materials[0]; await putMaterial(m.id, { name: m.name, kind: m.kind, text: (await getMaterial(m.id)) + " more" }); }, id);
   await page.evaluate(id => analyzeMaterials(examById(id)), id);
   assert.deepEqual(upstream.prompts.map(partOf), [1, 2, 3]);
+  await page.evaluate(() => { ANALYZE_BUSY.waitS = 20; });
+});
+
+test("tries a part whose connection broke off again in smaller parts, and resumes later", async () => {
+  const id = await examWithMaterials([{ name: "slides.pdf", kind: "slides", text: longMaterial() }, { name: "old.pdf", kind: "oldexam", text: oldExamText() }]);
+  await page.evaluate(() => { ANALYZE_BUSY.waitS = 1; });
+  const partOf = p => { const m = p.match(/This is part (\d+) of (\d+)/); return m ? `${m[1]}/${m[2]}` : "1/1"; };
+  // part 2 of 3 breaks off once
+  let cut = 1;
+  upstream.prompts = []; upstream.cutWhen = p => /This is part 2 of 3/.test(p) && cut-- > 0;
+  await page.evaluate(id => { analyzeMaterials(examById(id)); }, id);
+  await page.waitForFunction(() => /The connection to the AI broke off — trying part 2 again in smaller parts in 1 s…/.test(document.querySelector("#analyze-progress")?.textContent || ""));
+  await page.waitForFunction(() => /The connection broke off, so the AI reads the rest in smaller parts\. Reading part \d of 7…/.test(document.querySelector("#analyze-progress")?.textContent || ""));
+  await page.waitForFunction(() => !busy.analyze, null, { timeout: 20000 });
+  const seq = upstream.prompts.map(partOf);
+  assert.deepEqual(seq, ["1/3", "2/3", "2/7", "3/7", "4/7", "5/7", "6/7", "7/7"], "part 1 is kept; the rest is read again in smaller parts");
+  const later = upstream.prompts.slice(2);
+  assert.ok(later.every(p => p.length < 35000), "smaller requests: " + later.map(p => p.length));
+  assert.ok(later.every(p => p.includes("OLD EXAM: old.pdf")), "old exams still go into every part");
+  assert.match(later[0], /Topics found in earlier parts: Hypothesis tests; Sampling/, "knows the topics of part 1");
+  assert.deepEqual(await page.evaluate(id => examById(id).topics.map(t => t.name), id), ["Hypothesis tests", "Sampling", "Regression models"]);
+  const all = upstream.prompts.slice(0, 1).concat(later).join("");
+  for (let pg = 1; pg <= 60; pg++) assert.ok(all.includes(`=== p. ${pg} ===\n`), `page ${pg} was read`);
+
+  // it keeps breaking off: the parts read so far are kept, and Analyse continues in smaller parts
+  await page.evaluate(id => { examById(id).topics = []; }, id);
+  upstream.prompts = []; upstream.cutWhen = p => /This is part (2 of 3|[2-9] of 7)/.test(p);
+  await page.evaluate(id => analyzeMaterials(examById(id)), id);
+  assert.deepEqual(upstream.prompts.map(partOf), ["1/3", "2/3", "2/7", "2/7"], "one try with the big part, two with the smaller one");
+  const msg = await page.textContent("#toast");
+  assert.match(msg, /^The connection to the AI broke off\. Your work is kept — try again\. The AI already read part 1 of 7\. Press Analyse again to continue with part 2\./);
+  upstream.prompts = []; upstream.cutWhen = null;
+  await page.evaluate(id => analyzeMaterials(examById(id)), id);
+  assert.deepEqual(upstream.prompts.map(partOf), ["2/7", "3/7", "4/7", "5/7", "6/7", "7/7"], "resumes with the smaller parts");
+  assert.deepEqual(await page.evaluate(id => examById(id).topics.map(t => t.name), id), ["Hypothesis tests", "Sampling", "Regression models"]);
+
+  // short materials (one request) that break off: read again in smaller parts from the start
+  const id2 = await examWithMaterials([{ name: "notes.pdf", kind: "script", text: longMaterial().slice(0, 60000) }]);
+  cut = 1; upstream.prompts = []; upstream.cutWhen = p => !/This is part/.test(p) && cut-- > 0;
+  await page.evaluate(id => analyzeMaterials(examById(id)), id2);
+  upstream.cutWhen = null;
+  assert.deepEqual(upstream.prompts.map(partOf), ["1/1", "1/3", "2/3", "3/3"]);
+  assert.ok(await page.evaluate(id => examById(id).topics.length > 0, id2));
   await page.evaluate(() => { ANALYZE_BUSY.waitS = 20; });
 });
 
@@ -933,10 +980,32 @@ test("shows what went wrong when the AI fails", async () => {
     aiError({ code: "upstream_error", detail: "Gemini 503: models/gemini-3.8-flash at generativelanguage.googleapis.com is overloaded" })]);
   for (const t of texts) assert.doesNotMatch(t, /gemini|google|anthropic|claude|netlify|readme|api_key/i, t);
   assert.match(texts[4], /Details: .*503.*overloaded/, "technical detail is kept");
-  upstream.fail = 429;
+  // quota used up: the backend tried the quick model too, and the message says so
+  upstream.fail = 429; upstream.models = [];
   const limit = await page.evaluate(async () => { try { await AI.json("x"); return "no error"; } catch (e) { return aiError(e); } });
+  assert.deepEqual(upstream.models, ["gemini-3.8-flash", "gemini-3.5-flash-lite"]);
+  const quick = await page.evaluate(async () => { try { await AI.json("x", { modelTier: "quick" }); return "no error"; } catch (e) { return aiError(e); } });
   upstream.fail = null;
-  assert.match(limit, /usage limit/);
+  assert.match(limit, /^The free AI quota is used up for now \(a quicker backup model was tried too\)\. Your work is kept/);
+  assert.match(quick, /usage limit is reached/, "no backup model for a quick request");
+
+  // the connection breaks off half-way through the answer (reset, or a stream that just stops)
+  const broken = await page.evaluate(async () => {
+    const real = window.fetch, out = [];
+    const reset = () => new Response(new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(': connected\n\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"{"}}\n\n')); },
+      pull() { return new Promise((_, rej) => setTimeout(() => rej(new TypeError("network error")), 10)); } }));
+    const ended = () => new Response(': connected\n\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"{}"}}\n\n');
+    for (const f of [reset, ended]) {
+      window.fetch = async () => f();
+      try { await AI.json("x"); out.push("no error"); } catch (e) { out.push([e.code, aiError(e)]); }
+    }
+    window.fetch = real;
+    return out;
+  });
+  for (const [code, msg] of broken) {
+    assert.equal(code, "stream_broken");
+    assert.equal(msg, "The connection to the AI broke off. Your work is kept — try again.");
+  }
 });
 
 test("asks for the access code when one is set", async () => {
