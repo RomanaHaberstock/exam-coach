@@ -54,8 +54,9 @@ function fakeAnswer(prompt) {
       questions: ["What is a Type I error?", "How do you choose alpha?", "A third one that should be cut"], score: 55, missed: ["Type I error"] };
   }
   if (prompt.includes("short oral exam")) {
-    const n = (prompt.match(/^STUDENT: /gm) || []).length;
-    if (n < 3) return { end: false, question: n === 0 ? "Hello. What is a null hypothesis?" : `Question ${n + 1}: you said "${prompt.match(/STUDENT: ([^\n]*)\n*(?![\s\S]*STUDENT: )/)[1]}". Why?` };
+    // the student's answers come between markers with a random tag
+    const said = [...prompt.matchAll(/^STUDENT:\n<<<(\S+) answer \d+\n([\s\S]*?)\n\1 answer \d+>>>/gm)].map(m => m[2]), n = said.length;
+    if (n < 3) return { end: false, question: n === 0 ? "Hello. What is a null hypothesis?" : `Question ${n + 1}: you said "${said[n - 1]}". Why?` };
     return { end: true, score: 70, summary: "Solid basics, unsure about error types.", strengths: ["Defines H0 clearly"], improve: ["Type II error"], missed: ["Type II error"] };
   }
   if (prompt.includes("study topics in a sensible learning order"))
@@ -1010,7 +1011,7 @@ test("Oral exam practice: adapts questions, keeps the transcript when the AI fai
   await page.fill("#mode-text", "The default <claim> we test against");
   await page.click('[data-act="m-send"]');
   await page.waitForSelector("text=Question 2:");
-  assert.match(upstream.prompts[1], /EXAMINER: Hello\. What is a null hypothesis\?\n\nSTUDENT: The default <claim> we test against/, "the whole exam so far goes to the AI");
+  assert.match(upstream.prompts[1], /EXAMINER: Hello\. What is a null hypothesis\?\n\nSTUDENT:\n<<<(STUDENT_\w+) answer 1\nThe default <claim> we test against\n\1 answer 1>>>/, "the whole exam so far goes to the AI, the student's answers between markers");
   assert.ok((await page.innerHTML("#mode-chat")).includes("The default &lt;claim&gt; we test against"), "answers are escaped");
   assert.match(await page.textContent("#modes"), /Question 2:.*you said "The default <claim> we test against"/, "the follow-up adapts to the answer");
 
@@ -1041,7 +1042,7 @@ test("Oral exam practice: adapts questions, keeps the transcript when the AI fai
   await page.click('[data-act="m-send"]');
   await page.waitForSelector("#mode-result");
   await page.evaluate(() => { delete window.SpeechRecognition; render(); });
-  assert.match(upstream.prompts[upstream.prompts.length - 1], /STUDENT: A Type II error is keeping a false H0/);
+  assert.match(upstream.prompts[upstream.prompts.length - 1], /STUDENT:\n<<<STUDENT_\w+ answer 3\nA Type II error is keeping a false H0\n/);
   assert.match(upstream.prompts[upstream.prompts.length - 1], /End the exam now|end the exam/);
   const res = await page.textContent("#mode-result");
   assert.match(res, /Grade estimate\s*3\s*Befriedigend · 70%/);
