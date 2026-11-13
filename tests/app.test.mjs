@@ -8,6 +8,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
@@ -20,7 +21,7 @@ const TYPES = { ".html": "text/html", ".css": "text/css", ".js": "text/javascrip
 
 // ---- fake Anthropic API -------------------------------------------------------
 const realFetch = globalThis.fetch;
-const upstream = { calls: 0, models: [], fail: null, failWhen: null, answered: [], prompts: [], maxPrompt: 0, delay: 0, cutWhen: null };
+const upstream = { calls: 0, models: [], fail: null, failWhen: null, answered: [], prompts: [], maxPrompt: 0, delay: 0, cutWhen: null, raw: null };
 // The backend waits between retries of a busy provider; no real waiting in the tests.
 RETRY.sleep = async () => {};
 function fakeAnswer(prompt) {
@@ -80,7 +81,8 @@ globalThis.fetch = async (url, init) => {
   upstream.answered.push(upstream.models.at(-1));
   if (upstream.delay) await new Promise(r => setTimeout(r, upstream.delay));
   if (upstream.maxPrompt && prompt.length > upstream.maxPrompt) return new Response(JSON.stringify({ error: { code: 400, message: "The input token count exceeds the maximum number of tokens allowed" } }), { status: 400 });
-  const text = JSON.stringify(fakeAnswer(prompt));
+  // `raw` answers with exact text (e.g. LaTeX with single backslashes, not valid JSON).
+  const text = (upstream.raw && upstream.raw(prompt)) ?? JSON.stringify(fakeAnswer(prompt));
   const parts = [text.slice(0, 15), text.slice(15)];
   const sse = parts.map((t, i) => `data: ${JSON.stringify({ candidates: [{ content: { role: "model", parts: [{ text: t }] }, ...(i === parts.length - 1 ? { finishReason: "STOP" } : {}) }] })}\r\n\r\n`).join("");
   return new Response(sse, { headers: { "content-type": "text/event-stream" } });
@@ -568,12 +570,176 @@ test("explains that scanned PDFs can't be read instead of asking the AI", async 
   await page.setInputFiles("#mat-file", path.join(ROOT, "tests/fixtures/scanned-exam.pdf"));
   await page.waitForFunction(() => examById(selExam).materials.length === 1, null, { timeout: 15000 });
   assert.equal(await page.evaluate(() => examById(selExam).materials[0].empty), true);
-  assert.match(await page.textContent("#toast"), /"scanned-exam\.pdf" has almost no text.*scanned PDFs can't be read yet/);
+  assert.match(await page.textContent("#toast"), /"scanned-exam\.pdf" has no readable text on almost every page.*scanned PDFs can't be read yet/);
   const before = upstream.calls;
   await page.evaluate(() => { toast(""); return analyzeMaterials(examById(selExam)); });
   assert.equal(upstream.calls, before, "no request was sent");
   assert.match(await page.textContent("#toast"), /scanned PDFs can't be read yet/);
   assert.match(await page.textContent("main"), /scanned\? no text found/);
+});
+
+test("reads a large PDF page by page and keeps the text of decks with many picture slides", async () => {
+  await page.evaluate(() => { window.__savedPdf = JSON.stringify(S); newExam(); });
+  // Measured cause of "no text found": a 130-slide deck with text on half the slides (titles, a few
+  // bullet slides) has fewer than 25 characters per page on average, so the old rule called it scanned.
+  const old = await page.evaluate(async () => {
+    const f = new File([await (await fetch("/tests/fixtures/figure-deck.pdf")).blob()], "figure-deck.pdf");
+    const calls = []; const r = await extractFile(f, (i, n) => calls.push(`${i}/${n}`));
+    return { oldRule: textChars(r.text) < Math.max(200, 25 * r.pages), now: looksEmpty(r.text), noText: r.noText.length, pages: r.pages, calls: calls.length, last: calls.at(-1) };
+  });
+  assert.deepEqual(old, { oldRule: true, now: false, noText: 65, pages: 130, calls: 130, last: "130/130" });
+  await page.selectOption("#mat-kind", "slides");
+  // progress per page while reading
+  const seen = [];
+  await page.exposeFunction("__progress", t => seen.push(t)).catch(() => {});
+  await page.evaluate(() => { const o = showUpload; window.showUpload = () => { o(); __progress(uploadProgress()); }; });
+  await page.setInputFiles("#mat-file", [path.join(ROOT, "tests/fixtures/lecture-large.pdf"), path.join(ROOT, "tests/fixtures/figure-deck.pdf")]);
+  await page.waitForFunction(() => examById(selExam).materials.length === 2 && !busy.upload, null, { timeout: 30000 });
+  assert.ok(seen.some(t => /Reading "lecture-large\.pdf" \(file 1 of 2\): page \d+ of 160…/.test(t)), seen.slice(0, 3).join(" | "));
+  assert.ok(seen.some(t => /figure-deck\.pdf" \(file 2 of 2\): page 130 of 130…/.test(t)));
+  const mats = await page.evaluate(() => examById(selExam).materials.map(m => ({ empty: m.empty, noText: m.noText, pages: m.pages, failed: m.failed })));
+  assert.deepEqual(mats, [{ empty: false, noText: 48, pages: 160, failed: 0 }, { empty: false, noText: 65, pages: 130, failed: 0 }]);
+  const text = await page.evaluate(() => getMaterial(examById(selExam).materials[0].id));
+  assert.match(text, /=== p\. 159 ===\nMARKERPAGE159|MARKERPAGE159/, "text from the end of the file is kept");
+  assert.match(text, /Außenhandel/);
+  assert.match(await page.textContent("#toast"), /"figure-deck\.pdf": 65 of 130 pages had no readable text \(probably pictures\)\. The text on the other pages is used\./);
+  assert.match(await page.textContent("main"), /130 pages · 65 without text/);
+  assert.doesNotMatch(await page.textContent("main"), /no text found/);
+
+  // A page that fails is skipped, the others are kept.
+  const r = await page.evaluate(async () => {
+    const lib = window.pdfjsLib, fake = Object.create(lib);
+    // pdf.js pages 5 and 7 fail to load
+    Object.defineProperty(fake, "getDocument", { value: (...a) => ({ promise: lib.getDocument(...a).promise.then(pdf => new Proxy(pdf, { get: (o, k) =>
+      k === "getPage" ? (i => i === 5 || i === 7 ? Promise.reject(new Error("bad page")) : o.getPage(i)) : typeof o[k] === "function" ? o[k].bind(o) : o[k] })) }) });
+    window.pdfjsLib = fake;
+    try {
+      const f = new File([await (await fetch("/tests/fixtures/lecture-large.pdf")).blob()], "broken.pdf");
+      await addFiles(examById(selExam), [f], "script");
+      const m = examById(selExam).materials.at(-1), text = await getMaterial(m.id);
+      return { failed: m.failed, empty: m.empty, p4: /=== p\. 4 ===\n\S/.test(text), p9: /MARKERPAGE9\b/.test(text), toast: $("#toast").textContent };
+    } finally { window.pdfjsLib = lib; }
+  });
+  assert.equal(r.failed, 2); assert.equal(r.empty, false); assert.ok(r.p4 && r.p9);
+  assert.match(r.toast, /"broken\.pdf": pages 5, 7 couldn't be read, the rest is used\./);
+
+  // Very long files are cut at a page boundary, and the student is told how many pages are kept.
+  const cap = await page.evaluate(() => {
+    const text = Array.from({ length: 300 }, (_, i) => `\n=== p. ${i + 1} ===\n` + "x".repeat(1999) + "\n").join("");
+    const c = capText(text); return { len: c.text.length, kept: c.kept, endsClean: /x\n$/.test(c.text), last: c.text.match(/=== p\. (\d+) ===/g).at(-1) };
+  });
+  assert.ok(cap.len <= 400000 && cap.endsClean); assert.equal(cap.last, `=== p. ${cap.kept} ===`); assert.ok(cap.kept > 190 && cap.kept < 200);
+
+  // Materials flagged by the old rule are checked again when the page loads.
+  await page.evaluate(async () => { const e = examById(selExam); e.materials[1].empty = true; await recheckMaterials(); });
+  assert.equal(await page.evaluate(() => examById(selExam).materials[1].empty), false);
+  await page.evaluate(() => { Object.assign(S, JSON.parse(window.__savedPdf)); normalize(); selExam = S.exams[0] ? S.exams[0].id : null; commit({ plan: false }); });
+});
+
+test("maps Symbol-font characters to Greek letters and cleans PDF text", async () => {
+  const r = await page.evaluate(async () => {
+    const f = new File([await (await fetch("/tests/fixtures/symbol-office.pdf")).blob()], "symbol-office.pdf");
+    return { pdf: (await extractFile(f)).text,
+      clean: cleanPdfText(" Trade costs\nX = ,  1 ﬁnal \u0012big\u0013") };
+  });
+  assert.match(r.pdf, /Trade flows: α β σ τ Σ Δ/);
+  assert.equal(r.clean, "• Trade costs\nXα = β×σ, ≤ 1 final  big ");
+});
+
+test("shows formulas from the AI as readable symbols instead of LaTeX", async () => {
+  const cases = await page.evaluate(() => [
+    "Domestic trade flows ($X_{ii}$)", "$\\tau_{ij}^{1-\\sigma}$", "$\\frac{Y_i E_j}{Y}$", "costs $5 and $10", "the $\\alpha$ parameter",
+    "\\alpha + \\beta = 1", "$\\sum_{j=1}^{N} x_j \\leq 1$", "$\\hat{\\beta}$", "$R^2$", "file_name stays", "$\\left(\\frac{\\tau_{ij}}{\\Pi_i P_j}\\right)^{1-\\sigma}$",
+    "$\tau$ lost its backslash in JSON"].map(mathText));
+  assert.deepEqual(cases, ["Domestic trade flows (Xᵢᵢ)", "τᵢⱼ^(1−σ)", "(Yᵢ Eⱼ)/Y", "costs $5 and $10", "the α parameter",
+    "α + β = 1", "∑ⱼ₌₁ᴺ xⱼ ≤ 1", "β̂", "R²", "file_name stays", "(τᵢⱼ/(Πᵢ Pⱼ))^(1−σ)", "τ lost its backslash in JSON"]);
+  // Every AI answer goes through it, also when single backslashes make the JSON invalid.
+  upstream.raw = p => p.includes("MATHCHECK") ? String.raw`{"cards":[{"front":"What are domestic trade flows ($X_{ii}$)?","back":"Trade within country i, with \alpha and $\sigma > 1$."}]}` : null;
+  try {
+    const before = upstream.prompts.length;
+    const res = await page.evaluate(() => AI.json("MATHCHECK"));
+    assert.deepEqual(res, { cards: [{ front: "What are domestic trade flows (Xᵢᵢ)?", back: "Trade within country i, with α and σ > 1." }] });
+    const prompt = upstream.prompts[before];
+    assert.match(prompt, /Never use LaTeX commands or \$ signs/);
+    assert.match(prompt, /Greek letters can show up as Latin letters/);
+  } finally { upstream.raw = null; }
+  // Topic names saved earlier with LaTeX are cleaned when the state is loaded.
+  assert.equal(await page.evaluate(() => normExam({ topics: [{ id: "a", name: "Gravity: $X_{ij}$", summary: "\\alpha" }] }).topics[0].name), "Gravity: Xᵢⱼ");
+});
+
+test("adds a whole folder: lists the files with a guessed type, imports the ticked ones", async () => {
+  await page.evaluate(() => { window.__savedFold = JSON.stringify(S); newExam(); go("exams"); });
+  // Fallback for browsers without the folder picker: <input webkitdirectory>
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ec-folder-")), course = path.join(dir, "Statistik");
+  for (const d of ["Folien", "Altklausuren", ".git", "Bilder"]) fs.mkdirSync(path.join(course, d), { recursive: true });
+  fs.copyFileSync(path.join(ROOT, "tests/fixtures/statistics-script.pdf"), path.join(course, "Folien", "VO 1 Hypothesen.pdf"));
+  fs.copyFileSync(path.join(ROOT, "tests/fixtures/statistics-script.pdf"), path.join(course, "Altklausuren", "Klausur 2023.pdf"));
+  fs.copyFileSync(path.join(ROOT, "tests/fixtures/statistics-script.pdf"), path.join(course, "Skriptum.pdf"));
+  fs.writeFileSync(path.join(course, "notes.txt"), "My own notes about hypothesis tests and Type I errors. ".repeat(10));
+  fs.writeFileSync(path.join(course, "Bilder", "chart.png"), "png");
+  fs.writeFileSync(path.join(course, ".git", "x.pdf"), "hidden");
+  try {
+    assert.equal(await page.evaluate(() => canPickFolder()), false);
+    await page.setInputFiles("#mat-folder", course);
+    await page.waitForSelector("#folder-pick");
+    const rows = await page.evaluate(() => folderPick.items.map(x => [x.path, x.kind, x.on]));
+    assert.deepEqual(rows, [["Altklausuren/Klausur 2023.pdf", "oldexam", true], ["Folien/VO 1 Hypothesen.pdf", "slides", true], ["notes.txt", "script", true], ["Skriptum.pdf", "script", true]]);
+    assert.match(await page.textContent("#folder-pick"), /Files in “Statistik”.*4 files · 1 other file skipped \(only PDF, TXT, MD\)/s);
+    await page.uncheck('.fold-on[data-i="2"]');
+    await page.selectOption('.fold-kind[data-i="3"]', "slides");
+    assert.match(await page.textContent('[data-act="fold-add"]'), /Add 3 files/);
+    await page.click('[data-act="fold-add"]');
+    await page.waitForFunction(() => examById(selExam).materials.length === 3 && !busy.upload, null, { timeout: 20000 });
+    assert.deepEqual(await page.evaluate(() => examById(selExam).materials.map(m => [m.name, m.kind])),
+      [["Klausur 2023.pdf", "oldexam"], ["VO 1 Hypothesen.pdf", "slides"], ["Skriptum.pdf", "slides"]]);
+    assert.equal(await page.$("#folder-pick"), null);
+    // Choosing the folder again: files added before are listed but not ticked.
+    await page.setInputFiles("#mat-folder", course);
+    await page.waitForSelector("#folder-pick");
+    assert.deepEqual(await page.evaluate(() => folderPick.items.map(x => [x.name, x.on, x.seen])),
+      [["Klausur 2023.pdf", false, true], ["VO 1 Hypothesen.pdf", false, true], ["notes.txt", true, false], ["Skriptum.pdf", false, true]]);
+    assert.match(await page.textContent("#folder-pick"), /added before/);
+    await page.click('[data-act="fold-cancel"]');
+    assert.equal(await page.$("#folder-pick"), null);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+
+  // Browsers with the folder picker (File System Access API): the folder stays connected.
+  await page.evaluate(async () => {
+    const pdf = await (await fetch("/tests/fixtures/statistics-script.pdf")).blob();
+    const file = (name, mod) => ({ kind: "file", name, getFile: async () => new File([pdf], name, { lastModified: mod }) });
+    const folder = (name, kids) => ({ kind: "directory", name, async *entries() { for (const k of kids) yield [k.name, k]; } });
+    window.__fakeDir = folder("Makro", [file("Skript Kapitel 1.pdf", 1000), folder("Prüfungen", [file("2022.pdf", 2000)]), file("photo.jpg", 3000)]);
+    window.__fakeDir.queryPermission = async () => "granted";
+    window.showDirectoryPicker = async () => window.__fakeDir;
+    newExam(); render();
+  });
+  try {
+    await page.click('[data-act="folder"]');
+    await page.waitForSelector("#folder-pick");
+    assert.deepEqual(await page.evaluate(() => folderPick.items.map(x => [x.path, x.kind])), [["Prüfungen/2022.pdf", "oldexam"], ["Skript Kapitel 1.pdf", "script"]]);
+    await page.click('[data-act="fold-add"]');
+    await page.waitForFunction(() => examById(selExam).materials.length === 2 && !busy.upload, null, { timeout: 20000 });
+    assert.equal(await page.evaluate(() => examById(selExam).folder.name), "Makro");
+    await page.waitForSelector('[data-act="folder-check"]');
+    // Nothing new yet
+    await page.click('[data-act="folder-check"]');
+    await page.waitForFunction(() => /No new files in "Makro"/.test($("#toast").textContent));
+    // A new file appears in the folder: only that one is offered.
+    await page.evaluate(async () => {
+      const pdf = await (await fetch("/tests/fixtures/statistics-script.pdf")).blob();
+      const kids = []; for await (const [, k] of __fakeDir.entries()) kids.push(k);
+      kids.push({ kind: "file", name: "Skript Kapitel 2.pdf", getFile: async () => new File([pdf], "Skript Kapitel 2.pdf", { lastModified: 4000 }) });
+      __fakeDir.entries = async function* () { for (const k of kids) yield [k.name, k]; };
+    });
+    await page.click('[data-act="folder-check"]');
+    await page.waitForSelector("#folder-pick");
+    assert.deepEqual(await page.evaluate(() => folderPick.items.map(x => x.name)), ["Skript Kapitel 2.pdf"]);
+    assert.match(await page.textContent("#folder-pick"), /New files in “Makro”/);
+    await page.click('[data-act="fold-add"]');
+    await page.waitForFunction(() => examById(selExam).materials.length === 3 && !busy.upload, null, { timeout: 20000 });
+  } finally {
+    await page.evaluate(() => { delete window.showDirectoryPicker; Object.assign(S, JSON.parse(window.__savedFold)); normalize(); selExam = S.exams[0] ? S.exams[0].id : null; commit({ plan: false }); go("dashboard"); });
+  }
 });
 
 test("asks for energy before a focus session and offers a lighter session when low", async () => {
