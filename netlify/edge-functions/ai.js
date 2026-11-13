@@ -44,6 +44,12 @@ const MAX_BODY_BYTES = 1500000;
 // A whole class can share one IP (university Wi-Fi), so both limits are generous.
 export const RATE = { windowMs: 60000, max: 120 };        // AI requests per minute (POST only)
 export const CODE_RATE = { windowMs: 600000, max: 30 };   // wrong access codes per 10 minutes
+// Output tokens per answer. On Gemini the limit counts the model's hidden thinking too, so a
+// request that thinks a lot can end with MAX_TOKENS before (or without) any JSON. The page may ask
+// for a smaller limit (a quiz needs a few thousand tokens): if the model gets stuck repeating
+// itself, the answer then ends after seconds, not minutes, and the page can try again.
+export const OUTPUT = { max: 32768, min: 2048 };
+const clampTokens = v => { const n = Math.round(+v); return Number.isFinite(n) && n > 0 ? Math.min(OUTPUT.max, Math.max(OUTPUT.min, n)) : OUTPUT.max; };
 
 function env(name) {
   if (globalThis.Netlify && Netlify.env && Netlify.env.get) return Netlify.env.get(name);
@@ -110,12 +116,14 @@ export async function handle(request, context) {
   if (prompt.length > MAX_PROMPT_CHARS) return json({ error: "prompt_too_large" }, 413);
 
   const tier = body.tier === "quick" ? "quick" : "default";
+  // Output budget and thinking, set by the page per kind of request (see OUTPUT and thinkingFor()).
+  const opts = { maxTokens: clampTokens(body.maxTokens), think: body.think === "default" ? "default" : "low" };
   const prefix = prov === "gemini" ? "GEMINI" : "ANTHROPIC";
   const modelFor = t => env(t === "quick" ? `${prefix}_MODEL_QUICK` : `${prefix}_MODEL`) || DEFAULT_MODELS[prov][t];
   // The model asked for, then the quick model as a fallback when the first stays busy.
   const models = [...new Set([modelFor(tier), modelFor("quick")])];
 
-  return streamResponse((send, signal) => prov === "gemini" ? runGemini(send, key, models, prompt, signal) : runAnthropic(send, key, models, prompt, signal));
+  return streamResponse((send, signal) => prov === "gemini" ? runGemini(send, key, models, prompt, signal, opts) : runAnthropic(send, key, models, prompt, signal, opts));
 }
 
 // ---- request checks ---------------------------------------------------------------
@@ -280,10 +288,10 @@ async function sendError(send, name, res, fallbackTried) {
 }
 
 // ---- Anthropic: its stream already has the format the page reads -------------------
-async function runAnthropic(send, key, models, prompt, signal) {
+async function runAnthropic(send, key, models, prompt, signal, opts = {}) {
   // The request body names the model, so it is built once per model (not once per retry).
   const bodies = new Map();
-  const bodyFor = model => bodies.get(model) || bodies.set(model, JSON.stringify({ model, max_tokens: 16000, stream: true, system: SYSTEM, messages: [{ role: "user", content: prompt }] })).get(model);
+  const bodyFor = model => bodies.get(model) || bodies.set(model, JSON.stringify({ model, max_tokens: Math.min(16000, opts.maxTokens || 16000), stream: true, system: SYSTEM, messages: [{ role: "user", content: prompt }] })).get(model);
   const { res, fallbackTried } = await fetchWithRetry("Anthropic", models, model => fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: { "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json" },
@@ -294,17 +302,48 @@ async function runAnthropic(send, key, models, prompt, signal) {
 }
 
 // ---- Gemini: convert its stream into the same format ---------------------------------
-async function runGemini(send, key, models, prompt, signal) {
-  const body = JSON.stringify({
-    systemInstruction: { parts: [{ text: SYSTEM }] },
-    contents: [{ role: "user", parts: [{ text: prompt }] }],
-    generationConfig: { maxOutputTokens: 32768, responseMimeType: "application/json" },
-  });
-  const { res, fallbackTried } = await fetchWithRetry("Gemini", models, model => fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`, {
+// Thinking: Gemini 3 models think before answering ("medium" by default on Flash), and those
+// thought tokens count against maxOutputTokens. For JSON generation (quizzes, grading, study
+// material) "low" is enough and leaves the output budget to the answer; the material analysis
+// asks for the model's default ("think": "default"). Flash-Lite models default to "minimal",
+// which is already less, so they get no setting. Gemini 2.5 uses a token budget instead.
+export function thinkingFor(model, think) {
+  if (think !== "low") return null;
+  const m = /gemini-(\d+)(?:\.(\d+))?/i.exec(String(model));
+  if (!m || /lite/i.test(model)) return null;
+  if (+m[1] >= 3) return { thinkingLevel: "low" };
+  if (+m[1] === 2 && m[2] === "5") return { thinkingBudget: /pro/i.test(model) ? 128 : 0 };
+  return null;
+}
+async function runGemini(send, key, models, prompt, signal, opts = {}) {
+  // Built once per model (and without thinking settings only if the model refuses them).
+  const bodies = new Map();
+  const bodyFor = (model, plain) => {
+    const k = model + (plain ? "\n-" : "");
+    if (!bodies.has(k)) {
+      const think = plain ? null : thinkingFor(model, opts.think);
+      bodies.set(k, JSON.stringify({
+        systemInstruction: { parts: [{ text: SYSTEM }] },
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: { maxOutputTokens: opts.maxTokens || OUTPUT.max, responseMimeType: "application/json", ...(think ? { thinkingConfig: think } : {}) },
+      }));
+    }
+    return bodies.get(k);
+  };
+  const call = (model, plain) => fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`, {
     method: "POST",
     headers: { "x-goog-api-key": key, "content-type": "application/json" },
-    body, signal,
-  }));
+    body: bodyFor(model, plain), signal,
+  });
+  const { res, fallbackTried } = await fetchWithRetry("Gemini", models, async model => {
+    const r = await call(model);
+    // A model that doesn't know the thinking setting (e.g. set with GEMINI_MODEL) answers 400: ask again without it.
+    if (r.status === 400 && thinkingFor(model, opts.think)) {
+      const msg = await readError(r.clone());
+      if (/think/i.test(msg)) { console.log(`Exam Coach AI retry: Gemini ${model} refused the thinking setting; asking again without it`); drop(r); return call(model, true); }
+    }
+    return r;
+  });
   if (!res.ok) return sendError(send, "Gemini", res, fallbackTried);
   const parser = geminiParser(send);
   await pipe(res, parser.push, signal);
@@ -320,7 +359,7 @@ const FINISH = { STOP: "end_turn", MAX_TOKENS: "max_tokens", SAFETY: "refusal", 
 // proportional to the square of an event's size: ~30-60 ms CPU for one 200 kB event that
 // arrives in 256-byte pieces, more than Netlify allows.)
 export function geminiParser(send) {
-  let pending = [], cr = false, stop = null;
+  let pending = [], cr = false, stop = null, reason = "", usage = null, sent = 0;
   const handleEvent = raw => {
     const line = raw.split("\n").find(l => l.startsWith("data:"));
     if (!line) return;
@@ -330,12 +369,13 @@ export function geminiParser(send) {
       send(errorEvent(errorCode(d.error.code, d.error.message || ""), `${d.error.code ? statusLabel(d.error.code) + ": " : ""}${d.error.message || d.error.status || "error"}`)); return;
     }
     if (d.promptFeedback && d.promptFeedback.blockReason) stop = "refusal";
+    if (d.usageMetadata) usage = d.usageMetadata;
     const c = d.candidates && d.candidates[0];
     if (!c) return;
     for (const p of (c.content && c.content.parts) || []) {
-      if (typeof p.text === "string" && p.text && !p.thought) send(event({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: p.text } }));
+      if (typeof p.text === "string" && p.text && !p.thought) { sent += p.text.length; send(event({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: p.text } })); }
     }
-    if (c.finishReason) stop = FINISH[c.finishReason] || "end_turn";
+    if (c.finishReason) { reason = c.finishReason; stop = FINISH[c.finishReason] || "end_turn"; }
   };
   return {
     push(text) {
@@ -360,6 +400,9 @@ export function geminiParser(send) {
       const rest = pending.join("") + (cr ? "\r" : "");
       if (rest.trim()) handleEvent(rest);
       pending = []; cr = false;
+      // For the function log: an answer cut off by the token limit, or one without any text,
+      // with the token counts (how much went into thinking).
+      if ((reason && reason !== "STOP") || !sent) console.log(`Exam Coach AI: Gemini finished with ${reason || "no reason"} after ${sent} characters of answer` + (usage ? `; tokens: prompt ${usage.promptTokenCount || 0}, thinking ${usage.thoughtsTokenCount || 0}, answer ${usage.candidatesTokenCount || 0}` : ""));
       send(event({ type: "message_delta", delta: { stop_reason: stop || "end_turn" } }));
     },
   };

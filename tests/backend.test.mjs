@@ -3,7 +3,7 @@
 
 import { test, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
-import { handle, provider, geminiToEvents, geminiParser, resetLimits, RATE, CODE_RATE, RETRY, STREAM } from "../netlify/edge-functions/ai.js";
+import { handle, provider, geminiToEvents, geminiParser, resetLimits, thinkingFor, RATE, CODE_RATE, RETRY, STREAM, OUTPUT } from "../netlify/edge-functions/ai.js";
 
 const realFetch = globalThis.fetch;
 let next = null, lastCall = null, calls = 0;
@@ -224,6 +224,42 @@ test("Gemini stream conversion stays linear for big events in small pieces", () 
   }
 });
 
+test("Gemini: low thinking and a sized output limit for JSON generation, model default for the analysis", async () => {
+  process.env.GEMINI_API_KEY = "g";
+  const ok = () => new Response(streamOf('data: {"candidates":[{"content":{"parts":[{"text":"{}"}]},"finishReason":"STOP"}]}\n\n'));
+  next = ok;
+  await (await post({ prompt: "x", maxTokens: 9000 })).text();
+  let cfg = JSON.parse(lastCall.init.body).generationConfig;
+  assert.deepEqual(cfg.thinkingConfig, { thinkingLevel: "low" }, "default model thinks little, so thinking can't eat the answer's budget");
+  assert.equal(cfg.maxOutputTokens, 9000);
+  await (await post({ prompt: "x", think: "default" })).text();
+  cfg = JSON.parse(lastCall.init.body).generationConfig;
+  assert.equal(cfg.thinkingConfig, undefined, "analysis keeps the model's own thinking level");
+  assert.equal(cfg.maxOutputTokens, OUTPUT.max);
+  await (await post({ prompt: "x", maxTokens: 5 })).text();
+  assert.equal(JSON.parse(lastCall.init.body).generationConfig.maxOutputTokens, OUTPUT.min, "never below the minimum");
+  await (await post({ prompt: "x", tier: "quick" })).text();
+  assert.equal(JSON.parse(lastCall.init.body).generationConfig.thinkingConfig, undefined, "Flash-Lite already thinks minimally");
+  assert.deepEqual(thinkingFor("gemini-2.5-flash", "low"), { thinkingBudget: 0 });
+  assert.deepEqual(thinkingFor("gemini-2.5-pro", "low"), { thinkingBudget: 128 });
+  assert.equal(thinkingFor("gemini-1.5-flash", "low"), null);
+  // a model that refuses the setting is asked again without it
+  process.env.GEMINI_MODEL = "gemini-9-test";
+  const bodies = [];
+  next = () => { bodies.push(JSON.parse(lastCall.init.body)); return bodies.length === 1 ? new Response('{"error":{"code":400,"message":"Thinking level is not supported for this model."}}', { status: 400 }) : ok(); };
+  const ev = await readEvents(await post({ prompt: "x" }));
+  assert.equal(ev.at(-1).delta.stop_reason, "end_turn");
+  assert.deepEqual(bodies.map(b => !!b.generationConfig.thinkingConfig), [true, false]);
+});
+
+test("Gemini: an answer cut off by the token limit or with only thoughts ends with max_tokens and no text", async () => {
+  process.env.GEMINI_API_KEY = "g";
+  next = () => new Response(streamOf('data: {"candidates":[{"content":{"parts":[{"text":"plan the quiz","thought":true}]},"finishReason":"MAX_TOKENS"}],"usageMetadata":{"promptTokenCount":12000,"thoughtsTokenCount":32700,"candidatesTokenCount":0}}\n\n'));
+  const ev = await readEvents(await post({ prompt: "x" }));
+  assert.equal(ev.filter(e => e.type === "content_block_delta").length, 0);
+  assert.equal(ev.at(-1).delta.stop_reason, "max_tokens");
+});
+
 test("builds the request to the provider once per model, not once per retry", async () => {
   process.env.ANTHROPIC_API_KEY = "a";
   const bodies = [];
@@ -232,6 +268,12 @@ test("builds the request to the provider once per model, not once per retry", as
   await (await post({ prompt: "p".repeat(100000) })).text();
   assert.equal(bodies.length, 4);
   assert.ok(bodies.every(b => b === bodies[0]), "the same string is sent again");
+  // Gemini too
+  delete process.env.ANTHROPIC_API_KEY; process.env.GEMINI_API_KEY = "g";
+  bodies.length = 0; n = 0;
+  await (await post({ prompt: "p".repeat(100000) })).text();
+  assert.equal(bodies.length, 4);
+  assert.ok(bodies.every(b => b === bodies[0]), "the same string is sent again (Gemini)");
 });
 
 test("Anthropic: retries when overloaded and falls back to its quick model", async () => {
