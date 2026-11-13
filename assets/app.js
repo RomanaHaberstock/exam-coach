@@ -832,9 +832,12 @@ async function recheckMaterials() {
   if (changed) commit({ plan: false });
 }
 const SUPPORTED = /\.(pdf|txt|md)$/i;
-async function addFiles(e, files, kind) {
+// opts.name(f): name to store (a folder import uses the relative path when names collide);
+// opts.notes: messages to show with the result (files of a folder that couldn't be opened).
+async function addFiles(e, files, kind, opts = {}) {
+  if (busy.upload || busy.folder) { toast("Wait until the files being read are done."); return 0; }
   busy.upload = { f: 0, files: files.length, name: "", i: 0, n: 0 }; render();
-  let added = 0; const empty = [], notes = [];
+  let added = 0; const empty = [], notes = [...(opts.notes || [])];
   for (const [fi, f] of files.entries()) {
     const k = typeof kind === "function" ? kind(f) : kind;
     busy.upload = { f: fi + 1, files: files.length, name: f.name, i: 0, n: 0 }; showUpload();
@@ -843,10 +846,10 @@ async function addFiles(e, files, kind) {
       let last = 0;
       const r = await extractFile(f, (i, n) => { busy.upload.i = i; busy.upload.n = n; const now = Date.now(); if (now - last > 120 || i === n) { last = now; showUpload(); } });
       const { text, kept } = capText(r.text);
-      const id = uid(), isEmpty = looksEmpty(text);
-      await putMaterial(id, { name: f.name, kind: k, text });
-      const m = { id, name: f.name, kind: k, pages: r.pages, chars: text.length, truncated: !!kept, empty: isEmpty,
-        noText: isEmpty ? 0 : r.noText.length, failed: r.failed.length, ...(kept ? { keptPages: kept } : {}), src: { size: +f.size || 0, mod: +f.lastModified || 0 } };
+      const id = uid(), isEmpty = looksEmpty(text), name = (opts.name && opts.name(f)) || f.name;
+      await putMaterial(id, { name, kind: k, text });
+      const m = { id, name, kind: k, pages: r.pages, chars: text.length, truncated: !!kept, empty: isEmpty,
+        noText: isEmpty ? 0 : r.noText.length, failed: r.failed.length, ...(kept ? { keptPages: kept } : {}), src: { size: +f.size || 0, mod: +f.lastModified || 0, ...(name !== f.name ? { name: f.name } : {}) } };
       e.materials.push(m);
       if (isEmpty) empty.push(f.name);
       else {
@@ -877,18 +880,23 @@ let folderPick = null; // { examId, title, items: [{ path, name, size, mod, file
 const dirHandles = {};
 const fileKey = (name, size, mod) => `${name}|${+size || 0}|${+mod || 0}`;
 function seenKeys(e) {
-  return new Set([...(e.seenFiles || []), ...e.materials.filter(m => m.src).map(m => fileKey(m.name, m.src.size, m.src.mod))]);
+  return new Set([...(e.seenFiles || []), ...e.materials.filter(m => m.src).map(m => fileKey(m.src.name || m.name, m.src.size, m.src.mod))]);
 }
-// Old exams by name or folder (exam, Klausur, Prüfung, "old", Altklausur); slides by name; else script.
+// Old exams (exam, Klausur, Prüfung, "old", Altklausur) or slides (Folie, VO, lecture…) by the file
+// name first, then by the nearest folder name that says something; else script. "Prüfungsvorbereitung",
+// "prüfungsrelevant", "exam prep" are about preparing, not old exams.
+const OLD_RE = /exam(?!ple)|klausur|pr(ü|ue)fung|(^|[^a-z])old([^a-z]|$)|probe-?test|mock/;
+const SLIDES_RE = /slide|folie|präsentation|praesentation|lecture|vorlesung|(^|[^a-z])(vo|ppt|deck)([^a-z]|$)/;
+const NOT_OLD = /(exam|klausur|pr(ü|ue)fung)s?[-_ ]?(vorbereitung|relevant|prep|stoff)/g;
+function kindOfName(n) { n = n.replace(NOT_OLD, " "); return OLD_RE.test(n) ? "oldexam" : SLIDES_RE.test(n) ? "slides" : ""; }
 function guessKind(path) {
-  const p = String(path || "").toLowerCase();
-  if (/exam(?!ple)|klausur|pr(ü|ue)fung|(^|[^a-z])old([^a-z]|$)|probe-?test|mock/.test(p)) return "oldexam";
-  if (/slide|folie|präsentation|praesentation|lecture|vorlesung|(^|[^a-z])(vo|ppt|deck)([^a-z]|$)/.test(p)) return "slides";
-  return "script";
+  const segs = String(path || "").toLowerCase().split("/"), file = segs.pop();
+  return kindOfName(file) || segs.reverse().map(kindOfName).find(Boolean) || "script";
 }
 async function walkDir(dir, base = "", out = { files: [], other: 0 }, depth = 0) {
   for await (const [name, h] of dir.entries()) {
-    if (name.startsWith(".") || out.files.length + out.other >= FOLDER_MAX) continue;
+    if (name.startsWith(".") || name.startsWith("~$")) continue; // hidden, Office lock files
+    if (out.files.length + out.other >= FOLDER_MAX) { out.cut = true; break; }
     const path = base ? `${base}/${name}` : name;
     if (h.kind === "directory") { if (depth < FOLDER_DEPTH) await walkDir(h, path, out, depth + 1); }
     else if (SUPPORTED.test(name)) out.files.push({ path, name, handle: h });
@@ -901,37 +909,43 @@ function showFolderPick(e, title, list, other, opts = {}) {
   let items = list.map(x => ({ ...x, kind: guessKind(x.path), seen: seen.has(fileKey(x.name, x.size, x.mod)) }))
     .sort((a, b) => a.path.localeCompare(b.path, undefined, { numeric: true }));
   if (opts.onlyNew) items = items.filter(x => !x.seen);
-  items.forEach(x => { x.on = !x.seen; });
-  if (opts.onlyNew && !items.length) { folderPick = null; render(); return toast(`No new files in "${title}".${other ? ` ${other} other file${other > 1 ? "s" : ""} (not PDF, TXT or MD) skipped.` : ""}`); }
-  if (!items.length) { folderPick = null; render(); return toast(`"${title}" has no PDF, TXT or MD files${other ? ` (${other} other file${other > 1 ? "s" : ""} skipped)` : ""}.`); }
-  folderPick = { examId: e.id, title, items, skipped: other, handle: opts.handle || null, check: !!opts.onlyNew };
+  // The same file (name, size, last change) in two places: only the first is ticked.
+  const first = new Map();
+  items.forEach(x => { const k = fileKey(x.name, x.size, x.mod); x.dup = first.get(k) || null; if (!x.dup) first.set(k, x.path); x.on = !x.seen && !x.dup; });
+  const failed = opts.failed || [], fail = failed.length ? ` These files couldn't be opened: ${pageList(failed)}.` : "";
+  if (opts.onlyNew && !items.length) { folderPick = null; render(); return toast(`No new files in "${title}".${other ? ` ${other} other file${other > 1 ? "s" : ""} (not PDF, TXT or MD) skipped.` : ""}${fail}`); }
+  if (!items.length) { folderPick = null; render(); return toast(`"${title}" has no PDF, TXT or MD files${other ? ` (${other} other file${other > 1 ? "s" : ""} skipped)` : ""}.${fail}`); }
+  folderPick = { examId: e.id, title, items, skipped: other, handle: opts.handle || null, check: !!opts.onlyNew, cut: !!opts.cut, failed };
   render();
   const el = $("#folder-pick"); if (el) el.scrollIntoView({ block: "nearest" });
 }
 async function pickFolder(e) {
+  if (filesBusy()) return;
   let dir;
   try { dir = await window.showDirectoryPicker({ id: "exam-coach", mode: "read" }); }
   catch (err) { if (err && err.name !== "AbortError") toast("The folder couldn't be opened."); return; }
   await readFolder(e, dir, false);
 }
 async function readFolder(e, dir, onlyNew) {
+  if (filesBusy()) return;
   busy.folder = true; render();
   try {
-    const { files, other } = await walkDir(dir);
-    const list = [];
-    for (const x of files) { try { const f = await x.handle.getFile(); list.push({ ...x, size: f.size, mod: f.lastModified }); } catch (err) {} }
+    const { files, other, cut } = await walkDir(dir);
+    const list = [], failed = [];
+    for (const x of files) { try { const f = await x.handle.getFile(); list.push({ ...x, size: f.size, mod: f.lastModified }); } catch (err) { failed.push(x.path); } }
     busy.folder = false;
-    showFolderPick(e, dir.name, list, other, { onlyNew, handle: dir });
+    showFolderPick(e, dir.name, list, other, { onlyNew, handle: dir, cut, failed });
   } catch (err) { busy.folder = false; render(); toast("The folder couldn't be read. Choose it again."); }
 }
 // Fallback: <input webkitdirectory> gives all files of the folder with their relative paths.
 function folderFromInput(e, files) {
-  const all = [...files].filter(f => !(f.webkitRelativePath || f.name).split("/").some(s => s.startsWith(".")));
+  let all = [...files].filter(f => !(f.webkitRelativePath || f.name).split("/").some(s => s.startsWith(".") || s.startsWith("~$")));
+  const cut = all.length > FOLDER_MAX; if (cut) all = all.slice(0, FOLDER_MAX);
   const ok = all.filter(f => SUPPORTED.test(f.name));
   const title = ((ok[0] || all[0] || {}).webkitRelativePath || "").split("/")[0] || "Folder";
   // Paths inside the chosen folder (without its own name), as with the folder picker.
   const rel = f => (f.webkitRelativePath || f.name).split("/").slice(1).join("/") || f.name;
-  showFolderPick(e, title, ok.map(f => ({ path: rel(f), name: f.name, size: f.size, mod: f.lastModified, file: f })), all.length - ok.length);
+  showFolderPick(e, title, ok.map(f => ({ path: rel(f), name: f.name, size: f.size, mod: f.lastModified, file: f })), all.length - ok.length, { cut });
 }
 async function checkFolder(e) {
   let dir = dirHandles[e.id];
@@ -946,20 +960,24 @@ async function checkFolder(e) {
 }
 async function importFolderPick() {
   const fp = folderPick, e = fp && examById(fp.examId); if (!e) return;
+  if (busy.upload || busy.folder) return;
   const chosen = fp.items.filter(x => x.on);
   if (!chosen.length) return toast("Tick at least one file.");
   folderPick = null;
-  const files = [], kinds = new Map(), keys = new Map();
+  // Files with the same name (in different folders, or already added) are stored under their path.
+  const count = new Map();
+  for (const n of [...chosen.map(x => x.name), ...new Set(e.materials.map(m => m.name))]) count.set(n, (count.get(n) || 0) + 1);
+  const files = [], kinds = new Map(), names = new Map(), gone = [];
   for (const x of chosen) {
     let f = x.file;
-    if (!f) try { f = await x.handle.getFile(); } catch (err) { toast(`${x.name}: couldn't be opened.`); continue; }
-    files.push(f); kinds.set(f, x.kind); keys.set(f, x);
+    if (!f) try { f = await x.handle.getFile(); } catch (err) { gone.push(x.path); continue; }
+    files.push(f); kinds.set(f, x.kind); names.set(f, count.get(x.name) > 1 ? x.path : x.name);
   }
   if (fp.handle) {
     dirHandles[e.id] = fp.handle; e.folder = { name: String(fp.title).slice(0, 120) };
     try { await idb.set("dir-" + e.id, fp.handle); } catch (err) {} // not kept where the browser can't store handles
   }
-  await addFiles(e, files, f => kinds.get(f));
+  await addFiles(e, files, f => kinds.get(f), { name: f => names.get(f), notes: gone.length ? [`Couldn't open ${pageList(gone)}.`] : [] });
   e.seenFiles = [...new Set([...(e.seenFiles || []), ...files.map(f => fileKey(f.name, f.size, f.lastModified))])].slice(-1000);
   commit({ plan: false });
 }
@@ -968,19 +986,26 @@ function folderPanel(e) {
   if (!fp || fp.examId !== e.id) return "";
   const n = fp.items.filter(x => x.on).length, opt = (v, l, k) => `<option value="${v}" ${k === v ? "selected" : ""}>${l}</option>`;
   return `<div class="fold stack" id="folder-pick">
-    <div class="section-head"><b>${fp.check ? "New files in" : "Files in"} “${esc(fp.title)}”</b><span class="small muted">${fp.items.length} file${fp.items.length > 1 ? "s" : ""}${fp.skipped ? ` · ${fp.skipped} other file${fp.skipped > 1 ? "s" : ""} skipped (only PDF, TXT, MD)` : ""}</span></div>
+    <div class="section-head"><b>${fp.check ? "New files in" : "Files in"} “${esc(fp.title)}”</b><span class="small muted">${fp.items.length} file${fp.items.length > 1 ? "s" : ""}${fp.skipped ? ` · ${fp.skipped} other file${fp.skipped > 1 ? "s" : ""} skipped (only PDF, TXT, MD)` : ""}${fp.cut ? ` · first ${FOLDER_MAX} shown` : ""}</span></div>
+    ${fp.cut ? `<span class="small">The folder has more than ${FOLDER_MAX} files, so only the first ${FOLDER_MAX} were looked at. Choose a smaller folder (e.g. one sub-folder) to see the rest.</span>` : ""}
+    ${fp.failed && fp.failed.length ? `<span class="small" id="fold-failed">These files couldn't be opened: ${esc(pageList(fp.failed))}</span>` : ""}
     <span class="small muted">Untick what you don't need and check the type. The type is a guess from the file and folder names.</span>
     <div class="fold-list">${fp.items.map((x, i) => `<div class="fold-row">
-      <label class="fold-name"><input type="checkbox" class="fold-on" data-i="${i}" ${x.on ? "checked" : ""}> <span class="mono small">${esc(x.path)}</span>${x.seen ? ` <span class="chip">added before</span>` : ""}</label>
+      <label class="fold-name"><input type="checkbox" class="fold-on" data-i="${i}" ${x.on ? "checked" : ""}> <span class="mono small">${esc(x.path)}</span>${x.seen ? ` <span class="chip">added before</span>` : ""}${x.dup ? ` <span class="chip">same file as ${esc(x.dup)}</span>` : ""}</label>
       <select class="fold-kind" data-i="${i}" aria-label="Type of ${esc(x.name)}">${opt("script", "Script", x.kind)}${opt("slides", "Slides", x.kind)}${opt("oldexam", "Old exam", x.kind)}</select></div>`).join("")}</div>
-    <div class="row"><button class="btn primary" data-act="fold-add" ${n ? "" : "disabled"}>Add ${n} file${n === 1 ? "" : "s"}</button><button class="btn ghost" data-act="fold-all">${n === fp.items.length ? "Untick all" : "Tick all"}</button><button class="btn ghost" data-act="fold-cancel">Cancel</button></div>
+    <div class="row"><button class="btn primary" data-act="fold-add" ${n && !filesBusy() ? "" : "disabled"}>Add ${n} file${n === 1 ? "" : "s"}</button><button class="btn ghost" data-act="fold-all">${n === fp.items.length ? "Untick all" : "Tick all"}</button><button class="btn ghost" data-act="fold-cancel">Cancel</button></div>
   </div>`;
 }
 const canPickFolder = () => typeof window.showDirectoryPicker === "function";
+// While files are being read, the buttons that read more files (or analyse them) are off.
+const filesBusy = () => !!(busy.upload || busy.folder);
+const offIf = on => on ? "disabled" : "";
+const labelOff = on => on ? `aria-disabled="true"` : "";
 function folderButtons(e) {
-  return `${canPickFolder() ? `<button class="btn" data-act="folder" style="align-self:end">Add a whole folder</button>`
-    : `<label class="btn" style="align-self:end">Add a whole folder<input type="file" id="mat-folder" webkitdirectory multiple hidden></label>`}
-    ${e.folder && canPickFolder() ? `<button class="btn ghost" data-act="folder-check" style="align-self:end" title="Adds only files that weren't added before">Check “${esc(e.folder.name)}” for new files</button>` : ""}`;
+  const off = filesBusy();
+  return `${canPickFolder() ? `<button class="btn" data-act="folder" style="align-self:end" ${offIf(off)}>Add a whole folder</button>`
+    : `<label class="btn" style="align-self:end" ${labelOff(off)}>Add a whole folder<input type="file" id="mat-folder" webkitdirectory multiple hidden ${offIf(off)}></label>`}
+    ${e.folder && canPickFolder() ? `<button class="btn ghost" data-act="folder-check" style="align-self:end" ${offIf(off)} title="Adds only files that weren't added before">Check “${esc(e.folder.name)}” for new files</button>` : ""}`;
 }
 
 function chunksOf(name, kind, text) {
@@ -1298,12 +1323,20 @@ async function runAnalysis(e, mats, budget, signal, retry) {
   const styled = results.find(r => r.old && r.style) || results.find(r => r.style);
   return { list, style: styled ? styled.style : "", parts: n, tasks: mergeTasks(results, shared.length > 0) };
 }
-async function analyzeMaterials(e) {
+// More parts than this: the student confirms first (each part is one AI request on the shared key).
+const ANALYZE_ASK_PARTS = 8;
+async function analyzeMaterials(e, sure) {
   if (!sample) return toast(aiOffMsg());
+  if (filesBusy() || busy.analyze) return;
+  busy.anAsk = null;
   const all = await Promise.all(e.materials.map(async m => ({ ...m, text: await getMaterial(m.id) })));
   const mats = all.filter(m => !looksEmpty(m.text));
   const skipped = all.filter(m => looksEmpty(m.text)).map(m => m.name);
   if (!mats.length) return toast(noTextMsg(skipped.length ? skipped : ["These files"]));
+  if (!sure && !(analysisResume && analysisResume.key === analysisKey(e, mats))) {
+    const n = splitMaterials(mats, ANALYZE_CHARS).parts.length;
+    if (n > ANALYZE_ASK_PARTS) { busy.anAsk = { examId: e.id, n }; render(); const el = $("#analyze-confirm"); if (el) el.scrollIntoView({ block: "nearest" }); return; }
+  }
   const first = !e.topics.length;
   busy.analyze = e.id; busy.progress = null; busy.anErr = null; render();
   aiCtl = new AbortController();
@@ -2651,8 +2684,8 @@ function setupSteps(e) {
   const left = diffDays(today(), e.date);
   const steps = [
     { done: named && left > 0, title: "Name the exam and check its date", text: left > 0 ? `Exam on ${fmtLong(e.date)}, in ${left} day${left === 1 ? "" : "s"}. Change the date below if that's not right.` : "The exam date is today or already past. Set the real date below.", btn: `<button class="btn sm {p}" data-act="focus-field" data-f="${named ? "f-date" : "f-subject"}">${named ? "Set the date" : "Name the exam"}</button>` },
-    { done: mats > 0, title: "Upload your materials", text: "Scripts, slides and old exams (pick “Old exams” for those, so the plan knows what counts most), or your whole course folder: the type of each file is guessed from its name.", btn: `<span class="row"><label class="btn sm {p}" for="mat-file">Choose files</label>${canPickFolder() ? `<button class="btn sm" data-act="folder">Add a whole folder</button>` : `<label class="btn sm" for="mat-folder">Add a whole folder</label>`}</span>` },
-    { done: has, title: "Let the AI find the topics", text: "It reads everything and makes topics with subtopics, pages and key terms. Long materials are read in parts. Or add topics by hand below.", btn: `<button class="btn sm {p}" data-act="analyze" ${mats && sample && busy.analyze !== e.id ? "" : "disabled"}>Analyze materials</button>` },
+    { done: mats > 0, title: "Upload your materials", text: "Scripts, slides and old exams (pick “Old exams” for those, so the plan knows what counts most), or your whole course folder: the type of each file is guessed from its name.", btn: `<span class="row"><label class="btn sm {p}" for="mat-file" ${labelOff(filesBusy())}>Choose files</label>${canPickFolder() ? `<button class="btn sm" data-act="folder" ${offIf(filesBusy())}>Add a whole folder</button>` : `<label class="btn sm" for="mat-folder" ${labelOff(filesBusy())}>Add a whole folder</label>`}</span>` },
+    { done: has, title: "Let the AI find the topics", text: "It reads everything and makes topics with subtopics, pages and key terms. Long materials are read in parts. Or add topics by hand below.", btn: `<button class="btn sm {p}" data-act="analyze" ${mats && sample && busy.analyze !== e.id && !filesBusy() ? "" : "disabled"}>Analyze materials</button>` },
     { done: planned, title: "Get your study plan", text: has ? "The plan is built as soon as there are topics." : "Appears here as soon as there are topics.", btn: `<button class="btn sm {p}" data-view="plan" ${has ? "" : "disabled"}>See your study plan</button>` }
   ];
   const next = steps.findIndex(x => !x.done);
@@ -2858,7 +2891,7 @@ function vExams() {
         <b>Drop files here</b>
         <div class="row" style="justify-content:center">
           <label class="field" style="text-align:left"><span>These files are</span><select id="mat-kind"><option value="script">Script / lecture notes</option><option value="slides">Slides</option><option value="oldexam">Old exams</option></select></label>
-          <label class="btn" style="align-self:end">Choose files<input type="file" id="mat-file" multiple accept=".pdf,.txt,.md" hidden></label>
+          <label class="btn" style="align-self:end" ${labelOff(filesBusy())}>Choose files<input type="file" id="mat-file" multiple accept=".pdf,.txt,.md" hidden ${offIf(filesBusy())}></label>
           ${folderButtons(e)}
         </div>
         ${busy.folder ? `<span class="small"><span class="spinner"></span> Looking through the folder…</span>` : ""}
@@ -2869,9 +2902,10 @@ function vExams() {
       <div class="row">
         ${busy.analyze === e.id
           ? `<span id="analyze-progress"><span class="spinner"></span> <span class="ptext">${esc(progressText(busy.progress))}</span></span><button class="btn sm" data-act="stop">Stop</button>`
-          : `<button class="btn primary" data-act="analyze" ${e.materials.length && sample ? "" : "disabled"}>${T.length ? "Re-analyze materials" : "Analyze materials with AI"}</button>
+          : `<button class="btn primary" data-act="analyze" ${e.materials.length && sample && !filesBusy() ? "" : "disabled"}>${T.length ? "Re-analyze materials" : "Analyze materials with AI"}</button>
              ${!sample ? `<span class="small muted">${aiOffMsg()}</span>` : !e.materials.length ? `<span class="small muted">Add at least one file first.</span>` : T.length ? `<span class="small muted">Replaces the topic list. Quiz results stay with topics of the same name.</span>` : ""}`}
       </div>
+      ${busy.anAsk && busy.anAsk.examId === e.id && busy.analyze !== e.id ? `<div class="alert" id="analyze-confirm"><b>This needs about ${numOr(busy.anAsk.n, 0)} AI requests and may take a few minutes. Continue?</b><span class="row"><button class="btn sm primary" data-act="analyze-go">Continue</button><button class="btn sm ghost" data-act="analyze-no">Cancel</button></span></div>` : ""}
       ${busy.anErr && busy.anErr.examId === e.id && busy.analyze !== e.id ? `<div class="alert bad" id="analyze-error"><b>The AI couldn't finish reading your materials, so there are no topics and no plan yet.</b><span class="small">${esc(busy.anErr.msg)}</span><span class="small">Your files are kept. Press Analyze again, or add topics by hand under Topics.</span></div>` : ""}
       ${e.style ? `<div class="fb"><span class="label">Old-exam style</span><span>${esc(e.style)}</span></div>` : ""}
     </section>
@@ -3286,6 +3320,8 @@ $("#main").addEventListener("click", async ev => {
     case "add-off": { const v = $("#set-off").value; if (v && !S.settings.blackout.includes(v)) { S.settings.blackout.push(v); busy.openSettings = true; commit(); } break; }
     case "rm-off": S.settings.blackout = S.settings.blackout.filter(d => d !== el.dataset.date); busy.openSettings = true; commit(); break;
     case "analyze": analyzeMaterials(e); break;
+    case "analyze-go": analyzeMaterials(e, true); break;
+    case "analyze-no": busy.anAsk = null; render(); break;
     case "focus-field": { const f = $("#" + el.dataset.f); if (f) { f.focus(); if (f.select) f.select(); } break; }
     case "px": openPractice(e); break;
     case "px-gen": genPractice(); break;

@@ -780,6 +780,67 @@ test("adds a whole folder: lists the files with a guessed type, imports the tick
   }
 });
 
+test("folder import: type from the file name first, duplicates, name clashes, big folders and busy buttons", async () => {
+  assert.deepEqual(await page.evaluate(() => ["Prüfungsvorbereitung/Folien/VO1.pdf", "Prüfungsvorbereitung/Zusammenfassung.pdf", "Klausuren/2023_Klausur.pdf",
+    "Prüfungsrelevante Folien/Kapitel 2.pdf", "Altklausuren/Lösungen.pdf", "Folien/Klausur 2022.pdf", "exam prep/notes.md"].map(guessKind)),
+    ["slides", "script", "oldexam", "slides", "oldexam", "oldexam", "script"]);
+  await page.evaluate(() => { window.__savedFold2 = JSON.stringify(S); newExam(); go("exams"); });
+  try {
+    const r = await page.evaluate(async () => {
+      const body = "Some real lecture text about sets and logic. ".repeat(20);
+      const file = (name, mod = 1700000000000, txt = body) => ({ kind: "file", name, getFile: async () => new File([txt], name, { lastModified: mod }) });
+      const broken = name => ({ kind: "file", name, getFile: async () => { throw new DOMException("gone", "NotFoundError"); } });
+      const dir = (name, kids) => ({ kind: "directory", name, async *entries() { for (const k of kids) yield [k.name, k]; } });
+      const e = examById(selExam);
+      await readFolder(e, dir("Course", [dir("2023", [file("Uebung1.txt")]), dir("2024", [file("Uebung1.txt"), file("Notes.txt", 5)]), file("Notes.txt", 7, body + "x"), broken("gone.txt")]), false);
+      const out = { items: folderPick.items.map(x => [x.path, x.on, x.dup]), html: $("#folder-pick").textContent };
+      await importFolderPick();
+      out.mats = e.materials.map(m => m.name);
+      // The same folder again: the files stored under their path count as added before.
+      await readFolder(e, dir("Course", [dir("2023", [file("Uebung1.txt")]), dir("2024", [file("Notes.txt", 5)]), file("Notes.txt", 7, body + "x")]), true);
+      out.again = folderPick ? folderPick.items.map(x => x.path) : "none";
+      // A huge folder is cut and says so.
+      const many = []; for (let i = 0; i < 1600; i++) many.push(file(`sheet${i}.txt`, i, "abc"));
+      await readFolder(e, dir("Huge", many), false);
+      out.big = [folderPick.items.length, folderPick.cut, /first 1500 shown/.test($("#folder-pick").textContent)];
+      folderPick = null;
+      // While files are read, the buttons that add or analyse files are off.
+      busy.upload = { f: 1, files: 1, name: "x.pdf", i: 0, n: 0 }; render();
+      out.off = [$('[data-act="analyze"]').disabled, $("#mat-file").disabled, $("#mat-folder").disabled, $("#mat-file").closest("label").getAttribute("aria-disabled")];
+      busy.upload = false; render();
+      out.on = [$('[data-act="analyze"]').disabled, $("#mat-file").disabled];
+      return out;
+    });
+    assert.deepEqual(r.items, [["2023/Uebung1.txt", true, null], ["2024/Notes.txt", true, null], ["2024/Uebung1.txt", false, "2023/Uebung1.txt"], ["Notes.txt", true, null]]);
+    assert.match(r.html, /same file as 2023\/Uebung1\.txt/);
+    assert.match(r.html, /couldn't be opened: gone\.txt/);
+    assert.deepEqual(r.mats, ["Uebung1.txt", "2024/Notes.txt", "Notes.txt"], "names that clash are stored with their path");
+    assert.equal(r.again, "none", "nothing new after the import");
+    assert.deepEqual(r.big, [1500, true, true]);
+    assert.deepEqual(r.off, [true, true, true, "true"]);
+    assert.deepEqual(r.on, [false, false]);
+  } finally {
+    await page.evaluate(() => { folderPick = null; busy.upload = false; Object.assign(S, JSON.parse(window.__savedFold2)); normalize(); selExam = S.exams[0] ? S.exams[0].id : null; commit({ plan: false }); go("dashboard"); });
+  }
+});
+
+test("asks before an analysis that needs many AI requests", async () => {
+  const big = Array.from({ length: 10 }, (_, i) => ({ name: `deck${i}.pdf`, kind: "slides", text: Array.from({ length: 20 }, (_, p) => `=== p.${p + 1} ===\n` + `Topic ${i} page ${p} text. `.repeat(200)).join("\n") }));
+  const id = await examWithMaterials(big);
+  upstream.prompts = [];
+  await page.evaluate(id => { go("exams"); analyzeMaterials(examById(id)); }, id);
+  await page.waitForSelector("#analyze-confirm");
+  assert.match(await page.textContent("#analyze-confirm"), /This needs about \d+ AI requests and may take a few minutes\. Continue\?/);
+  assert.equal(upstream.prompts.length, 0, "nothing is sent before the student agrees");
+  await page.click('[data-act="analyze-no"]');
+  assert.equal(await page.$("#analyze-confirm"), null);
+  await page.click('[data-act="analyze"]');
+  await page.click('[data-act="analyze-go"]');
+  await page.waitForFunction(() => !busy.analyze, null, { timeout: 30000 });
+  assert.ok(upstream.prompts.length > 8);
+  await page.evaluate(id => { S.exams = S.exams.filter(e => e.id !== id); selExam = S.exams[0] ? S.exams[0].id : null; commit({ plan: true }); go("dashboard"); }, id);
+});
+
 test("asks for energy before a focus session and offers a lighter session when low", async () => {
   await page.evaluate(() => go("dashboard"));
   const id = await page.evaluate(() => {
