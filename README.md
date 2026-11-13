@@ -9,7 +9,7 @@ Over time it also learns which study methods, times of day and session lengths w
 ## Features
 
 - **Plan built backwards from the exam.** Final review the day before, a mock exam before that, then learning blocks and spaced reviews spread over the days you have. Topics that appear often in old exams get more time.
-- **Reads your own materials.** Upload PDFs of scripts, slides and old exams. The AI turns them into a topic list with weights, estimated hours and page references, which you can edit.
+- **Reads your own materials.** Upload PDFs of scripts, slides and old exams, or add a whole course folder at once (in Chrome and Edge it stays connected, so new files can be added with one click). The AI turns them into a topic list with weights, estimated hours and page references, which you can edit. Formulas are shown with real symbols (α, Xᵢⱼ), not LaTeX code.
 - **Quizzes in the style of your old exams.** Multiple choice, short answers and calculations, graded by the AI with feedback on what was missing.
 - **A plan that adapts.** A low quiz score adds study time for that topic, schedules a review for the next day and focuses the next quiz on what you got wrong. Skipped blocks are rescheduled. Every change is logged with its reason.
 - **Study sessions.** Each learning block opens a session made from your material: practice problems, worked examples, flashcards, or writing an explanation or summary that the AI checks.

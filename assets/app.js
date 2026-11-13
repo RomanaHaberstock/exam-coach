@@ -32,6 +32,98 @@ function toast(msg) {
   t.onclick = () => { t.hidden = true; };
 }
 
+/* ---------- math notation ---------- */
+// The AI sometimes writes formulas as LaTeX ("$X_{ii}$", "\alpha"). mathText() turns simple
+// LaTeX into readable Unicode (Xᵢᵢ, α); everything the AI returns goes through it (AI.json),
+// before esc() and rendering. Text without LaTeX stays as it is ("$5 and $10" too).
+const TEX_SYM = {
+  alpha: "α", beta: "β", gamma: "γ", delta: "δ", epsilon: "ε", varepsilon: "ε", zeta: "ζ", eta: "η", theta: "θ", vartheta: "ϑ", iota: "ι", kappa: "κ",
+  lambda: "λ", mu: "μ", nu: "ν", xi: "ξ", pi: "π", varpi: "ϖ", rho: "ρ", varrho: "ϱ", sigma: "σ", varsigma: "ς", tau: "τ", upsilon: "υ", phi: "φ", varphi: "φ",
+  chi: "χ", psi: "ψ", omega: "ω", Gamma: "Γ", Delta: "Δ", Theta: "Θ", Lambda: "Λ", Xi: "Ξ", Pi: "Π", Sigma: "Σ", Upsilon: "Υ", Phi: "Φ", Psi: "Ψ", Omega: "Ω",
+  cdot: "·", times: "×", div: "÷", pm: "±", mp: "∓", leq: "≤", le: "≤", geq: "≥", ge: "≥", neq: "≠", ne: "≠", approx: "≈", sim: "∼", simeq: "≃", equiv: "≡",
+  propto: "∝", infty: "∞", sum: "∑", prod: "∏", int: "∫", partial: "∂", nabla: "∇", to: "→", rightarrow: "→", Rightarrow: "⇒", leftarrow: "←", Leftarrow: "⇐",
+  leftrightarrow: "↔", Leftrightarrow: "⇔", iff: "⇔", implies: "⇒", mapsto: "↦", in: "∈", notin: "∉", subset: "⊂", subseteq: "⊆", supset: "⊃", cup: "∪", cap: "∩",
+  forall: "∀", exists: "∃", emptyset: "∅", neg: "¬", land: "∧", lor: "∨", ldots: "…", cdots: "⋯", dots: "…", prime: "′", circ: "∘", degree: "°", ell: "ℓ",
+  langle: "⟨", rangle: "⟩", lfloor: "⌊", rfloor: "⌋", lceil: "⌈", rceil: "⌉", perp: "⊥", parallel: "∥", angle: "∠", star: "⋆", ast: "∗", bullet: "•",
+  ln: "ln", log: "log", exp: "exp", max: "max", min: "min", lim: "lim", sup: "sup", inf: "inf", sin: "sin", cos: "cos", tan: "tan", det: "det", arg: "arg",
+  quad: " ", qquad: " ", "%": "%", "$": "$", "&": "&", "#": "#", "_": "_", "{": "{", "}": "}", ",": " ", ";": " ", ":": " ", " ": " ", "!": "", "\\": " "
+};
+const TEX_WRAP = { text: "", mathrm: "", mathit: "", mathbf: "", textbf: "", textit: "", boldsymbol: "", operatorname: "", mathsf: "", mbox: "", emph: "",
+  hat: "̂", widehat: "̂", bar: "̄", overline: "̄", tilde: "̃", widetilde: "̃", dot: "̇", ddot: "̈", vec: "⃗" };
+const BB = { R: "ℝ", N: "ℕ", Z: "ℤ", Q: "ℚ", C: "ℂ", E: "𝔼", P: "ℙ" };
+const SUB = Object.fromEntries([..."0123456789+-=()aehijklmnoprstuvxβγρφχ"].map((c, i) => [c, "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑₕᵢⱼₖₗₘₙₒₚᵣₛₜᵤᵥₓᵦᵧᵨᵩᵪ"[i] ]));
+SUB["−"] = "₋";
+const SUP = Object.fromEntries([..."0123456789+-=()abcdefghijklmnoprstuvwxyzABDEGHIJKLMNOPRTUVWβγδθφχ"].map((c, i) => [c, [..."⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ᵃᵇᶜᵈᵉᶠᵍʰⁱʲᵏˡᵐⁿᵒᵖʳˢᵗᵘᵛʷˣʸᶻᴬᴮᴰᴱᴳᴴᴵᴶᴷᴸᴹᴺᴼᴾᴿᵀᵁⱽᵂᵝᵞᵟᶿᵠᵡ"][i]]));
+SUP["−"] = "⁻"; SUP["′"] = "′"; SUP["*"] = "*";
+// Reads one argument at s[i]: a {group} or a single character (or \command). Returns [text, next i].
+function texArg(s, i) {
+  while (s[i] === " ") i++;
+  if (s[i] === "{") { let d = 1, j = i + 1; for (; j < s.length && d; j++) { if (s[j] === "\\") { j++; continue; } if (s[j] === "{") d++; else if (s[j] === "}") d--; } return [s.slice(i + 1, j - 1), j]; }
+  if (s[i] === "\\") { const m = s.slice(i).match(/^\\([a-zA-Z]+|.)/); return m ? [m[0], i + m[0].length] : ["", i + 1]; }
+  return [s[i] || "", i + 1];
+}
+const simple = t => /^[\p{L}\p{N}.′]+$/u.test(t) || /^[\p{L}\p{N}]+[̀-ͯ⃗]$/u.test(t);
+function script(t, map, mark) {
+  if (!t) return "";
+  const chars = [...t];
+  if (chars.every(c => map[c])) return chars.map(c => map[c]).join("");
+  return mark + (simple(t) ? t : `(${t})`);
+}
+// Converts LaTeX inside math: commands, sub/superscripts, fractions, roots, groups.
+function texMath(s) {
+  let out = "";
+  for (let i = 0; i < s.length;) {
+    const c = s[i];
+    if (c === "\\") {
+      const m = s.slice(i).match(/^\\([a-zA-Z]+|.)/); if (!m) { i++; continue; }
+      const cmd = m[1]; i += m[0].length;
+      if (cmd === "frac" || cmd === "dfrac" || cmd === "tfrac") {
+        const [a, j] = texArg(s, i), [b, k] = texArg(s, j); i = k;
+        const A = texMath(a).trim(), B = texMath(b).trim();
+        out += `${simple(A) ? A : `(${A})`}/${simple(B) ? B : `(${B})`}`;
+      } else if (cmd === "sqrt") {
+        let n = ""; if (s[i] === "[") { const e = s.indexOf("]", i); n = s.slice(i + 1, e); i = e + 1; }
+        const [a, j] = texArg(s, i); i = j; const A = texMath(a).trim();
+        out += (n ? script(texMath(n), SUP, "") : "") + "√" + (simple(A) ? A : `(${A})`);
+      } else if (cmd === "mathbb") { const [a, j] = texArg(s, i); i = j; out += [...a].map(x => BB[x] || x).join(""); }
+      else if (cmd in TEX_WRAP) { const [a, j] = texArg(s, i); i = j; out += texMath(a) + TEX_WRAP[cmd]; }
+      else if (cmd === "left" || cmd === "right" || cmd === "big" || cmd === "Big" || cmd === "bigg" || cmd === "Bigg" || cmd === "displaystyle" || cmd === "limits") {
+        if ((cmd === "left" || cmd === "right") && s[i] === ".") i++;
+      }
+      else if (cmd in TEX_SYM) out += TEX_SYM[cmd];
+      else out += cmd; // unknown command: keep its name
+    } else if (c === "_" || c === "^") {
+      const [a, j] = texArg(s, i + 1); i = j;
+      out += script(texMath(a).trim(), c === "_" ? SUB : SUP, c === "_" ? "_" : "^");
+    } else if (c === "{") { const [a, j] = texArg(s, i); i = j; out += texMath(a); }
+    else if (c === "}") i++;
+    else if (c === "-") { out += "−"; i++; }
+    else { out += c; i++; }
+  }
+  return out;
+}
+// JSON turns "\tau", "\frac", "\beta", "\rho", "\nu" into a tab, form feed, backspace, CR or new line
+// plus the rest of the word when the AI forgets to double the backslash; this takes them back.
+const TEX_LOST = /\t(?=au|heta|imes|ext|ilde|o\b)|\f(?=rac)|\x08(?=eta|ar|ig|oldsymbol)|\r(?=ho|ight)|\n(?=u\b|eq\b|abla|eg\b|otin\b)/g;
+function mathText(s) {
+  s = String(s ?? "");
+  if (!/[\\$^_]/.test(s) && !/[\t\f\x08\r]/.test(s)) return s;
+  if (/[$\\]|_\{/.test(s)) s = s.replace(TEX_LOST, c => "\\" + { "\t": "t", "\f": "f", "\x08": "b", "\r": "r", "\n": "n" }[c]);
+  // $$…$$, $…$, \(…\), \[…\]: math if it holds LaTeX or is a single symbol ("$x$"), not "$5 and $10".
+  s = s.replace(/\$\$([^$]{1,400})\$\$|\\\[([\s\S]{1,400}?)\\\]|\\\(([\s\S]{1,400}?)\\\)|\$([^$\n]{1,200})\$/g, (all, a, b, c, d) => {
+    const t = a ?? b ?? c ?? d;
+    if (d != null && !/[\\_^{]/.test(t) && !/^\s*[A-Za-z]\s*$/.test(t)) return all;
+    return texMath(t.trim());
+  });
+  // LaTeX outside $…$: known commands (with their arguments) and X_{…} / X^{…}.
+  s = s.replace(/\\(?:frac|dfrac|sqrt|mathbb|text|mathrm|mathbf|hat|bar|tilde|overline)\s*(?:\[[^\]]*\])?(?:\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}|\\?[A-Za-z]){1,2}/g, m => texMath(m))
+    .replace(/\\([a-zA-Z]+)(?![a-zA-Z])/g, (m, cmd) => cmd in TEX_SYM && cmd.length > 1 ? TEX_SYM[cmd] : m)
+    .replace(/([\p{L}\p{N})′])([_^])(\{[^{}\s]{1,30}\}|\{[^{}]{1,30}\})/gu, (m, x, op, arg) => x + texMath(op + arg));
+  return s;
+}
+// Applies mathText() to every string in an AI answer (objects and arrays, any depth).
+const mathDeep = v => typeof v === "string" ? mathText(v) : Array.isArray(v) ? v.map(mathDeep) : v && typeof v === "object" ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, mathDeep(x)])) : v;
+
 /* ---------- state ---------- */
 const DEFAULTS = () => ({
   v: 1,
@@ -74,9 +166,14 @@ function normExam(e) {
   if (!Array.isArray(e.oldTasks)) e.oldTasks = [];
   if (!Array.isArray(e.topics)) e.topics = [];
   if (!Array.isArray(e.materials)) e.materials = [];
+  e.seenFiles = Array.isArray(e.seenFiles) ? e.seenFiles.filter(k => typeof k === "string").slice(-1000) : [];
+  if (!e.folder || typeof e.folder !== "object" || typeof e.folder.name !== "string") delete e.folder;
   if (e.review && typeof e.review === "object") e.review.gradeNum = gradeNum(e.review.gradeNum);
   else delete e.review;
   e.topics = e.topics.filter(t => t && typeof t === "object");
+  // AI text saved before formulas were converted (LaTeX such as "$X_{ii}$").
+  for (const t of e.topics) { if (typeof t.name === "string") t.name = mathText(t.name); if (typeof t.summary === "string") t.summary = mathText(t.summary); }
+  if (typeof e.style === "string") e.style = mathText(e.style);
   return cleanPrereqs(e);
 }
 // Prerequisite links: t.prereqs = ids of topics this topic builds on (learn them first).
@@ -170,6 +267,7 @@ async function boot() {
   if ((TM.phase === "focus" || TM.phase === "short" || TM.phase === "long") && !TM.paused && Date.now() >= TM.endsAt) phaseEnd();
   render();
   checkAI();
+  recheckMaterials();
 }
 function loadLocal() { try { const raw = localStorage.getItem("examcoach"); if (raw) S = Object.assign(DEFAULTS(), JSON.parse(raw)); } catch (e) {} }
 let saveTimer = null, saving = false, dirty = false;
@@ -559,59 +657,274 @@ const canEditMock = b => !!(b && b.mock && b.mock.fx);
 const fmtPts = n => String(Math.round(n * 10) / 10);
 
 /* ---------- material extraction ---------- */
-async function extractFile(file) {
+// PDFs are read page by page. A page that fails (or hangs) is counted and skipped, the other
+// pages are kept. `onPage(i, n)` reports progress. Returns the text with "=== p. N ===" markers,
+// the page count, and the pages without text / that failed.
+const PAGE_TIMEOUT_MS = 20000;
+// Office writes characters of the Symbol font as private-use codes U+F020–U+F0FF. These are
+// the Symbol font's Greek letters and math signs; a lone one at the start of a line is a bullet
+// (Wingdings and Symbol bullets use the same codes), anything else unknown is dropped.
+const SYMBOL_PUA = (() => {
+  const m = {}, up = "ΑΒΧΔΕΦΓΗΙϑΚΛΜΝΟΠΘΡΣΤΥςΩΞΨΖ", lo = "αβχδεφγηιϕκλμνοπθρστυϖωξψζ";
+  for (let i = 0; i < 26; i++) { m[0x41 + i] = up[i]; m[0x61 + i] = lo[i]; }
+  Object.assign(m, { 0x22: "∀", 0x24: "∃", 0x27: "∋", 0x2a: "∗", 0x2d: "−", 0x40: "≅", 0x5c: "∴", 0x5e: "⊥", 0xa2: "′", 0xa3: "≤", 0xa5: "∞", 0xa6: "ƒ",
+    0xab: "↔", 0xac: "←", 0xad: "↑", 0xae: "→", 0xaf: "↓", 0xb0: "°", 0xb1: "±", 0xb2: "″", 0xb3: "≥", 0xb4: "×", 0xb5: "∝", 0xb6: "∂", 0xb7: "•", 0xb8: "÷",
+    0xb9: "≠", 0xba: "≡", 0xbb: "≈", 0xbc: "…", 0xc5: "⊕", 0xc6: "∅", 0xc7: "∩", 0xc8: "∪", 0xc9: "⊃", 0xca: "⊇", 0xcc: "⊂", 0xcd: "⊆", 0xce: "∈", 0xcf: "∉",
+    0xd0: "∠", 0xd1: "∇", 0xd5: "∏", 0xd6: "√", 0xd7: "⋅", 0xd8: "¬", 0xd9: "∧", 0xda: "∨", 0xdb: "⇔", 0xdc: "⇐", 0xde: "⇒", 0xe5: "∑", 0xf2: "∫" });
+  return m;
+})();
+const LIGATURES = { "ﬀ": "ff", "ﬁ": "fi", "ﬂ": "fl", "ﬃ": "ffi", "ﬄ": "ffl", "ﬅ": "st", "ﬆ": "st" };
+function cleanPdfText(s) {
+  return String(s)
+    .replace(/^([ \t]*)[\uF020-\uF0FF](?=[ \t]+\S)/gm, "$1•")
+    .replace(/[\uF020-\uF0FF]/g, c => { const k = c.charCodeAt(0) - 0xF000; return SYMBOL_PUA[k] || (k >= 0x20 && k < 0x7f ? String.fromCharCode(k) : ""); })
+    .replace(/[\uFB00-\uFB06]/g, c => LIGATURES[c] || c)
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, " "); // e.g. big brackets of formula fonts
+}
+function pageText(tc) {
+  let line = "", out = [], lastY = null;
+  for (const it of tc.items) {
+    if (typeof it.str !== "string") continue; // marked-content items
+    const y = it.transform ? it.transform[5] : null;
+    if (lastY != null && y != null && Math.abs(y - lastY) > 3) { out.push(line); line = ""; }
+    line += it.str + (it.hasEOL ? "\n" : " "); lastY = y;
+  }
+  out.push(line);
+  return cleanPdfText(out.join("\n")).replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+}
+async function extractFile(file, onPage) {
   const name = file.name;
   if (/\.pdf$/i.test(name)) {
     if (!window.pdfjsLib) throw new Error("The PDF reader did not load. Reload the page and try again.");
     const buf = await file.arrayBuffer();
     pdfjsLib.GlobalWorkerOptions.workerSrc = "assets/vendor/pdfjs/pdf.worker.min.js";
-    const pdf = await pdfjsLib.getDocument({ data: buf, isEvalSupported: false }).promise;
-    let text = "";
-    for (let i = 1; i <= pdf.numPages; i++) {
-      const page = await pdf.getPage(i);
-      const tc = await page.getTextContent();
-      let line = "", out = [], lastY = null;
-      for (const it of tc.items) { const y = it.transform ? it.transform[5] : null; if (lastY != null && y != null && Math.abs(y - lastY) > 3) { out.push(line); line = ""; } line += it.str + (it.hasEOL ? "\n" : " "); lastY = y; }
-      out.push(line);
-      text += `\n=== p. ${i} ===\n` + out.join("\n").replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim() + "\n";
+    let pdf;
+    try { pdf = await pdfjsLib.getDocument({ data: buf, isEvalSupported: false }).promise; }
+    catch (err) { throw new Error(err && err.name === "PasswordException" ? "this PDF is protected with a password. Save a copy without the password and add that." : "this doesn't look like a readable PDF file."); }
+    const n = pdf.numPages, parts = [], noText = [], failed = [];
+    for (let i = 1; i <= n; i++) {
+      if (onPage) onPage(i, n);
+      let t = "";
+      try {
+        const page = await withTimeout(pdf.getPage(i), PAGE_TIMEOUT_MS);
+        t = pageText(await withTimeout(page.getTextContent(), PAGE_TIMEOUT_MS));
+        try { page.cleanup(); } catch (e) {}
+      } catch (err) { failed.push(i); }
+      if (!failed.includes(i) && !hasText(t)) noText.push(i);
+      parts.push(`\n=== p. ${i} ===\n${t}\n`);
     }
-    return { text, pages: pdf.numPages };
+    try { pdf.destroy(); } catch (e) {}
+    if (failed.length === n) throw new Error("the pages of this PDF couldn't be read. Open it, save a new copy (for example with Print → Save as PDF) and add that.");
+    return { text: parts.join(""), pages: n, noText, failed };
   }
   const raw = await file.text();
   const parts = []; for (let i = 0; i < raw.length; i += 3000) parts.push(`\n=== part ${parts.length + 1} ===\n` + raw.slice(i, i + 3000));
-  return { text: parts.join(""), pages: parts.length };
+  return { text: parts.join(""), pages: parts.length, noText: [], failed: [] };
 }
-const MAT_MAX = 400000; // characters kept per file; analysis splits long materials into parts
+// Up to MAT_MAX characters are kept per file, cut at a page boundary (analysis splits long
+// materials into parts). Returns the kept text and how many pages / parts it has.
+const MAT_MAX = 400000;
+function capText(text) {
+  if (text.length <= MAT_MAX) return { text, kept: null };
+  let cut = text.lastIndexOf("\n=== ", MAT_MAX);
+  if (cut <= 0) cut = MAT_MAX;
+  const kept = text.slice(0, cut);
+  return { text: kept, kept: pageSections(kept).length };
+}
+const MARK = /=== (?:p\.|part) ?\d+ ===/g;
 // Text without page markers and spacing. Scanned PDFs have pages but (almost) no text layer.
-const textChars = text => String(text || "").replace(/=== (?:p\.|part) ?\d+ ===/g, "").replace(/\s+/g, "").length;
-const looksEmpty = (text, pages) => textChars(text) < Math.max(200, 25 * (+pages || 1));
+const textChars = text => String(text || "").replace(MARK, "").replace(/\s+/g, "").length;
+// A page counts as having text with at least 4 letters/digits/signs (a bare page number doesn't).
+const hasText = t => String(t || "").replace(/\s+/g, "").length >= 4;
+const pageSections = text => { const s = String(text || "").split(/\n?=== (?:p\.|part) ?\d+ ===\n?/); return s.length > 1 ? s.slice(1) : [s[0]]; };
+// "No text found" only when (nearly) every page is without text: under 50 characters in all,
+// or text on at most 5 % of the pages (e.g. a scanned PDF with one typed cover page).
+// Slide decks with many picture slides keep their text and are not flagged.
+function looksEmpty(text) {
+  if (textChars(text) < 50) return true;
+  const secs = pageSections(text), withText = secs.filter(hasText).length;
+  return secs.length >= 10 && withText <= Math.floor(secs.length * 0.05);
+}
 const isPdf = name => /\.pdf$/i.test(name);
 function noTextMsg(names) {
   const pdf = names.every(isPdf), one = names.length === 1;
   const what = one ? `"${names[0]}" has` : `${names.length} files have`;
-  return pdf ? `${what} almost no text. ${one ? "It is" : "They are"} probably scanned pages, and scanned PDFs can't be read yet. Use a PDF where you can select the text, or paste the text into a TXT file.`
+  return pdf ? `${what} no readable text on almost every page. ${one ? "It is" : "They are"} probably scanned pages, and scanned PDFs can't be read yet. Use a PDF where you can select the text, or paste the text into a TXT file.`
     : `${what} almost no text, so there is nothing for the AI to read.`;
 }
+const pageList = a => a.length <= 6 ? a.join(", ") : `${a.slice(0, 5).join(", ")} and ${a.length - 5} more`;
+function uploadProgress() {
+  const u = busy.upload; if (!u || u === true) return "Reading files…";
+  return `Reading "${u.name}"${u.files > 1 ? ` (file ${u.f} of ${u.files})` : ""}${u.n ? `: page ${u.i} of ${u.n}…` : "…"}`;
+}
+function showUpload() { const el = $("#upload-progress .ptext"); if (el) el.textContent = uploadProgress(); else render(); }
+function matInfo(m) {
+  const unit = isPdf(m.name) ? "pages" : "parts", n = numOr(m.pages, 0);
+  return [`${n} ${unit}`, m.truncated ? (m.keptPages ? `first ${numOr(m.keptPages, 0)} kept` : "shortened") : "",
+    !m.empty && m.noText > 0 ? `${numOr(m.noText, 0)} without text` : "", m.failed > 0 ? `${numOr(m.failed, 0)} unreadable` : ""].filter(Boolean).join(" · ");
+}
+// Materials flagged by the older, stricter "no text" rule are checked again with the current one.
+async function recheckMaterials() {
+  let changed = false;
+  for (const e of S.exams) for (const m of e.materials) {
+    if (!m.empty) continue;
+    const text = await getMaterial(m.id);
+    if (text && !looksEmpty(text)) { m.empty = false; m.noText = pageSections(text).filter(t => !hasText(t)).length; changed = true; }
+  }
+  if (changed) commit({ plan: false });
+}
+const SUPPORTED = /\.(pdf|txt|md)$/i;
 async function addFiles(e, files, kind) {
-  busy.upload = true; render();
-  let added = 0; const empty = [];
-  for (const f of files) {
-    if (!/\.(pdf|txt|md)$/i.test(f.name)) { toast(`${f.name}: only PDF, TXT and MD files are supported.`); continue; }
+  busy.upload = { f: 0, files: files.length, name: "", i: 0, n: 0 }; render();
+  let added = 0; const empty = [], notes = [];
+  for (const [fi, f] of files.entries()) {
+    const k = typeof kind === "function" ? kind(f) : kind;
+    busy.upload = { f: fi + 1, files: files.length, name: f.name, i: 0, n: 0 }; showUpload();
+    if (!SUPPORTED.test(f.name)) { toast(`${f.name}: only PDF, TXT and MD files are supported.`); continue; }
     try {
-      let { text, pages } = await extractFile(f);
-      const truncated = text.length > MAT_MAX; if (truncated) text = text.slice(0, MAT_MAX);
-      const id = uid(), isEmpty = looksEmpty(text, pages);
-      await putMaterial(id, { name: f.name, kind, text });
-      e.materials.push({ id, name: f.name, kind, pages, chars: text.length, truncated, empty: isEmpty });
+      let last = 0;
+      const r = await extractFile(f, (i, n) => { busy.upload.i = i; busy.upload.n = n; const now = Date.now(); if (now - last > 120 || i === n) { last = now; showUpload(); } });
+      const { text, kept } = capText(r.text);
+      const id = uid(), isEmpty = looksEmpty(text);
+      await putMaterial(id, { name: f.name, kind: k, text });
+      const m = { id, name: f.name, kind: k, pages: r.pages, chars: text.length, truncated: !!kept, empty: isEmpty,
+        noText: isEmpty ? 0 : r.noText.length, failed: r.failed.length, ...(kept ? { keptPages: kept } : {}), src: { size: +f.size || 0, mod: +f.lastModified || 0 } };
+      e.materials.push(m);
       if (isEmpty) empty.push(f.name);
+      else {
+        const unit = isPdf(f.name) ? "pages" : "parts";
+        if (r.noText.length) notes.push(`"${f.name}": ${r.noText.length} of ${r.pages} pages had no readable text (probably pictures). The text on the other pages is used.`);
+        if (r.failed.length) notes.push(`"${f.name}": page${r.failed.length > 1 ? "s" : ""} ${pageList(r.failed)} couldn't be read, the rest is used.`);
+        if (kept) notes.push(`"${f.name}" is very long, so only the first ${kept} of ${r.pages} ${unit} are kept (${Math.round(MAT_MAX / 1000)}k characters). Split the file to use the rest.`);
+      }
       added++;
     } catch (err) { toast(`${f.name}: ${err.message || "could not be read"}`); }
   }
   busy.upload = false;
   commit({ plan: false });
-  if (empty.length) toast(noTextMsg(empty));
+  const msg = [empty.length ? noTextMsg(empty) : "", ...notes].filter(Boolean);
+  if (msg.length) toast(msg.join(" ") + (added > empty.length ? " Next: analyze the materials." : ""));
   else if (added) toast(`${added} file${added > 1 ? "s" : ""} added. Next: analyze the materials.`);
+  return added;
 }
+/* ---------- course folder ---------- */
+// "Add a whole folder": with the File System Access API (Chromium) the folder is opened with
+// showDirectoryPicker() and its handle is kept in IndexedDB (`dir-<exam id>`), so "Check folder for
+// new files" works later; other browsers use <input webkitdirectory> (no handle, nothing kept).
+// Files in sub-folders are included; only PDF/TXT/MD are offered, the rest is counted and skipped.
+// Before anything is read, the student sees the list with checkboxes and a guessed type per file.
+// A file counts as already added by name + size + last change (`fileKey`), also after removal.
+const FOLDER_MAX = 1500, FOLDER_DEPTH = 8;
+let folderPick = null; // { examId, title, items: [{ path, name, size, mod, file?, handle?, kind, on, seen }], skipped, handle, check }
+const dirHandles = {};
+const fileKey = (name, size, mod) => `${name}|${+size || 0}|${+mod || 0}`;
+function seenKeys(e) {
+  return new Set([...(e.seenFiles || []), ...e.materials.filter(m => m.src).map(m => fileKey(m.name, m.src.size, m.src.mod))]);
+}
+// Old exams by name or folder (exam, Klausur, Prüfung, "old", Altklausur); slides by name; else script.
+function guessKind(path) {
+  const p = String(path || "").toLowerCase();
+  if (/exam(?!ple)|klausur|pr(ü|ue)fung|(^|[^a-z])old([^a-z]|$)|probe-?test|mock/.test(p)) return "oldexam";
+  if (/slide|folie|präsentation|praesentation|lecture|vorlesung|(^|[^a-z])(vo|ppt|deck)([^a-z]|$)/.test(p)) return "slides";
+  return "script";
+}
+async function walkDir(dir, base = "", out = { files: [], other: 0 }, depth = 0) {
+  for await (const [name, h] of dir.entries()) {
+    if (name.startsWith(".") || out.files.length + out.other >= FOLDER_MAX) continue;
+    const path = base ? `${base}/${name}` : name;
+    if (h.kind === "directory") { if (depth < FOLDER_DEPTH) await walkDir(h, path, out, depth + 1); }
+    else if (SUPPORTED.test(name)) out.files.push({ path, name, handle: h });
+    else out.other++;
+  }
+  return out;
+}
+function showFolderPick(e, title, list, other, opts = {}) {
+  const seen = seenKeys(e);
+  let items = list.map(x => ({ ...x, kind: guessKind(x.path), seen: seen.has(fileKey(x.name, x.size, x.mod)) }))
+    .sort((a, b) => a.path.localeCompare(b.path, undefined, { numeric: true }));
+  if (opts.onlyNew) items = items.filter(x => !x.seen);
+  items.forEach(x => { x.on = !x.seen; });
+  if (opts.onlyNew && !items.length) { folderPick = null; render(); return toast(`No new files in "${title}".${other ? ` ${other} other file${other > 1 ? "s" : ""} (not PDF, TXT or MD) skipped.` : ""}`); }
+  if (!items.length) { folderPick = null; render(); return toast(`"${title}" has no PDF, TXT or MD files${other ? ` (${other} other file${other > 1 ? "s" : ""} skipped)` : ""}.`); }
+  folderPick = { examId: e.id, title, items, skipped: other, handle: opts.handle || null, check: !!opts.onlyNew };
+  render();
+  const el = $("#folder-pick"); if (el) el.scrollIntoView({ block: "nearest" });
+}
+async function pickFolder(e) {
+  let dir;
+  try { dir = await window.showDirectoryPicker({ id: "exam-coach", mode: "read" }); }
+  catch (err) { if (err && err.name !== "AbortError") toast("The folder couldn't be opened."); return; }
+  await readFolder(e, dir, false);
+}
+async function readFolder(e, dir, onlyNew) {
+  busy.folder = true; render();
+  try {
+    const { files, other } = await walkDir(dir);
+    const list = [];
+    for (const x of files) { try { const f = await x.handle.getFile(); list.push({ ...x, size: f.size, mod: f.lastModified }); } catch (err) {} }
+    busy.folder = false;
+    showFolderPick(e, dir.name, list, other, { onlyNew, handle: dir });
+  } catch (err) { busy.folder = false; render(); toast("The folder couldn't be read. Choose it again."); }
+}
+// Fallback: <input webkitdirectory> gives all files of the folder with their relative paths.
+function folderFromInput(e, files) {
+  const all = [...files].filter(f => !(f.webkitRelativePath || f.name).split("/").some(s => s.startsWith(".")));
+  const ok = all.filter(f => SUPPORTED.test(f.name));
+  const title = ((ok[0] || all[0] || {}).webkitRelativePath || "").split("/")[0] || "Folder";
+  // Paths inside the chosen folder (without its own name), as with the folder picker.
+  const rel = f => (f.webkitRelativePath || f.name).split("/").slice(1).join("/") || f.name;
+  showFolderPick(e, title, ok.map(f => ({ path: rel(f), name: f.name, size: f.size, mod: f.lastModified, file: f })), all.length - ok.length);
+}
+async function checkFolder(e) {
+  let dir = dirHandles[e.id];
+  if (!dir) try { dir = await idb.get("dir-" + e.id); } catch (err) {}
+  if (!dir || typeof dir.entries !== "function") { delete e.folder; commit({ plan: false }); return toast("The folder isn't connected any more. Use “Add a whole folder” to choose it again."); }
+  try {
+    if (dir.queryPermission && await dir.queryPermission({ mode: "read" }) !== "granted" && await dir.requestPermission({ mode: "read" }) !== "granted")
+      return toast("Exam Coach needs your permission to read the folder. Click again and allow it.");
+  } catch (err) { return toast("Exam Coach needs your permission to read the folder. Click again and allow it."); }
+  dirHandles[e.id] = dir;
+  await readFolder(e, dir, true);
+}
+async function importFolderPick() {
+  const fp = folderPick, e = fp && examById(fp.examId); if (!e) return;
+  const chosen = fp.items.filter(x => x.on);
+  if (!chosen.length) return toast("Tick at least one file.");
+  folderPick = null;
+  const files = [], kinds = new Map(), keys = new Map();
+  for (const x of chosen) {
+    let f = x.file;
+    if (!f) try { f = await x.handle.getFile(); } catch (err) { toast(`${x.name}: couldn't be opened.`); continue; }
+    files.push(f); kinds.set(f, x.kind); keys.set(f, x);
+  }
+  if (fp.handle) {
+    dirHandles[e.id] = fp.handle; e.folder = { name: String(fp.title).slice(0, 120) };
+    try { await idb.set("dir-" + e.id, fp.handle); } catch (err) {} // not kept where the browser can't store handles
+  }
+  await addFiles(e, files, f => kinds.get(f));
+  e.seenFiles = [...new Set([...(e.seenFiles || []), ...files.map(f => fileKey(f.name, f.size, f.lastModified))])].slice(-1000);
+  commit({ plan: false });
+}
+function folderPanel(e) {
+  const fp = folderPick;
+  if (!fp || fp.examId !== e.id) return "";
+  const n = fp.items.filter(x => x.on).length, opt = (v, l, k) => `<option value="${v}" ${k === v ? "selected" : ""}>${l}</option>`;
+  return `<div class="fold stack" id="folder-pick">
+    <div class="section-head"><b>${fp.check ? "New files in" : "Files in"} “${esc(fp.title)}”</b><span class="small muted">${fp.items.length} file${fp.items.length > 1 ? "s" : ""}${fp.skipped ? ` · ${fp.skipped} other file${fp.skipped > 1 ? "s" : ""} skipped (only PDF, TXT, MD)` : ""}</span></div>
+    <span class="small muted">Untick what you don't need and check the type. The type is a guess from the file and folder names.</span>
+    <div class="fold-list">${fp.items.map((x, i) => `<div class="fold-row">
+      <label class="fold-name"><input type="checkbox" class="fold-on" data-i="${i}" ${x.on ? "checked" : ""}> <span class="mono small">${esc(x.path)}</span>${x.seen ? ` <span class="chip">added before</span>` : ""}</label>
+      <select class="fold-kind" data-i="${i}" aria-label="Type of ${esc(x.name)}">${opt("script", "Script", x.kind)}${opt("slides", "Slides", x.kind)}${opt("oldexam", "Old exam", x.kind)}</select></div>`).join("")}</div>
+    <div class="row"><button class="btn primary" data-act="fold-add" ${n ? "" : "disabled"}>Add ${n} file${n === 1 ? "" : "s"}</button><button class="btn ghost" data-act="fold-all">${n === fp.items.length ? "Untick all" : "Tick all"}</button><button class="btn ghost" data-act="fold-cancel">Cancel</button></div>
+  </div>`;
+}
+const canPickFolder = () => typeof window.showDirectoryPicker === "function";
+function folderButtons(e) {
+  return `${canPickFolder() ? `<button class="btn" data-act="folder" style="align-self:end">Add a whole folder</button>`
+    : `<label class="btn" style="align-self:end">Add a whole folder<input type="file" id="mat-folder" webkitdirectory multiple hidden></label>`}
+    ${e.folder && canPickFolder() ? `<button class="btn ghost" data-act="folder-check" style="align-self:end" title="Adds only files that weren't added before">Check “${esc(e.folder.name)}” for new files</button>` : ""}`;
+}
+
 function chunksOf(name, kind, text) {
   return text.split(/\n(?==== (?:p\.|part) ?\d+ ===)/).filter(s => s.trim()).map(s => {
     const m = s.match(/=== (p\.|part) ?(\d+) ===/);
@@ -779,8 +1092,10 @@ async function aiCall(prompt, { signal, modelTier } = {}) {
   if (!text.trim()) throw { code: "empty_completion" };
   return { text, truncated: stop === "max_tokens" };
 }
-function parseJSON(t) {
+function parseJSON(t, fixed) {
   try { return JSON.parse(t); } catch (e) {}
+  // LaTeX with single backslashes ("\alpha") is not valid JSON; double the backslashes JSON doesn't know.
+  if (!fixed) { const u = t.replace(/\\(["\\/bfnrt]|u[0-9a-fA-F]{4})|\\/g, (m, ok) => ok ? m : "\\\\"); if (u !== t) { try { return parseJSON(u, true); } catch (e) {} } }
   const f = t.match(/```(?:json)?\s*([\s\S]*?)```/);
   if (f) { try { return JSON.parse(f[1]); } catch (e) {} }
   const starts = ["{", "["].map(c => t.indexOf(c)).filter(i => i >= 0);
@@ -788,11 +1103,15 @@ function parseJSON(t) {
   if (a >= 0 && b > a) { try { return JSON.parse(t.slice(a, b + 1)); } catch (e) {} }
   throw { code: "invalid_json" };
 }
+// Added to every request: how to write formulas for the student, and that formula text taken
+// from PDF slides may have lost symbols.
+const MATH_RULES = `Formulas: the student reads plain text, not LaTeX. Write math with Unicode symbols: Greek letters (α, β, σ, τ, Π), ∑, ≤, ≥, ≠, ≈, ×, ·, √, fractions as a/b, subscripts and superscripts as Xᵢⱼ, x², τᵢⱼ^(1−σ) or X_ij. Never use LaTeX commands or $ signs.
+Course material text was extracted from PDFs, so formulas in it may be damaged: Greek letters can show up as Latin letters (for example "a" or "s" where the slide shows α or σ), and subscripts or superscripts as separate letters or lines ("X ij" for Xᵢⱼ). Use the notation of the course where it is clear from the context; if a symbol is unclear, describe it in words instead of guessing. Don't invent notation the material doesn't use.`;
 const AI = {
   json: async (prompt, opts = {}) => {
-    const r = await aiCall(prompt + "\n\nReply with the JSON only, no other text.", opts);
+    const r = await aiCall(prompt + "\n\n" + MATH_RULES + "\n\nReply with the JSON only, no other text.", opts);
     if (r.truncated) throw { code: "invalid_json" };
-    return parseJSON(r.text);
+    return mathDeep(parseJSON(r.text));
   }
 };
 // Technical detail for error messages, without provider, product or hosting names
@@ -921,8 +1240,8 @@ async function runAnalysis(e, mats, budget, signal, retry) {
 async function analyzeMaterials(e) {
   if (!sample) return toast(aiOffMsg());
   const all = await Promise.all(e.materials.map(async m => ({ ...m, text: await getMaterial(m.id) })));
-  const mats = all.filter(m => !looksEmpty(m.text, m.pages));
-  const skipped = all.filter(m => looksEmpty(m.text, m.pages)).map(m => m.name);
+  const mats = all.filter(m => !looksEmpty(m.text));
+  const skipped = all.filter(m => looksEmpty(m.text)).map(m => m.name);
   if (!mats.length) return toast(noTextMsg(skipped.length ? skipped : ["These files"]));
   busy.analyze = e.id; busy.progress = null; render();
   aiCtl = new AbortController();
@@ -2294,10 +2613,13 @@ function vExams() {
         <div class="row" style="justify-content:center">
           <label class="field" style="text-align:left"><span>These files are</span><select id="mat-kind"><option value="script">Script / lecture notes</option><option value="slides">Slides</option><option value="oldexam">Old exams</option></select></label>
           <label class="btn" style="align-self:end">Choose files<input type="file" id="mat-file" multiple accept=".pdf,.txt,.md" hidden></label>
+          ${folderButtons(e)}
         </div>
-        ${busy.upload ? `<span class="small"><span class="spinner"></span> Reading files…</span>` : ""}
+        ${busy.folder ? `<span class="small"><span class="spinner"></span> Looking through the folder…</span>` : ""}
+        ${busy.upload ? `<span class="small" id="upload-progress"><span class="spinner"></span> <span class="ptext">${esc(uploadProgress())}</span></span>` : ""}
       </div>
-      ${e.materials.length ? `<div class="mats">${e.materials.map(m => `<div class="mat"><span class="chip ${m.kind === "oldexam" ? "mock" : m.kind === "slides" ? "review" : "learn"}">${{ script: "Script", slides: "Slides", oldexam: "Old exam" }[m.kind]}</span><b>${esc(m.name)}</b><span class="small muted mono">${m.pages} ${/\.pdf$/i.test(m.name) ? "pages" : "parts"}${m.truncated ? " · shortened" : ""}</span>${m.empty ? `<span class="chip warn" title="${isPdf(m.name) ? "Scanned PDFs without a text layer can't be read yet" : "This file has almost no text"}">${isPdf(m.name) ? "scanned? no text found" : "little text found"}</span>` : ""}<button class="btn sm ghost" data-act="rm-mat" data-id="${m.id}">${confirmKey === "mat" + m.id ? "Click to remove" : "Remove"}</button></div>`).join("")}</div>` : ""}
+      ${folderPanel(e)}
+      ${e.materials.length ? `<div class="mats">${e.materials.map(m => `<div class="mat"><span class="chip ${m.kind === "oldexam" ? "mock" : m.kind === "slides" ? "review" : "learn"}">${{ script: "Script", slides: "Slides", oldexam: "Old exam" }[m.kind]}</span><b>${esc(m.name)}</b><span class="small muted mono">${matInfo(m)}</span>${m.empty ? `<span class="chip warn" title="${isPdf(m.name) ? "Scanned PDFs without a text layer can't be read yet" : "This file has almost no text"}">${isPdf(m.name) ? "scanned? no text found" : "little text found"}</span>` : ""}<button class="btn sm ghost" data-act="rm-mat" data-id="${m.id}">${confirmKey === "mat" + m.id ? "Click to remove" : "Remove"}</button></div>`).join("")}</div>` : ""}
       <div class="row">
         ${busy.analyze === e.id
           ? `<span id="analyze-progress"><span class="spinner"></span> <span class="ptext">${esc(progressText(busy.progress))}</span></span><button class="btn sm" data-act="stop">Stop</button>`
@@ -2568,6 +2890,11 @@ $("#main").addEventListener("click", async ev => {
     case "rm-off": S.settings.blackout = S.settings.blackout.filter(d => d !== el.dataset.date); busy.openSettings = true; commit(); break;
     case "analyze": analyzeMaterials(e); break;
     case "stop": aiCtl && aiCtl.abort(); break;
+    case "folder": pickFolder(e); break;
+    case "folder-check": checkFolder(e); break;
+    case "fold-add": importFolderPick(); break;
+    case "fold-cancel": folderPick = null; render(); break;
+    case "fold-all": if (folderPick) { const all = folderPick.items.every(x => x.on); folderPick.items.forEach(x => { x.on = !all; }); render(); } break;
     case "rm-mat": {
       const id = el.dataset.id;
       if (confirmKey !== "mat" + id) { confirmKey = "mat" + id; render(); break; }
@@ -2581,7 +2908,7 @@ $("#main").addEventListener("click", async ev => {
     case "add-topic": { const n = $("#new-topic").value.trim(); if (!n) { $("#new-topic").focus(); break; } e.topics.push(mkTopic(n, 3, 3)); commit(); setTimeout(() => $("#new-topic") && $("#new-topic").focus(), 20); break; }
     case "rm-exam": {
       if (confirmKey !== "exam" + e.id) { confirmKey = "exam" + e.id; render(); break; }
-      confirmKey = null; e.materials.forEach(m => dropMaterial(m.id));
+      confirmKey = null; e.materials.forEach(m => dropMaterial(m.id)); delete dirHandles[e.id]; idb.del("dir-" + e.id).catch(() => {});
       S.exams = S.exams.filter(x => x !== e); S.blocks = S.blocks.filter(b => b.examId !== e.id); selExam = null;
       commit({ log: { kind: "setup", title: `Removed ${e.subject}`, detail: "Its blocks were removed and the freed time went to your other exams." } }); break;
     }
@@ -2641,6 +2968,9 @@ $("#main").addEventListener("change", ev => {
   }
   if (el.id === "restore-file") { if (el.files[0]) readBackup(el.files[0]); el.value = ""; return; }
   if (el.id === "mat-file" && e) { addFiles(e, [...el.files], $("#mat-kind").value); el.value = ""; return; }
+  if (el.id === "mat-folder" && e) { folderFromInput(e, el.files); el.value = ""; return; }
+  if (el.classList.contains("fold-on") && folderPick) { folderPick.items[+el.dataset.i].on = el.checked; render(); return; }
+  if (el.classList.contains("fold-kind") && folderPick) { folderPick.items[+el.dataset.i].kind = el.value; return; }
   if (el.dataset.q === "exam") { quiz = { examId: el.value, topicId: null, phase: "pick" }; render(); return; }
   if (el.dataset.q === "topic") { quiz = { examId: quiz.examId, topicId: el.value, phase: "pick", n: quiz.n }; render(); return; }
   if (el.dataset.conf != null && quiz) { quiz.conf = quiz.conf || {}; quiz.conf[+el.dataset.conf] = el.value; return; }

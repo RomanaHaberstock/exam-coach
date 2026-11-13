@@ -169,6 +169,11 @@ td input[type=number]{width:72px}
 .mats{display:grid; gap:6px}
 .mat{display:flex; gap:10px; align-items:center; padding:8px 10px; background:var(--bg); border-radius:8px; flex-wrap:wrap}
 .mat b{font-weight:500; overflow-wrap:anywhere; flex:1; min-width:140px}
+.fold{padding:12px; border:1px solid var(--line); border-radius:10px}
+.fold-list{display:grid; gap:4px; max-height:360px; overflow:auto}
+.fold-row{display:flex; gap:10px; align-items:center; justify-content:space-between; padding:6px 8px; background:var(--bg); border-radius:8px; flex-wrap:wrap}
+.fold-name{display:flex; gap:8px; align-items:center; flex:1; min-width:180px; overflow-wrap:anywhere}
+.fold-kind{min-width:0}
 
 /* quiz */
 .q{display:grid; gap:10px}
