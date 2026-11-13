@@ -270,3 +270,25 @@ hr.sep{border:0; border-top:1px solid var(--line); margin:6px 0; width:100%}
 .turn{display:grid; gap:2px; padding:8px 12px; border-radius:10px; max-width:min(62ch,88%); white-space:pre-wrap; overflow-wrap:anywhere; background:var(--sunk)}
 .turn.me{justify-self:end; background:var(--accent-soft)}
 [data-act="m-mic"][aria-pressed="true"]{border-color:var(--bad); color:var(--bad)}
+/* What a block covers, what to do and what to have at the end */
+.detail{display:grid; gap:3px; margin-top:6px; font-size:.84rem; max-width:75ch}
+.detail .label{font-size:.66rem; margin-right:4px}
+.detail ul{margin:2px 0 0; padding-left:18px}
+.detail li{margin:0}
+/* "Do this now" card */
+.now{display:grid; gap:10px; border-left:4px solid var(--ec, var(--accent))}
+.now h2{font-size:1.25rem}
+.now .detail{font-size:.92rem}
+/* Week-by-week overview */
+.weeks{list-style:none; margin:0; padding:0; display:grid; gap:2px}
+.weeks li{display:grid; grid-template-columns:minmax(150px,220px) 1fr; gap:4px 14px; padding:8px 0; border-top:1px solid var(--line)}
+.weeks li:first-child{border-top:0}
+.weeks .wk{display:flex; flex-wrap:wrap; gap:4px 8px; align-items:center}
+@media (max-width:560px){ .weeks li{grid-template-columns:1fr} }
+/* Setup steps for an exam without a plan */
+.setup{list-style:none; margin:0; padding:0; display:grid; gap:8px; counter-reset:s}
+.setup li{display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center; justify-content:space-between; padding:10px 12px; border-radius:8px; background:var(--sunk)}
+.setup li > div{display:grid; gap:2px; flex:1; min-width:200px}
+.setup li.done{opacity:.7}
+.setup li.next{background:var(--accent-soft); outline:2px solid var(--accent)}
+details.panel > summary{font-family:var(--display)}
