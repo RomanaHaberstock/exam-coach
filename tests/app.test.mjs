@@ -177,6 +177,38 @@ test("builds a plan from the example exams and keeps it after a reload", async (
   assert.equal(await page.evaluate(() => S.exams.length), 2);
 });
 
+test("learns a topic in one block per day instead of several blocks in a row", async () => {
+  const r = await page.evaluate(() => {
+    const saved = JSON.stringify(S);
+    S.settings.dayMinutes = { 0: 180, 1: 180, 2: 180, 3: 180, 4: 180, 5: 180, 6: 180 }; S.settings.blockMin = 60; S.settings.blackout = [];
+    const goals = n => Array.from({ length: n }, (_, i) => ({ text: `Goal ${i + 1}`, src: `p. ${i + 1}` }));
+    const e = normExam({ id: uid(), subject: "Merge check", date: addDays(today(), 30), format: "written", target: 80, materials: [], style: "",
+      topics: [Object.assign(mkTopic("Long topic", 3, 4), { goals: goals(4) }), Object.assign(mkTopic("Short topic", 3, 1.5), { goals: goals(3) })] });
+    S.exams = [e]; S.blocks = []; replan();
+    const learn = S.blocks.filter(b => b.type === "learn").sort((a, b) => (a.date + a.start) < (b.date + b.start) ? -1 : 1);
+    const byDay = {}; for (const b of S.blocks) byDay[b.date] = (byDay[b.date] || 0) + b.minutes;
+    const out = {
+      twice: learn.filter((b, i) => i && learn[i - 1].date === b.date && learn[i - 1].topicId === b.topicId).length,
+      minutes: e.topics.map(t => sum(learn.filter(b => b.topicId === t.id), b => b.minutes)),
+      goals: e.topics.map(t => [...new Set(learn.filter(b => b.topicId === t.id).flatMap(b => b.goals))].sort()),
+      sorted: learn.every(b => b.goals.every((g, i) => !i || b.goals[i - 1] < g)),
+      over: Object.entries(byDay).filter(([d, m]) => m > 180).length,
+      longest: Math.max(...learn.map(b => b.minutes))
+    };
+    const sig = () => S.blocks.map(b => `${b.date} ${b.start} ${b.minutes} ${b.type} ${b.topicId} ${b.goals}`).join("|");
+    const s1 = sig(); replan(); out.stable = s1 === sig();
+    Object.assign(S, JSON.parse(saved)); normalize(); commit({ plan: true });
+    return out;
+  });
+  assert.equal(r.twice, 0, "no topic twice in a row on the same day");
+  assert.deepEqual(r.minutes, [240, 90], "all learning time is still planned");
+  assert.deepEqual(r.goals, [[0, 1, 2, 3], [0, 1, 2]], "every goal is still covered");
+  assert.ok(r.sorted);
+  assert.equal(r.over, 0, "no day over its available time");
+  assert.ok(r.longest > 60, "a day's learning of one topic is one longer block");
+  assert.ok(r.stable, "same plan when re-planned");
+});
+
 test("reads an uploaded PDF and turns it into topics", async () => {
   await page.click('nav [data-view="exams"]');
   await page.selectOption("#mat-kind", "script");
@@ -1020,7 +1052,7 @@ test("Teach the AI / oral results get the root-cause repair and stay out of the 
 // An exam of its own with one topic and one material, so these results don't change the other tests' exams.
 async function studyBlockWithMaterial() {
   return page.evaluate(async () => {
-    newExam(); const e = examById(selExam); e.subject = "Methods exam"; e.date = addDays(today(), 5);
+    newExam(); const e = examById(selExam); e.subject = "Methods exam"; e.date = addDays(today(), 8);
     const id = uid(), text = "\n=== p. 1 ===\nHypothesis tests compare H0 and H1.\n=== p. 2 ===\nHypothesis tests can make a Type I error (rejecting a true H0) or a Type II error.";
     await putMaterial(id, { name: "notes.pdf", kind: "script", text });
     e.materials.push({ id, name: "notes.pdf", kind: "script", pages: 2, chars: text.length, truncated: false, empty: false });
@@ -1355,7 +1387,7 @@ test("guides from the first visit to a full, concrete plan: steps, week overview
   // each learning block covers its own share of the topic's subtopics, in order
   const lb = await p.evaluate(() => { const e = S.exams[0], t = e.topics[0];
     return S.blocks.filter(b => b.topicId === t.id && b.type === "learn").map(b => b.goals); });
-  assert.ok(lb.length >= 4);
+  assert.ok(lb.length >= 2);
   assert.deepEqual([...new Set(lb.flat())].sort(), [0, 1, 2, 3], "every subtopic is covered");
   assert.equal(lb[0][0], 0); assert.ok(lb.at(-1).includes(3)); assert.ok(!lb[0].includes(3));
   const row = p.locator(".block", { hasText: "Learn: Hypothesis tests" }).first();

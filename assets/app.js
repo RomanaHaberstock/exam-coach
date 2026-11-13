@@ -439,7 +439,17 @@ function replan() {
     cap[d] = Math.max(0, c); cur[d] = Math.max(start, keptEnd);
   }
   const out = [];
-  const place = (d, minutes, props) => { out.push({ id: uid(), date: d, start: fromMin(cur[d]), minutes, status: "planned", ...props }); cur[d] += minutes + 10; cap[d] -= minutes; };
+  const place = (d, minutes, props) => {
+    // The next chunk of the topic learned right before on the same day extends that block
+    // (one longer block instead of "Learn: X" twice in a row); its goals are joined.
+    const prev = out[out.length - 1];
+    if (props.type === "learn" && prev && prev.type === "learn" && prev.date === d && prev.examId === props.examId && prev.topicId === props.topicId
+      && toMin(prev.start) + prev.minutes + 10 === cur[d]) {
+      prev.minutes += minutes; prev.goals = [...new Set([...(prev.goals || []), ...(props.goals || [])])].sort((x, y) => x - y);
+      cur[d] += minutes; cap[d] -= minutes; return;
+    }
+    out.push({ id: uid(), date: d, start: fromMin(cur[d]), minutes, status: "planned", ...props }); cur[d] += minutes + 10; cap[d] -= minutes;
+  };
   const learnEnd = {}, queue = {}, reviews = {};
   // 1) backwards: final review on the eve, mock exam a few days before
   for (const e of active) {
