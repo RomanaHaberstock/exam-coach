@@ -52,8 +52,15 @@ nav button{border:0; background:none; padding:8px 12px; border-radius:8px; curso
 nav button:hover{background:var(--sunk); color:var(--ink)}
 nav button[aria-current="page"]{background:var(--accent-soft); color:var(--accent); font-weight:600}
 .savestate{font-size:.78rem; color:var(--muted); white-space:nowrap}
+/* narrow screens: the tabs get their own row under the brand and wrap, so every section stays reachable */
+@media (max-width:560px){
+  .top-in{gap:6px 12px; padding-block:8px}
+  .brand{flex:1}
+  nav{order:5; flex:1 1 100%; flex-wrap:wrap; overflow:visible; gap:2px; margin-inline:-6px}
+  nav button{padding:6px 9px; font-size:.9rem}
+}
 
-main{max-width:1100px; margin:0 auto; padding-block:24px 64px; padding-left:max(16px, env(safe-area-inset-left,0px)); padding-right:max(16px, env(safe-area-inset-right,0px)); display:grid; gap:24px}
+main{max-width:1100px; margin:0 auto; padding-block:24px max(64px, calc(var(--timer-h, 0px) + 24px)); padding-left:max(16px, env(safe-area-inset-left,0px)); padding-right:max(16px, env(safe-area-inset-right,0px)); display:grid; gap:24px}
 .section{display:grid; gap:12px; min-width:0}
 .section-head{display:flex; align-items:baseline; justify-content:space-between; gap:12px; flex-wrap:wrap}
 
@@ -137,6 +144,19 @@ th{text-align:left; font-size:.72rem; text-transform:uppercase; letter-spacing:.
 td{padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:middle}
 td input[type=text]{width:100%}
 td input[type=number]{width:72px}
+
+/* mock exam form: on a phone each task becomes a small card instead of a wide table row */
+@media (max-width:560px){
+  #mk-table{min-width:0}
+  #mk-table thead{display:none}
+  #mk-table, #mk-table tbody{display:block}
+  #mk-table tr{display:grid; grid-template-columns:1fr 1fr; gap:8px 10px; padding:12px 0; border-bottom:1px solid var(--line)}
+  #mk-table td{display:grid; gap:3px; padding:0; border:0; min-width:0}
+  #mk-table td[data-label]::before{content:attr(data-label); font-size:.72rem; text-transform:uppercase; letter-spacing:.07em; color:var(--muted); font-weight:600}
+  #mk-table td.mk-wide{grid-column:1/-1}
+  #mk-table td input, #mk-table td select{width:100%}
+  #mk-table td.mk-rm{grid-column:1/-1; justify-self:start}
+}
 
 /* exam editor */
 .ed{display:grid; grid-template-columns:240px 1fr; gap:20px; align-items:start}
@@ -240,3 +260,8 @@ hr.sep{border:0; border-top:1px solid var(--line); margin:6px 0; width:100%}
 .aibar{display:flex; gap:10px; align-items:center; flex-wrap:wrap}
 .aibar input{flex:1 1 200px}
 .toast{position:fixed; left:50%; transform:translateX(-50%); bottom:calc(20px + env(safe-area-inset-bottom,0px)); background:var(--ink); color:var(--bg); padding:10px 16px; border-radius:8px; font-size:.9rem; z-index:20; max-width:calc(100% - 32px)}
+/* study modes: Teach the AI and oral exam practice */
+.chat{display:grid; gap:8px}
+.turn{display:grid; gap:2px; padding:8px 12px; border-radius:10px; max-width:min(62ch,88%); white-space:pre-wrap; overflow-wrap:anywhere; background:var(--sunk)}
+.turn.me{justify-self:end; background:var(--accent-soft)}
+[data-act="m-mic"][aria-pressed="true"]{border-color:var(--bad); color:var(--bad)}

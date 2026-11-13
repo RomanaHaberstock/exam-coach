@@ -13,6 +13,7 @@ Over time it also learns which study methods, times of day and session lengths w
 - **Quizzes in the style of your old exams.** Multiple choice, short answers and calculations, graded by the AI with feedback on what was missing.
 - **A plan that adapts.** A low quiz score adds study time for that topic, schedules a review for the next day and focuses the next quiz on what you got wrong. Skipped blocks are rescheduled. Every change is logged with its reason.
 - **Study sessions.** Each learning block opens a session made from your material: practice problems, worked examples, flashcards, or writing an explanation or summary that the AI checks.
+- **Teach the AI and oral exam practice.** On the Study page you can explain a topic to the AI, which plays a curious classmate, asks follow-up questions and points out gaps against your material. Or practise a short oral exam: 3–5 examiner questions, one at a time, ending with a grade estimate on the Austrian 1–5 scale. Both count like a quiz. Answers can be typed, or spoken where the browser supports speech input.
 - **Learning profile.** The app tries different study methods on different topics and checks two days later what you still remember. It also learns how fast you forget, when you're sharpest, how much of your plan you complete, how long you focus and whether your confidence can be trusted, and offers to adjust the plan to each finding.
 - **Focus timer and streaks.** A Pomodoro timer that credits focus time to your study blocks, and a daily study streak.
 - **Calendar export.** Download the plan as an `.ics` file for Google Calendar, Outlook or Apple Calendar.
@@ -29,7 +30,7 @@ Over time it also learns which study methods, times of day and session lengths w
 
 There are no accounts. Each student's plan, quiz results and uploaded materials are saved in their own browser (IndexedDB) and never stored on a server. Under **Plan → Your data**, students can download a backup file and restore it on another device.
 
-Only the text needed for an AI request is sent to the backend, which stores nothing and passes it on to the AI provider. With Google Gemini, users in the EU, Switzerland and the UK get Google's paid-tier data protections even on the free tier, so their prompts aren't used to improve Google's products ([Gemini API terms](https://ai.google.dev/gemini-api/terms)). Outside these regions, free-tier requests may be used by Google, so don't upload sensitive material there. The site loads no external fonts, scripts or trackers.
+Only the text needed for an AI request is sent to the backend, which stores nothing and passes it on to the AI provider. With Google Gemini, users in the EU, Switzerland and the UK get Google's paid-tier data protections even on the free tier, so their prompts aren't used to improve Google's products ([Gemini API terms](https://ai.google.dev/gemini-api/terms)). Outside these regions, free-tier requests may be used by Google, so don't upload sensitive material there. The site loads no external fonts, scripts or trackers. Speech input in oral exam practice is optional and uses the browser's own speech recognition; some browsers (for example Chrome) send the audio to their maker's servers for this, so the app tells students before they use it.
 
 ## How it works
 
@@ -84,6 +85,7 @@ From then on, every push to GitHub updates the site automatically.
 | `ANTHROPIC_API_KEY` | none | Your Anthropic API key. Needed when using Anthropic. |
 | `AI_PROVIDER` | automatic | `gemini` or `anthropic`. If not set, Gemini is used when `GEMINI_API_KEY` exists, otherwise Anthropic. |
 | `ACCESS_CODE` | none | If set, the AI features only work after entering this code, so strangers who find the link can't use up your limits or credit. |
+| `ALLOWED_ORIGINS` | none | Other websites (comma-separated origins, e.g. `https://example.org`) allowed to call `/api/ai` from a browser. The site itself always may. |
 | `GEMINI_MODEL` | `gemini-3.8-flash` | Gemini model for analysing materials, quizzes, grading and study sessions. |
 | `GEMINI_MODEL_QUICK` | `gemini-3.5-flash-lite` | Gemini model for short requests. |
 | `ANTHROPIC_MODEL` | `claude-sonnet-5-5` | Anthropic model for the main requests. |

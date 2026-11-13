@@ -5,7 +5,8 @@
  *
  * Sections: helpers · state · persistence · planning engine · feedback loop ·
  * material extraction · AI backend · calendar export · example data · streaks ·
- * focus timer · learning fingerprint · fingerprint views · study sessions · views · events
+ * focus timer · learning fingerprint · fingerprint views · study sessions ·
+ * post-exam review · views · events
  */
 "use strict";
 /* ---------- helpers ---------- */
@@ -25,13 +26,17 @@ const fromMin = m => `${pad(Math.floor(m / 60) % 24)}:${pad(m % 60)}`;
 const hrs = m => { const h = Math.round(m / 6) / 10; return (h % 1 === 0 ? h.toFixed(0) : h.toFixed(1)) + " h"; };
 const sum = (a, f = x => x) => a.reduce((s, x) => s + f(x), 0);
 const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej({ code: "timeout" }), ms))]);
-function toast(msg) { const t = $("#toast"); t.textContent = msg; t.hidden = false; clearTimeout(toast.t); toast.t = setTimeout(() => t.hidden = true, 3200); }
+function toast(msg) {
+  const t = $("#toast"); t.textContent = msg; t.hidden = false; clearTimeout(toast.t);
+  toast.t = setTimeout(() => t.hidden = true, Math.min(12000, Math.max(3200, msg.length * 55)));
+  t.onclick = () => { t.hidden = true; };
+}
 
 /* ---------- state ---------- */
 const DEFAULTS = () => ({
   v: 1,
   settings: { dayMinutes: { 0: 60, 1: 120, 2: 120, 3: 120, 4: 120, 5: 90, 6: 180 }, blockMin: 60, startTime: "17:00", blackout: [], pomo: { focus: 25, short: 5, long: 15, every: 4 } },
-  exams: [], blocks: [], log: [], shortfall: {}, activity: {}, bestStreak: 0, fp: fpInit()
+  exams: [], blocks: [], log: [], shortfall: {}, activity: {}, bestStreak: 0, fp: fpInit(), archive: []
 });
 function normalize() {
   const d = DEFAULTS();
@@ -40,11 +45,89 @@ function normalize() {
   if (!S.activity || typeof S.activity !== "object") S.activity = {};
   S.bestStreak = +S.bestStreak || 0;
   S.fp = Object.assign(fpInit(), S.fp || {});
-  for (const k of ["quizLog", "sessions", "conf", "enjoy"]) if (!Array.isArray(S.fp[k])) S.fp[k] = [];
+  for (const k of ["quizLog", "sessions", "conf", "enjoy", "energy"]) if (!Array.isArray(S.fp[k])) S.fp[k] = [];
   S.fp.applied = S.fp.applied || {};
+  const rp = S.fp.realismPast;
+  S.fp.realismPast = rp && typeof rp === "object" ? { done: +rp.done || 0, total: +rp.total || 0 } : null;
+  if (!Array.isArray(S.exams)) S.exams = [];
+  S.exams.forEach(normExam);
+  if (!Array.isArray(S.blocks)) S.blocks = [];
+  // Blocks from a restored backup: known status and type, finite minutes, a mock's effect record as an object.
+  S.blocks = S.blocks.filter(b => b && typeof b === "object" && typeof b.date === "string");
+  for (const b of S.blocks) {
+    if (!["planned", "done", "skipped"].includes(b.status)) b.status = "planned";
+    if (!["learn", "review", "mock", "check"].includes(b.type)) b.type = "review";
+    b.minutes = Math.max(0, Math.min(720, Math.round(+b.minutes) || 0));
+    if (b.mock && (typeof b.mock !== "object" || !Array.isArray(b.mock.tasks))) delete b.mock;
+    if (b.mock) b.mock.tasks = b.mock.tasks.filter(x => x && typeof x === "object").map(x => ({ ...x, label: String(x.label ?? ""), got: Math.max(0, +x.got || 0), max: Math.max(0, +x.max || 0) }));
+    if (b.mock && b.mock.fx != null && (typeof b.mock.fx !== "object" || Array.isArray(b.mock.fx))) delete b.mock.fx;
+  }
+  if (!Array.isArray(S.archive)) S.archive = [];
+  S.archive = S.archive.filter(a => a && typeof a === "object");
+  S.archive.forEach(normSemester);
+}
+// Per-exam fields added later: study mode ("top" = aim at full mastery, "pass" = cheapest
+// points first until the pass mark), pass mark in %, and old-exam tasks found by the AI.
+function normExam(e) {
+  if (e.mode !== "pass" && e.mode !== "top") e.mode = "top";
+  e.passPct = Math.min(100, Math.max(10, Math.round(+e.passPct || 50)));
+  if (!Array.isArray(e.oldTasks)) e.oldTasks = [];
+  if (!Array.isArray(e.topics)) e.topics = [];
+  if (!Array.isArray(e.materials)) e.materials = [];
+  if (e.review && typeof e.review === "object") e.review.gradeNum = gradeNum(e.review.gradeNum);
+  else delete e.review;
+  e.topics = e.topics.filter(t => t && typeof t === "object");
+  return cleanPrereqs(e);
+}
+// Prerequisite links: t.prereqs = ids of topics this topic builds on (learn them first).
+// Drops unknown ids, self-links and duplicates, then breaks cycles: links the student set by hand
+// (t.prereqsSet) are kept first, then links to topics earlier in the list (the material's learning
+// order), then later ones, each only if it closes no loop.
+function cleanPrereqs(e) {
+  const idx = new Map(e.topics.map((t, i) => [t.id, i]));
+  for (const t of e.topics) t.prereqs = [...new Set((Array.isArray(t.prereqs) ? t.prereqs : []).map(String))].filter(id => idx.has(id) && id !== t.id);
+  const keep = new Map(e.topics.map(t => [t.id, []]));
+  const reaches = (from, to) => { const seen = new Set(), st = [from]; while (st.length) { const x = st.pop(); if (x === to) return true; if (!seen.has(x)) { seen.add(x); st.push(...keep.get(x)); } } return false; };
+  for (const manual of [true, false]) for (const earlier of [true, false]) for (const t of e.topics) if (!!t.prereqsSet === manual) for (const p of t.prereqs)
+    if ((idx.get(p) < idx.get(t.id)) === earlier && !reaches(p, t.id)) keep.get(t.id).push(p);
+  for (const t of e.topics) { const k = keep.get(t.id); t.prereqs = t.prereqs.filter(p => k.includes(p)); }
+  return e;
+}
+// Every topic `id` builds on, directly or through other topics.
+function prereqsOf(e, id) {
+  const out = new Set(), st = [id];
+  while (st.length) { const t = topicById(e, st.pop()); if (t) for (const p of t.prereqs || []) if (!out.has(p)) { out.add(p); st.push(p); } }
+  return out;
+}
+// Topics in priority order, with each topic's prerequisites pulled in just before it
+// (in the same priority order), so nothing comes before what it builds on.
+function topoOrder(e, list) {
+  const pos = new Map(list.map((t, i) => [t.id, i])), out = [], seen = new Set();
+  const visit = t => {
+    if (seen.has(t.id)) return; seen.add(t.id);
+    (t.prereqs || []).map(id => topicById(e, id)).filter(Boolean).sort((a, b) => (pos.get(a.id) ?? 1e9) - (pos.get(b.id) ?? 1e9)).forEach(visit);
+    out.push(t);
+  };
+  list.forEach(visit);
+  return out;
+}
+// Austrian grading scale; the numeric grade in a review is optional (null).
+const GRADES = { 1: "Sehr gut", 2: "Gut", 3: "Befriedigend", 4: "Genügend", 5: "Nicht genügend" };
+function gradeNum(v) { const n = Math.round(+v); return v !== "" && v != null && n >= 1 && n <= 5 ? n : null; }
+// Archived semesters (from "Start a new semester"), also after a restore from an older backup.
+function normSemester(a) {
+  if (!Array.isArray(a.exams)) a.exams = [];
+  a.exams = a.exams.filter(x => x && typeof x === "object");
+  for (const x of a.exams) {
+    for (const k of ["topics", "oldTasks", "mocks"]) if (!Array.isArray(x[k])) x[k] = [];
+    if (x.mode !== "pass" && x.mode !== "top") x.mode = "top";
+    x.passPct = Math.min(100, Math.max(10, Math.round(+x.passPct || 50)));
+    if (!x.stats || typeof x.stats !== "object") x.stats = {};
+    if (x.review && typeof x.review === "object") x.review.gradeNum = gradeNum(x.review.gradeNum); else x.review = null;
+  }
 }
 let S = DEFAULTS();
-let view = "dashboard", selExam = null, quiz = null, busy = {}, confirmKey = null;
+let view = "dashboard", selExam = null, quiz = null, busy = { noCheck: {}, rv: {} }, confirmKey = null;
 let sample = null, aiState = "checking", storeMode = "none";
 const matCache = {};
 
@@ -158,6 +241,56 @@ function needLearn(t) { return Math.max(0, Math.round((+t.effortH || 0) * 60) + 
 function remainingLearn(t) { return Math.max(0, needLearn(t) - doneMin(t.id, ["learn"])); }
 function learnProgress(t) { const base = Math.round((+t.effortH || 0) * 60); return base ? Math.min(1, doneMin(t.id, ["learn"]) / base) : 1; }
 
+/* ---------- points per hour ---------- */
+// Share of the exam's points per topic (sums to 100). Best source first: old-exam tasks
+// found by the AI, then the latest mock exam the student scored, then old-exam hits, then weights.
+function lastMock(e) { return S.blocks.filter(b => b.examId === e.id && b.mock && b.mock.tasks.length).sort((a, b) => a.mock.at < b.mock.at ? 1 : -1)[0] || null; }
+function topicPoints(e) {
+  const T = e.topics, raw = {};
+  const fromTasks = list => { for (const x of list) if (topicById(e, x.topicId) && x.max > 0) raw[x.topicId] = (raw[x.topicId] || 0) + x.max; return Object.keys(raw).length; };
+  const m = lastMock(e);
+  let source;
+  if (fromTasks(e.oldTasks.map(x => ({ topicId: x.topicId, max: +x.points || 0 })))) source = "old-exam tasks";
+  else if (m && fromTasks(m.mock.tasks)) source = "your mock exam";
+  else if (T.some(t => t.oldExamHits > 0)) { for (const t of T) raw[t.id] = (t.oldExamHits || 0) + 0.25 * (+t.weight || 1); source = "how often topics come up in old exams"; }
+  else { for (const t of T) raw[t.id] = +t.weight || 1; source = "topic weights"; }
+  const tot = sum(Object.values(raw)) || 1, pts = {};
+  for (const t of T) pts[t.id] = 100 * (raw[t.id] || 0) / tot;
+  return { pts, source };
+}
+// Per topic: exam points, points you probably have now, hours to full mastery, points per hour.
+// Pass mode marks the cheapest topics that together reach the pass mark as "needed".
+function pointsTable(e) {
+  const { pts, source } = topicPoints(e);
+  const rows = e.topics.map((t, i) => {
+    const level = t.mastery != null ? t.mastery / 100 : learnProgress(t) * e.target / 100;
+    const left = remainingLearn(t) / 60;
+    // learned but below full mastery: the missing share of the effort, rounded to half hours
+    const hours = left > 0 ? left : level < 0.95 ? Math.max(0.5, Math.round((+t.effortH || 1) * (1 - level) * 2) / 2) : 0;
+    const points = pts[t.id] || 0, have = points * level, gain = Math.max(0, points - have);
+    return { t, i, points, have, gain, hours, pph: hours ? gain / hours : 0, needed: e.mode !== "pass" };
+  }).sort((a, b) => b.pph - a.pph || b.gain - a.gain || a.i - b.i);
+  let now = sum(rows, r => r.have), passHours = 0;
+  const reached = now, byId = new Map(rows.map(r => [r.t.id, r]));
+  // A needed topic also needs the unfinished topics it builds on (marked with `first`).
+  const mark = (r, forName) => {
+    if (r.needed) return; r.needed = true; if (forName) r.first = forName;
+    for (const p of r.t.prereqs || []) { const q = byId.get(p); if (q && q.hours > 0) mark(q, r.t.name); }
+    now += r.gain; passHours += r.hours;
+  };
+  if (e.mode === "pass") for (const r of rows) { if (now >= e.passPct) break; if (r.gain <= 0) continue; mark(r); }
+  return { rows, source, have: reached, passHours, passReach: now, topHours: sum(rows, r => r.hours) };
+}
+// Learning order: the order of the material (the topic list) is the default sequence, because
+// courses build up step by step. Repair topics come first. Top grade: everything in material order.
+// Pass: the topics needed for the pass mark (picked by points per hour in pointsTable) come first,
+// still in material order, then the rest. Prerequisite links override both (topoOrder).
+function learnOrder(e) {
+  const needed = new Map(pointsTable(e).rows.map(r => [r.t.id, r.needed])), idx = new Map(e.topics.map((t, i) => [t.id, i]));
+  return topoOrder(e, [...e.topics].sort((a, b) => ((b.extraMin > 0) - (a.extraMin > 0))
+    || (e.mode === "pass" ? needed.get(b.id) - needed.get(a.id) : 0) || idx.get(a.id) - idx.get(b.id)));
+}
+
 function replan() {
   const t0 = today(), set = S.settings;
   const keep = S.blocks.filter(b => b.status !== "planned" || b.date < t0);
@@ -186,15 +319,17 @@ function replan() {
   for (const e of active) {
     const eve = addDays(e.date, -1);
     if (eve >= t0) {
-      const weakest = [...e.topics].sort((a, b) => (a.mastery ?? -1) - (b.mastery ?? -1) || b.weight - a.weight).slice(0, 2);
+      const weakest = [...e.topics].sort((a, b) => eveRank(e, a) - eveRank(e, b) || b.weight - a.weight).slice(0, 2);
       for (const t of weakest) if (cap[eve] >= 30) place(eve, Math.min(60, cap[eve]), { examId: e.id, topicId: t.id, type: "review", label: `Final review: ${t.name}` });
     }
+    // no new mock once the student has done (or scored) one for this exam
+    const mockDone = keep.some(b => b.examId === e.id && b.type === "mock" && (b.status === "done" || b.mock));
     let mockDay = null;
-    for (let d = addDays(e.date, -2); d >= t0 && diffDays(d, e.date) <= 7; d = addDays(d, -1)) if (cap[d] >= 60) { mockDay = d; break; }
+    if (!mockDone) for (let d = addDays(e.date, -2); d >= t0 && diffDays(d, e.date) <= 7; d = addDays(d, -1)) if (cap[d] >= 60) { mockDay = d; break; }
     if (mockDay) place(mockDay, Math.min(e.format === "oral" ? 60 : 90, cap[mockDay]), { examId: e.id, type: "mock", label: e.format === "oral" ? "Oral practice: explain every topic out loud" : "Mock exam under exam conditions" });
     learnEnd[e.id] = mockDay && mockDay > t0 ? addDays(mockDay, -1) : (addDays(e.date, -2) >= t0 ? addDays(e.date, -2) : eve);
-    // 2) learning chunks: repair topics first, then the material order
-    const order = [...e.topics].sort((a, b) => ((b.extraMin > 0) - (a.extraMin > 0)));
+    // 2) learning chunks: repair topics first, then by the exam's study mode (see learnOrder)
+    const order = learnOrder(e);
     queue[e.id] = [];
     for (const t of order) {
       let r = remainingLearn(t);
@@ -252,6 +387,15 @@ function replan() {
   for (const e of active) { const left = sum(queue[e.id], c => c.minutes); if (left > 0) S.shortfall[e.id] = left; }
   S.blocks = keep.concat(out).sort((a, b) => (a.date + a.start) < (b.date + b.start) ? -1 : 1);
 }
+// Who gets the final review on the eve: topics behind plan first (most behind first), then
+// not quizzed or on track (by weight), clearly strong ones last. On-track and not-learned-yet
+// results rank like an unquizzed topic, so a quiz that changes nothing doesn't move the eve slot.
+function eveRank(e, t) {
+  if (t.mastery == null) return 0;
+  const gap = t.mastery - Math.round(e.target * learnProgress(t));
+  if (gap < -10) return gap;
+  return t.mastery >= e.target + 10 && learnProgress(t) >= 1 ? 1 : 0;
+}
 function futureByTopic() {
   const m = {}, t0 = today();
   for (const b of S.blocks) if (b.status === "planned" && b.date >= t0 && b.topicId) m[b.examId + "|" + b.topicId] = (m[b.examId + "|" + b.topicId] || 0) + b.minutes;
@@ -270,40 +414,149 @@ function commit({ plan = true, log = null } = {}) {
   const before = futureByTopic();
   if (plan) replan();
   let entry = null;
-  if (log) { entry = { at: new Date().toISOString(), ...log, changes: plan ? diffTopics(before, futureByTopic()) : [] }; S.log.unshift(entry); }
+  if (log) {
+    const changes = plan ? diffTopics(before, futureByTopic()) : [];
+    // log.detail may be a function of the change list, so "the plan stays as it is" is only said when it does
+    entry = { at: new Date().toISOString(), ...log, detail: typeof log.detail === "function" ? log.detail(changes) : log.detail, changes };
+    S.log.unshift(entry);
+  }
   save(); render();
   return entry;
 }
 
 /* ---------- feedback loop ---------- */
-function applyQuizResult(e, t, score, missed) {
+// src: undefined for a normal quiz, "teach" (Teach the AI) or "oral" (oral exam practice);
+// those count like a quiz and are marked in the topic's quiz list and the log title.
+const VIA = { teach: "Teach the AI", oral: "oral exam practice" };
+function applyQuizResult(e, t, score, missed, src) {
+  const r = quizEffect(e, t, score, missed, null, src);
+  return commit({ log: { examId: e.id, kind: "quiz", title: r.title + (VIA[src] ? ` · ${VIA[src]}` : ""), detail: ch => r.detail + (r.verdict === "below" || r.verdict === "above" ? "" : keepText(ch)), score, expected: r.expected, ...(VIA[src] ? { via: src } : {}) } });
+}
+// Root-cause check: the weakest topic this one builds on that is below the target (quizzed),
+// or not quizzed yet and not fully learned (so there's no sign the student knows it).
+function weakPrereq(e, t) {
+  const level = p => p.mastery != null ? p.mastery : Math.round(e.target * learnProgress(p));
+  return (t.prereqs || []).map(id => topicById(e, id)).filter(Boolean)
+    .filter(p => p.mastery != null ? p.mastery < e.target - 10 : learnProgress(p) < 1)
+    .sort((a, b) => level(a) - level(b))[0] || null;
+}
+// Updates mastery and study time for one result; returns what changed (no commit).
+// Expected score: target × learning progress, unless `expectedOverride` is given.
+// `ctx.repaired` (mock exams): topics that already got repair time from this result;
+// `ctx.mockId`: the mock block, stored on the quiz entry so an edited mock can take it back.
+function quizEffect(e, t, score, missed, expectedOverride, src, ctx = { repaired: new Set() }) {
   const m0 = t.mastery;
   t.mastery = m0 == null ? score : Math.round(0.6 * score + 0.4 * m0);
-  t.quizzes = (t.quizzes || []).concat([{ date: today(), score }]).slice(-12);
+  t.quizzes = (t.quizzes || []).concat([src === "mock" ? { date: today(), score, mock: true, mockId: ctx.mockId || null } : VIA[src] ? { date: today(), score, via: src } : { date: today(), score }]).slice(-12);
   t.weakConcepts = [...new Set([...missed, ...(t.weakConcepts || [])])].filter(Boolean).slice(0, 6);
   const p = learnProgress(t);
-  const expected = Math.round(e.target * p);
+  const expected = expectedOverride != null ? expectedOverride : Math.round(e.target * p);
   const base = Math.round((+t.effortH || 0) * 60);
-  let title, detail;
+  let title, detail, verdict = "ok", root = null;
+  const focus = t.weakConcepts.length ? `, focused on ${t.weakConcepts.slice(0, 3).join(", ")}.` : ".";
   if (score < expected - 10) {
+    verdict = "below";
     const gap = expected - score;
     const extra = Math.min(base || 60, Math.max(30, Math.round(base * gap / 100 * 1.5 / 30) * 30));
-    t.extraMin = (t.extraMin || 0) + extra;
-    t.reviewDue = addDays(today(), 1);
     title = `${t.name}: ${score}% (expected ${expected}%)`;
-    detail = `Below plan. Added ${hrs(extra)} of study and a repair review tomorrow` + (t.weakConcepts.length ? `, focused on ${t.weakConcepts.slice(0, 3).join(", ")}.` : ".") + " Time was taken from later, lower-priority blocks where needed.";
+    root = weakPrereq(e, t);
+    if (root) {
+      // Most of the repair time goes to the prerequisite, reviewed first; this topic is reviewed the day after.
+      const rBase = Math.round((+root.effortH || 0) * 60);
+      const rExtra = Math.min(rBase || 60, Math.max(30, Math.round(extra / 2 / 30) * 30)), own = Math.max(0, extra - rExtra);
+      const again = ctx.repaired.has(root.id);
+      if (!again) { root.extraMin = (root.extraMin || 0) + rExtra; root.reviewDue = addDays(today(), 1); ctx.repaired.add(root.id); }
+      t.extraMin = (t.extraMin || 0) + own;
+      t.reviewDue = addDays(today(), 2);
+      detail = `Below plan. ${rootCauseText(t, root)} ` + (again ? `${root.name} already gets extra study time and a repair review tomorrow. ` : `Added ${hrs(rExtra)} of study on ${root.name} and a repair review tomorrow. `)
+        + `Then ${own ? `${hrs(own)} more on ${t.name} and ` : ""}a repair review of ${t.name} the day after` + focus + " Time was taken from later, lower-priority blocks where needed.";
+    } else {
+      t.extraMin = (t.extraMin || 0) + extra;
+      t.reviewDue = addDays(today(), 1);
+      detail = `Below plan. Added ${hrs(extra)} of study and a repair review tomorrow` + focus + " Time was taken from later, lower-priority blocks where needed.";
+    }
+    ctx.repaired.add(t.id);
   } else if (score >= e.target + 10 && p >= 1) {
     const free = Math.min(60, Math.max(0, needLearn(t) - doneMin(t.id, ["learn"])) + 60);
     t.extraMin = Math.max(-Math.round(base * 0.3), (t.extraMin || 0) - free);
+    verdict = "above";
     title = `${t.name}: ${score}% (target ${e.target}%)`;
     detail = `Strong result. Removed review time from this topic so it goes to weaker ones.`;
     t.reviewDue = null;
+  } else if (p < 1 && score < e.target - 10) {
+    // Expected is low because the topic isn't learned yet; a low score here is not "behind".
+    verdict = "notyet";
+    title = `${t.name}: ${score}% (expected ${expected}%)`;
+    detail = `Not learned yet (${Math.round(p * 100)}% of its study time done), so this doesn't count as behind; its learning time stays in the plan.`;
   } else {
     title = `${t.name}: ${score}% (expected ${expected}%)`;
-    detail = score >= expected ? "On track. The plan stays as it is." : "Slightly below plan, within tolerance. Keeping the plan and watching the next quiz.";
+    detail = score >= expected ? "On track." : "Slightly below plan, within tolerance. Watching the next quiz.";
   }
-  return commit({ log: { examId: e.id, kind: "quiz", title, detail, score, expected } });
+  return { title, detail, expected, verdict, root };
 }
+// Ending for results that change nothing on purpose: only claim the plan stays when it does.
+const keepText = ch => ch.length ? " Nothing was changed for this topic on purpose; rebuilding the plan around today moved the hours below." : " The plan stays as it is.";
+const rootCauseText = (t, p) => `Your trouble with ${t.name} probably comes from ${p.name} — reviewing ${p.name} first.`;
+// Mock exam scored per task: each task maps to a topic; per-topic percentages go through
+// the same feedback loop as quizzes, logged as one plan change. Like a quiz, each topic is
+// compared with target × learning progress: a topic that isn't fully learned yet still has
+// its remaining learning time in the plan, so it isn't repaired for what it hasn't covered.
+// What the result changed per topic is kept in b.mock.fx, so editing the result first takes
+// the old effect back (reverseMock) and then applies the new one, instead of adding both.
+const MOCK_FX = ["mastery", "extraMin", "reviewDue"];
+function applyMockResult(b, tasks) {
+  const e = examById(b.examId); if (!e) return null;
+  tasks = tasks.filter(x => String(x.got ?? "").trim() !== "").map(x => ({ label: String(x.label || "").trim().slice(0, 60), topicId: topicById(e, x.topicId) ? x.topicId : null, max: Math.max(0, +x.max || 0), got: +x.got || 0 }))
+    .filter(x => x.max > 0).map(x => ({ ...x, got: Math.min(x.max, Math.max(0, x.got)) }));
+  if (!tasks.length) return null;
+  const edit = !!b.mock;
+  if (edit) reverseMock(e, b);
+  const got = sum(tasks, x => x.got), max = sum(tasks, x => x.max), pct = Math.round(100 * got / max);
+  const per = {};
+  for (const x of tasks) if (x.topicId) { const p = per[x.topicId] = per[x.topicId] || { got: 0, max: 0 }; p.got += x.got; p.max += x.max; }
+  const below = [], above = [], ok = [], notyet = [], roots = [], ctx = { repaired: new Set(), mockId: b.id };
+  const snap = new Map(e.topics.map(t => [t.id, MOCK_FX.map(k => t[k] ?? null)]));
+  // Prerequisites first, so a topic's diagnosis sees its prerequisites' new mock results.
+  for (const t of topoOrder(e, e.topics).filter(x => per[x.id])) {
+    const p = per[t.id], score = Math.round(100 * p.got / p.max);
+    const r = quizEffect(e, t, score, [], Math.round(e.target * learnProgress(t)), "mock", ctx);
+    ({ below, above, notyet }[r.verdict] || ok).push(`${t.name} ${score}%`);
+    if (r.root) roots.push(rootCauseText(t, r.root));
+  }
+  const fx = {};
+  for (const t of e.topics) {
+    const was = snap.get(t.id), now = MOCK_FX.map(k => t[k] ?? null);
+    if (now.some((v, i) => v !== was[i])) fx[t.id] = { mastery: [was[0], now[0]], extra: (now[1] || 0) - (was[1] || 0), reviewDue: [was[2], now[2]] };
+  }
+  const en = blockEnergy(b);
+  b.mock = { at: new Date().toISOString(), tasks, energy: edit ? b.mock.energy ?? null : en ? en.v : null, fx };
+  if (b.status !== "done") b.status = "done";
+  const detail = ch => [
+    below.length ? `Below plan: ${below.join(", ")}. Added study time and a repair review tomorrow for ${below.length > 1 ? "these topics" : "this topic"}.` : "",
+    roots.length ? `${roots.join(" ")} The topics that build on them are reviewed the day after.` : "",
+    above.length ? `Strong: ${above.join(", ")}. Some review time moved to weaker topics.` : "",
+    ok.length ? `On track: ${ok.join(", ")}.` : "",
+    notyet.length ? `Not learned yet: ${notyet.join(", ")}. ${notyet.length > 1 ? "These still have their" : "This still has its"} learning time in the plan, so ${notyet.length > 1 ? "they don't" : "it doesn't"} count as behind.` : "",
+    Object.keys(per).length ? "" : "No task was linked to a topic.",
+    below.length || above.length ? "" : keepText(ch).trim()
+  ].filter(Boolean).join(" ");
+  return commit({ log: { examId: e.id, kind: "mock", title: `${e.subject}: mock exam ${edit ? "corrected to " : ""}${fmtPts(got)}/${fmtPts(max)} points (${pct}%)`,
+    detail: ch => (edit ? "You changed the mock exam results, so the earlier changes were taken back first. " : "") + detail(ch), score: pct } });
+}
+// Takes back what a scored mock changed: its extra study time, and mastery and repair review
+// dates unless a later quiz has changed them since. Its entries leave the topics' quiz lists.
+function reverseMock(e, b) {
+  const fx = b.mock && b.mock.fx || {};
+  for (const t of e.topics) {
+    t.quizzes = (t.quizzes || []).filter(q => !(q.mock && q.mockId === b.id));
+    const f = fx[t.id]; if (!f) continue;
+    t.extraMin = (t.extraMin || 0) - (+f.extra || 0);
+    if (Array.isArray(f.mastery) && (t.mastery ?? null) === f.mastery[1]) t.mastery = f.mastery[0];
+    if (Array.isArray(f.reviewDue) && (t.reviewDue ?? null) === f.reviewDue[1]) t.reviewDue = f.reviewDue[0];
+  }
+}
+const canEditMock = b => !!(b && b.mock && b.mock.fx);
+const fmtPts = n => String(Math.round(n * 10) / 10);
 
 /* ---------- material extraction ---------- */
 async function extractFile(file) {
@@ -328,23 +581,36 @@ async function extractFile(file) {
   const parts = []; for (let i = 0; i < raw.length; i += 3000) parts.push(`\n=== part ${parts.length + 1} ===\n` + raw.slice(i, i + 3000));
   return { text: parts.join(""), pages: parts.length };
 }
+const MAT_MAX = 400000; // characters kept per file; analysis splits long materials into parts
+// Text without page markers and spacing. Scanned PDFs have pages but (almost) no text layer.
+const textChars = text => String(text || "").replace(/=== (?:p\.|part) ?\d+ ===/g, "").replace(/\s+/g, "").length;
+const looksEmpty = (text, pages) => textChars(text) < Math.max(200, 25 * (+pages || 1));
+const isPdf = name => /\.pdf$/i.test(name);
+function noTextMsg(names) {
+  const pdf = names.every(isPdf), one = names.length === 1;
+  const what = one ? `"${names[0]}" has` : `${names.length} files have`;
+  return pdf ? `${what} almost no text. ${one ? "It is" : "They are"} probably scanned pages, and scanned PDFs can't be read yet. Use a PDF where you can select the text, or paste the text into a TXT file.`
+    : `${what} almost no text, so there is nothing for the AI to read.`;
+}
 async function addFiles(e, files, kind) {
   busy.upload = true; render();
-  let added = 0;
+  let added = 0; const empty = [];
   for (const f of files) {
     if (!/\.(pdf|txt|md)$/i.test(f.name)) { toast(`${f.name}: only PDF, TXT and MD files are supported.`); continue; }
     try {
       let { text, pages } = await extractFile(f);
-      const truncated = text.length > 180000; if (truncated) text = text.slice(0, 180000);
-      const id = uid();
+      const truncated = text.length > MAT_MAX; if (truncated) text = text.slice(0, MAT_MAX);
+      const id = uid(), isEmpty = looksEmpty(text, pages);
       await putMaterial(id, { name: f.name, kind, text });
-      e.materials.push({ id, name: f.name, kind, pages, chars: text.length, truncated, empty: text.replace(/=== (p|part)\. ?\d+ ===/g, "").trim().length < 200 });
+      e.materials.push({ id, name: f.name, kind, pages, chars: text.length, truncated, empty: isEmpty });
+      if (isEmpty) empty.push(f.name);
       added++;
     } catch (err) { toast(`${f.name}: ${err.message || "could not be read"}`); }
   }
   busy.upload = false;
   commit({ plan: false });
-  if (added) toast(`${added} file${added > 1 ? "s" : ""} added. Next: analyze the materials.`);
+  if (empty.length) toast(noTextMsg(empty));
+  else if (added) toast(`${added} file${added > 1 ? "s" : ""} added. Next: analyze the materials.`);
 }
 function chunksOf(name, kind, text) {
   return text.split(/\n(?==== (?:p\.|part) ?\d+ ===)/).filter(s => s.trim()).map(s => {
@@ -353,14 +619,83 @@ function chunksOf(name, kind, text) {
   });
 }
 const KIND = { script: "SCRIPT", slides: "SLIDES", oldexam: "OLD EXAM" };
-async function materialDigest(e, budget) {
-  const mats = await Promise.all(e.materials.map(async m => ({ ...m, text: await getMaterial(m.id) })));
-  const total = sum(mats, m => m.text.length) || 1;
-  return mats.map(m => {
-    const share = Math.floor(budget * (m.kind === "oldexam" ? Math.min(1, 1.5 * m.text.length / total) : m.text.length / total));
-    return `\n##### ${KIND[m.kind]}: ${m.name}\n` + m.text.slice(0, Math.max(2000, share));
-  }).join("\n");
+// Material analysis in parts: everything that fits in one request goes in one request.
+// Longer materials are split at page markers into parts of at most `budget` characters.
+// Old exams that are small enough go into every part, so each part can weight its topics
+// by the old exams; otherwise old-exam pages are split like the rest.
+const ANALYZE_CHARS = 80000, ANALYZE_RETRY_CHARS = 26000, OLD_SHARE = 0.4;
+function pagesOf(m, room) {
+  const out = [];
+  for (const s of m.text.split(/\n(?==== (?:p\.|part) ?\d+ ===)/)) {
+    if (!s.trim()) continue;
+    for (let i = 0; i < s.length; i += room) out.push({ id: m.id, name: m.name, kind: m.kind, text: s.slice(i, i + room) });
+  }
+  return out;
 }
+function splitMaterials(mats, budget) {
+  if (sum(mats, m => m.text.length) <= budget) return { parts: [mats], shared: [] };
+  const old = mats.filter(m => m.kind === "oldexam"), rest = mats.filter(m => m.kind !== "oldexam");
+  const oldLen = sum(old, m => m.text.length);
+  const share = old.length > 0 && rest.length > 0 && oldLen <= budget * OLD_SHARE;
+  const room = share ? budget - oldLen : budget;
+  const parts = []; let cur = [], used = 0;
+  for (const p of (share ? rest : mats).flatMap(m => pagesOf(m, room))) {
+    if (cur.length && used + p.text.length > room) { parts.push(cur); cur = []; used = 0; }
+    const last = cur[cur.length - 1];
+    if (last && last.id === p.id) last.text += "\n" + p.text; else cur.push({ ...p });
+    used += p.text.length;
+  }
+  if (cur.length) parts.push(cur);
+  return { parts, shared: share ? old : [] };
+}
+// Merges the old-exam task lists of all parts into one list in exam order.
+// Only parts that contain old-exam material count (all parts if none is marked as old exam).
+// Same normalised label = same task, so old exams that go into every part aren't multiplied;
+// tasks without a label are matched by position when every part saw the same old exams.
+// Each task keeps every topic name it was given; the latest part knows the most topic names,
+// so analyzeMaterials() uses the latest one that matches a final topic.
+const taskKey = s => String(s || "").toLowerCase().replace(/\s+/g, "").replace(/[.:)]+$/, ""); // "Task 2.1:" → "task2.1"
+function mergeTasks(results, sharedOld) {
+  const from = results.some(r => r.old) ? results.filter(r => r.old) : results, by = new Map();
+  from.forEach((r, pi) => r.tasks.forEach((x, j) => {
+    if (!x || !(+x.points > 0)) return;
+    const k = taskKey(x.label) || (sharedOld ? `#${j}` : `#${pi}.${j}`);
+    const g = by.get(k) || by.set(k, { label: String(x.label || "").trim(), points: +x.points, topics: [] }).get(k);
+    if (x.topic) g.topics.push(String(x.topic));
+  }));
+  return [...by.values()];
+}
+const digestOf = segs => segs.map(m => `\n##### ${KIND[m.kind]}: ${m.name}\n` + m.text).join("\n");
+const normName = s => String(s || "").normalize("NFKD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/^\s*(?:\d+[.)]\s*)+/, "").replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+// Merges the topic lists of all parts: same normalised name = same topic.
+// Weight: the highest any part gave. Old-exam hits: the highest if every part saw all old exams,
+// otherwise added up. Effort: added up over the parts that teach the topic (old-exam-only parts
+// count only if no other part covers it). Prerequisite names ("buildsOn") are joined over all parts;
+// links to unknown topics and cycles are dropped later by cleanPrereqs().
+function mergeTopics(results, sharedOld) {
+  const by = new Map();
+  for (const r of results) for (const t of r.topics) {
+    const k = normName(t.name); if (!k) continue;
+    const hits = Math.max(0, +t.oldExamHits || 0), eff = Math.max(0.5, +t.effortH || 3), w = +t.weight || 3;
+    let g = by.get(k);
+    if (!g) { g = { name: t.name, summary: t.summary || "", weight: w, oldExamHits: hits, learnH: 0, oldH: 0, sources: [], buildsOn: new Map() }; by.set(k, g); }
+    else {
+      g.weight = Math.max(g.weight, w);
+      g.oldExamHits = sharedOld ? Math.max(g.oldExamHits, hits) : g.oldExamHits + hits;
+      if (!g.summary && t.summary) g.summary = t.summary;
+    }
+    if (r.oldOnly) g.oldH = Math.max(g.oldH, eff); else g.learnH += eff;
+    if (t.sources && !g.sources.includes(String(t.sources))) g.sources.push(String(t.sources));
+    for (const n of buildsOnOf(t)) if (normName(n) && !g.buildsOn.has(normName(n))) g.buildsOn.set(normName(n), n);
+  }
+  let list = [...by.values()].map((g, i) => ({ i, name: g.name, summary: g.summary, weight: g.weight, oldExamHits: g.oldExamHits, effortH: g.learnH || g.oldH, sources: g.sources.join("; "), buildsOn: [...g.buildsOn.values()] }));
+  if (list.length > 14) {
+    const keep = new Set([...list].sort((a, b) => b.weight - a.weight || b.oldExamHits - a.oldExamHits || b.effortH - a.effortH).slice(0, 14).map(t => t.i));
+    list = list.filter(t => keep.has(t.i));
+  }
+  return list;
+}
+const buildsOnOf = t => (Array.isArray(t.buildsOn) ? t.buildsOn : []).filter(n => typeof n === "string" && n.trim()).slice(0, 12);
 async function topicContext(e, t, budget = 45000) {
   const words = (t.name + " " + (t.summary || "") + " " + (t.weakConcepts || []).join(" ")).toLowerCase().split(/[^a-zäöüß0-9]+/).filter(w => w.length > 3);
   const all = [];
@@ -377,6 +712,7 @@ async function topicContext(e, t, budget = 45000) {
 
 /* ---------- AI backend ---------- */
 const AI_URL = "/api/ai";
+const AI_CODES = ["rate_limited", "busy", "bad_key", "model_unavailable", "prompt_too_large", "refused", "not_configured", "access_code", "upstream_error"];
 const aiCode = () => { try { return localStorage.getItem("examcoach-code") || ""; } catch (e) { return ""; } };
 async function checkAI() {
   aiState = "checking";
@@ -393,7 +729,7 @@ async function checkAI() {
 function aiOffMsg() {
   if (aiState === "checking") return "Connecting to the AI…";
   if (aiState === "code") return "Enter the access code at the top of the page to use the AI features.";
-  if (location.protocol === "file:") return "AI features need the app to be hosted with its backend (see README).";
+  if (location.protocol === "file:") return "AI features only work when you open Exam Coach from its website, not as a file on your computer.";
   return "AI features aren't available right now. The AI backend isn't set up or can't be reached.";
 }
 function aiBanner() {
@@ -405,11 +741,11 @@ async function aiCall(prompt, { signal, modelTier } = {}) {
   let res;
   try {
     res = await fetch(AI_URL, { method: "POST", headers: { "content-type": "application/json", "x-access-code": aiCode() }, body: JSON.stringify({ prompt, tier: modelTier === "quick" ? "quick" : "default" }), signal });
-  } catch (e) { throw { code: signal && signal.aborted ? "cancelled" : "upstream_error" }; }
+  } catch (e) { throw { code: signal && signal.aborted ? "cancelled" : "upstream_error", detail: "The connection to the website's AI backend failed. Check your internet connection." }; }
   if (!res.ok) {
     let j = {}; try { j = await res.json(); } catch (e) {}
     if (j.error === "access_code") { aiState = "code"; sample = null; render(); }
-    throw { code: j.error || (res.status === 429 ? "rate_limited" : res.status === 413 ? "prompt_too_large" : "upstream_error") };
+    throw { code: j.error || (res.status === 429 ? "rate_limited" : res.status === 413 ? "prompt_too_large" : "upstream_error"), detail: j.error ? "" : `The AI backend answered with HTTP ${res.status}.` };
   }
   const reader = res.body.getReader(), dec = new TextDecoder();
   let buf = "", text = "", stop = null;
@@ -426,12 +762,15 @@ async function aiCall(prompt, { signal, modelTier } = {}) {
         let d; try { d = JSON.parse(line.slice(5)); } catch (e) { continue; }
         if (d.type === "content_block_delta" && d.delta && d.delta.type === "text_delta") text += d.delta.text;
         else if (d.type === "message_delta" && d.delta) stop = d.delta.stop_reason;
-        else if (d.type === "error") throw { code: d.error && d.error.type === "overloaded_error" ? "rate_limited" : "upstream_error" };
+        else if (d.type === "error") {
+          const t = d.error && d.error.type;
+          throw { code: t === "overloaded_error" ? "busy" : AI_CODES.includes(t) ? t : "upstream_error", detail: d.error && d.error.message };
+        }
       }
     }
   } catch (e) {
     if (e && e.code) throw e;
-    throw { code: signal && signal.aborted ? "cancelled" : "upstream_error" };
+    throw { code: signal && signal.aborted ? "cancelled" : "upstream_error", detail: "The connection broke off while the AI was answering." };
   }
   if (stop === "refusal") throw { code: "refused" };
   if (!text.trim()) throw { code: "empty_completion" };
@@ -453,58 +792,104 @@ const AI = {
     return parseJSON(r.text);
   }
 };
+// Technical detail for error messages, without provider, product or hosting names
+// (the server log keeps the full message).
+const aiDetail = d => String(d).replace(/[\w.\/-]*(?:gemini|anthropic|claude|google|netlify)[\w.\/-]*/gi, "the AI service").replace(/\s+/g, " ").trim().slice(0, 180);
 function aiError(e) {
   const c = e && e.code;
-  if (c === "not_configured") return "The AI backend has no API key yet. Add GEMINI_API_KEY in the Netlify environment variables (see README).";
-  if (c === "bad_key") return "The AI backend's API key was rejected. Check the key in the Netlify environment variables.";
-  if (c === "model_unavailable") return "The AI model in the settings isn't available. Check GEMINI_MODEL or remove it to use the default (see README).";
+  if (c === "not_configured") return "The AI isn't set up on this website yet. Ask the person who runs this Exam Coach to add an API key.";
+  if (c === "bad_key") return "The AI service didn't accept this website's API key. Ask the person who runs this Exam Coach to check it.";
+  if (c === "model_unavailable") return "The AI model this website is set up with isn't available. Ask the person who runs this Exam Coach to check the model setting.";
+  if (c === "forbidden") return "This page isn't allowed to use the AI. Open Exam Coach from its own website.";
   if (c === "access_code") return "Enter the access code at the top of the page to use the AI features.";
   if (c === "empty_completion") return "The AI didn't send an answer. Try again.";
+  if (c === "busy") return "The AI service is busy right now. Wait a minute and try again.";
   if (c === "rate_limited") return "The AI's usage limit is reached for now. Wait a minute and try again. If it keeps happening, the daily limit is used up and resets the next morning.";
   if (c === "invalid_json") return "The AI's answer couldn't be read. Try again.";
   if (c === "prompt_too_large") return "The materials are too large for one request. Remove a file and try again.";
   if (c === "cancelled") return "Stopped.";
   if (c === "refused") return "The AI declined this request. Try different materials.";
-  return "Something went wrong talking to the AI. Try again.";
+  const d = e && e.detail ? aiDetail(e.detail) : "";
+  return "Something went wrong talking to the AI. Try again." + (d ? ` Details: ${d}` : "");
 }
 let aiCtl = null;
-async function analyzeMaterials(e) {
-  if (!sample) return toast(aiOffMsg());
-  busy.analyze = e.id; render();
-  aiCtl = new AbortController();
-  try {
-    const digest = await materialDigest(e, 150000);
-    const prompt = `You are a study coach helping a university student prepare for an exam.
+function analysisPrompt(e, digest, part) {
+  const multi = part && part.n > 1;
+  return `You are a study coach helping a university student prepare for an exam.
 Exam: "${e.subject}" — format: ${e.format}, date: ${e.date}, target score: ${e.target}%.
-Below are the course materials. Each starts with a header naming its kind (SCRIPT, SLIDES or OLD EXAM). Page markers look like "=== p. 12 ===".
+${multi ? `The materials are too long for one request, so they come in ${part.n} parts. This is part ${part.i} of ${part.n}.${part.shared ? " The old exams are included in full in every part." : ""}
+${part.known.length ? `Topics found in earlier parts: ${part.known.join("; ")}. If content in this part belongs to one of them, use exactly the same name.\n` : ""}` : ""}Below are the course materials. Each starts with a header naming its kind (SCRIPT, SLIDES or OLD EXAM). Page markers look like "=== p. 12 ===".
 
 Tasks:
-1. Split the content into 5–12 study topics in a sensible learning order.
-2. For each topic give: "name" (short, in the language of the material), "summary" (one sentence), "weight" (1–5: importance for the exam, based mainly on how often it appears in the old exams, secondarily on how much space it takes in the material), "oldExamHits" (how many old-exam tasks touch it; 0 if no old exams), "effortH" (realistic hours for a student to learn it properly from the material, 1–12, may use .5 steps), "sources" (where it is, e.g. "Script p. 12–20; Slides 4–9").
+1. Split the content${multi ? " of this part" : ""} into ${multi ? "2–8" : "5–12"} study topics in a sensible learning order.
+2. For each topic give: "name" (short, in the language of the material), "summary" (one sentence), "weight" (1–5: importance for the exam, based mainly on how often it appears in the old exams, secondarily on how much space it takes in the material), "oldExamHits" (how many old-exam tasks touch it; 0 if no old exams), "effortH" (realistic hours for a student to learn ${multi ? "the content of this part on it" : "it properly from the material"}, 1–12, may use .5 steps), "sources" (where it is, e.g. "Script p. 12–20; Slides 4–9"), "buildsOn" (names of the other topics a student must understand before this one${multi && part.known.length ? ", from this part or the topics found in earlier parts" : ""}, using exactly their names; [] if none).
 3. "style": 2–3 sentences in English describing the old exams' question style (task types, typical calculations, point distribution). If there are no old exams, describe what to expect from the material.
+4. "tasks": the tasks of the most recent old exam${multi && !part.shared ? " that are in this part" : ""}, in order, each with "label" (e.g. "Task 1a", as printed in the exam), "topic" (exactly one of your topic names${multi && part.known.length ? " or of the topics found in earlier parts" : ""}) and "points" (points possible; give [] if there are no old exams${multi ? " in this part" : ""} or the points are not shown).
 
 Reply with only JSON in this shape:
-{"topics":[{"name":"","summary":"","weight":3,"oldExamHits":0,"effortH":4,"sources":""}],"style":""}
+{"topics":[{"name":"","summary":"","weight":3,"oldExamHits":0,"effortH":4,"sources":"","buildsOn":[]}],"style":"","tasks":[{"label":"","topic":"","points":10}]}
 
 MATERIALS:
 ${digest}`;
-    const res = await sample.json(prompt, { signal: aiCtl.signal, modelTier: "default" });
-    const list = Array.isArray(res && res.topics) ? res.topics.filter(t => t && t.name) : [];
-    if (!list.length) throw { code: "invalid_json" };
-    const old = Object.fromEntries(e.topics.map(t => [t.name.toLowerCase(), t]));
-    e.topics = list.slice(0, 14).map(t => {
-      const prev = old[String(t.name).toLowerCase()];
-      return Object.assign(prev || { id: uid(), mastery: null, extraMin: 0, weakConcepts: [], quizzes: [], reviewDue: null }, {
+}
+async function runAnalysis(e, mats, budget, signal, retry) {
+  const { parts, shared } = splitMaterials(mats, budget);
+  const n = parts.length, results = [];
+  for (let i = 0; i < n; i++) {
+    if (signal.aborted) throw { code: "cancelled" };
+    busy.progress = n > 1 ? { i: i + 1, n, retry } : null; render();
+    const known = [...new Set(results.flatMap(r => r.topics.map(t => String(t.name))))].slice(0, 40);
+    const digest = digestOf([...shared, ...parts[i]]);
+    const res = await sample.json(analysisPrompt(e, digest, { i: i + 1, n, shared: shared.length > 0, known }), { signal, modelTier: "default" });
+    const topics = Array.isArray(res && res.topics) ? res.topics.filter(t => t && t.name) : [];
+    const tasks = Array.isArray(res && res.tasks) ? res.tasks : [];
+    results.push({ topics, tasks, style: String((res && res.style) || ""), old: shared.length > 0 || parts[i].some(m => m.kind === "oldexam"), oldOnly: parts[i].every(m => m.kind === "oldexam") });
+  }
+  const list = n === 1 ? results[0].topics.slice(0, 14) : mergeTopics(results, shared.length > 0);
+  if (!list.length) throw { code: "invalid_json" };
+  const styled = results.find(r => r.old && r.style) || results.find(r => r.style);
+  return { list, style: styled ? styled.style : "", parts: n, tasks: mergeTasks(results, shared.length > 0) };
+}
+async function analyzeMaterials(e) {
+  if (!sample) return toast(aiOffMsg());
+  const all = await Promise.all(e.materials.map(async m => ({ ...m, text: await getMaterial(m.id) })));
+  const mats = all.filter(m => !looksEmpty(m.text, m.pages));
+  const skipped = all.filter(m => looksEmpty(m.text, m.pages)).map(m => m.name);
+  if (!mats.length) return toast(noTextMsg(skipped.length ? skipped : ["These files"]));
+  busy.analyze = e.id; busy.progress = null; render();
+  aiCtl = new AbortController();
+  try {
+    let r;
+    try { r = await runAnalysis(e, mats, ANALYZE_CHARS, aiCtl.signal, false); }
+    catch (err) {
+      if (err.code !== "prompt_too_large") throw err;
+      r = await runAnalysis(e, mats, ANALYZE_RETRY_CHARS, aiCtl.signal, true);
+    }
+    const old = Object.fromEntries(e.topics.map(t => [normName(t.name), t]));
+    e.topics = r.list.map(t => {
+      const prev = old[normName(t.name)];
+      return Object.assign(prev || { id: uid(), mastery: null, extraMin: 0, weakConcepts: [], quizzes: [], reviewDue: null, prereqs: [] }, {
         name: String(t.name).slice(0, 80), summary: String(t.summary || "").slice(0, 240),
         weight: Math.min(5, Math.max(1, Math.round(+t.weight || 3))), oldExamHits: Math.max(0, Math.round(+t.oldExamHits || 0)),
         effortH: Math.min(20, Math.max(0.5, Math.round((+t.effortH || 3) * 2) / 2)), sources: String(t.sources || "").slice(0, 160)
       });
     });
-    e.style = String(res.style || "").slice(0, 600);
-    busy.analyze = null;
-    commit({ log: { examId: e.id, kind: "setup", title: `${e.subject}: ${e.topics.length} topics from your materials`, detail: `Total estimated effort ${sum(e.topics, t => t.effortH)} h. The plan was rebuilt backwards from ${fmtDay(e.date)}.` } });
-    toast("Topics created and plan rebuilt.");
-  } catch (err) { busy.analyze = null; render(); if (err.code !== "cancelled") toast(aiError(err)); }
+    e.style = r.style.slice(0, 600);
+    const byName = Object.fromEntries(e.topics.map(t => [normName(t.name), t.id]));
+    // Links from the AI, unless the student set this topic's links by hand.
+    r.list.forEach((x, i) => { const t = e.topics[i]; if (!t.prereqsSet) t.prereqs = buildsOnOf(x).map(n => byName[normName(n)]).filter(Boolean); });
+    cleanPrereqs(e);
+    const links = sum(e.topics, t => t.prereqs.length);
+    e.oldTasks = r.tasks.slice(0, 40).map((x, i) => ({ label: String(x.label || `Task ${i + 1}`).slice(0, 60),
+      topicId: [...x.topics].reverse().map(n => byName[normName(n)]).find(Boolean) || null, points: Math.min(200, Math.round(+x.points * 2) / 2) }));
+    busy.analyze = null; busy.progress = null;
+    commit({ log: { examId: e.id, kind: "setup", title: `${e.subject}: ${e.topics.length} topics from your materials`, detail: `${r.parts > 1 ? `The AI read your materials in ${r.parts} parts. ` : ""}Total estimated effort ${sum(e.topics, t => t.effortH)} h.${links ? ` The AI found ${links} ${links > 1 ? "links" : "link"} between topics (what builds on what), so those are learned in that order.` : ""} The plan was rebuilt backwards from ${fmtDay(e.date)}.` } });
+    toast("Topics created and plan rebuilt." + (skipped.length ? ` Skipped (no readable text): ${skipped.join(", ")}.` : ""));
+  } catch (err) {
+    busy.analyze = null; busy.progress = null; render();
+    if (err.code === "prompt_too_large") toast("The materials are too large for the AI, even in smaller parts. Remove a file and try again.");
+    else if (err.code !== "cancelled") toast(aiError(err));
+  }
 }
 async function generateQuiz(e, t, n) {
   if (!sample) return toast(aiOffMsg());
@@ -570,6 +955,7 @@ Reply with only JSON: [{"i":0,"score":0.5,"feedback":"","missed":"concept the st
   S.fp.conf = S.fp.conf.slice(-400);
   quiz.kind = quizKind(t); logQuiz(e, t, quiz.score, quiz.kind);
   quiz.change = applyQuizResult(e, t, quiz.score, [...sureWrong, ...results.map(r => r.missed)]);
+  render(); // commit() rendered before quiz.change was set
 }
 
 /* ---------- calendar export ---------- */
@@ -600,20 +986,30 @@ function exportIcs() {
 }
 
 /* ---------- example ---------- */
-function mkTopic(name, weight, effortH, summary = "") { return { id: uid(), name, summary, weight, effortH, sources: "", oldExamHits: 0, mastery: null, extraMin: 0, weakConcepts: [], quizzes: [], reviewDue: null }; }
+function mkTopic(name, weight, effortH, summary = "") { return { id: uid(), name, summary, weight, effortH, sources: "", oldExamHits: 0, mastery: null, extraMin: 0, weakConcepts: [], quizzes: [], reviewDue: null, prereqs: [] }; }
+// Example topics in the order of the material: [name, weight, effort h, names of the topics it builds on]
+function exampleTopics(list) {
+  const topics = list.map(([n, w, h]) => mkTopic(n, w, h)), id = Object.fromEntries(topics.map(t => [t.name, t.id]));
+  list.forEach(([, , , pre = []], i) => { topics[i].prereqs = pre.map(n => id[n]); });
+  return topics;
+}
 function loadExample() {
   const t = today();
   S.exams.push({ id: uid(), example: true, subject: "Statistics I (example)", date: addDays(t, 23), format: "written", target: 80, materials: [],
     style: "Example data: 6 tasks in 90 minutes, mostly calculations (probabilities, confidence intervals, tests) plus short definitions.",
-    topics: [["Descriptive statistics", 2, 2], ["Probability basics", 4, 4], ["Random variables & distributions", 5, 5], ["Normal distribution & CLT", 4, 4], ["Confidence intervals", 4, 3], ["Hypothesis tests", 5, 5], ["Linear regression", 3, 3]].map(a => mkTopic(...a)) });
+    topics: exampleTopics([["Descriptive statistics", 2, 2], ["Probability basics", 4, 4], ["Random variables & distributions", 5, 5, ["Probability basics"]],
+      ["Normal distribution & CLT", 4, 4, ["Random variables & distributions"]], ["Confidence intervals", 4, 3, ["Normal distribution & CLT"]],
+      ["Hypothesis tests", 5, 5, ["Normal distribution & CLT", "Confidence intervals"]], ["Linear regression", 3, 3, ["Descriptive statistics", "Hypothesis tests"]]]) });
   S.exams.push({ id: uid(), example: true, subject: "Microeconomics (example)", date: addDays(t, 37), format: "multiple-choice", target: 75, materials: [],
     style: "Example data: 40 multiple-choice questions, about a third with small graphs or calculations.",
-    topics: [["Supply & demand", 3, 2], ["Elasticities", 4, 3], ["Consumer theory", 4, 4], ["Production & costs", 4, 4], ["Market forms", 5, 4], ["Market failure", 3, 3]].map(a => mkTopic(...a)) });
+    topics: exampleTopics([["Supply & demand", 3, 2], ["Elasticities", 4, 3, ["Supply & demand"]], ["Consumer theory", 4, 4], ["Production & costs", 4, 4],
+      ["Market forms", 5, 4, ["Production & costs"]], ["Market failure", 3, 3, ["Supply & demand"]]]) });
+  S.exams.forEach(normExam);
   selExam = S.exams[S.exams.length - 2].id;
   commit({ log: { kind: "setup", title: "Example exams added", detail: "Two example exams with sample topics, so you can try the plan and quizzes. Delete them under Exams & materials once you add your own." } });
 }
 function newExam() {
-  const e = { id: uid(), subject: "New exam", date: addDays(today(), 28), format: "written", target: 80, materials: [], topics: [], style: "" };
+  const e = normExam({ id: uid(), subject: "New exam", date: addDays(today(), 28), format: "written", target: 80, materials: [], topics: [], style: "" });
   S.exams.push(e); selExam = e.id; view = "exams"; commit({ plan: false });
   setTimeout(() => { const i = $("#f-subject"); if (i) { i.focus(); i.select(); } }, 30);
 }
@@ -668,11 +1064,20 @@ function beep(kind) {
     tones.forEach((f, i) => { const o = audio.createOscillator(), g = audio.createGain(); o.frequency.value = f; o.type = "sine"; o.connect(g); g.connect(audio.destination); const t = audio.currentTime + i * 0.22; g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.25, t + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.2); o.start(t); o.stop(t + 0.21); });
   } catch (e) {}
 }
-function startFocus(blockId) {
+function startFocus(blockId, { ask = true } = {}) {
   try { audio = audio || new (window.AudioContext || window.webkitAudioContext)(); audio.resume && audio.resume(); } catch (e) {}
   const keepCycle = TM.phase !== "idle" ? (TM.cycle || 0) : 0;
   const b = blockId ? S.blocks.find(x => x.id === blockId) : null;
-  TM = { phase: "focus", endsAt: Date.now() + phaseMs("focus"), dur: phaseMs("focus"), paused: false, left: 0, cycle: keepCycle, blockId: b ? b.id : null, label: b ? b.label : "Free focus session", open: true };
+  // energy check-in once per session: known from today's check-in for this block, or carried over within this timer run
+  const carry = TM.phase !== "idle" && TM.asked && (TM.blockId || null) === (b ? b.id : null) ? { v: TM.energy || null, light: !!TM.light } : null;
+  const known = (b && blockEnergy(b)) || carry || (b && busy.noCheck[b.id] ? { v: null, light: false } : null);
+  if (ask && !known) {
+    TM = { phase: "checkin", cycle: keepCycle, blockId: b ? b.id : null, label: b ? b.label : "Free focus session", open: true };
+    tmSave(); render(); return;
+  }
+  const ms = (known && known.light ? lightFocusMin() : S.settings.pomo.focus) * 60000;
+  TM = { phase: "focus", endsAt: Date.now() + ms, dur: ms, paused: false, left: 0, cycle: keepCycle, blockId: b ? b.id : null, label: b ? b.label : "Free focus session", open: true,
+    asked: true, energy: known ? known.v : null, light: !!(known && known.light) };
   tmSave(); render();
 }
 function creditFocus(min) {
@@ -702,7 +1107,13 @@ function tmPause() { if (TM.paused) { TM.endsAt = Date.now() + TM.left; TM.pause
 function tmSkip() { if (TM.phase === "focus") { const done = Math.floor((TM.dur - tmLeft()) / 60000); creditFocus(done); logSession(done, false); TM.cycle = (TM.cycle || 0) + 1; const ph = TM.cycle % S.settings.pomo.every === 0 ? "long" : "short"; Object.assign(TM, { phase: ph, endsAt: Date.now() + phaseMs(ph), dur: phaseMs(ph), paused: false }); } else { Object.assign(TM, { phase: "ready", paused: false }); } tmSave(); render(); }
 function tmNext() { const id = TM.blockId; const b = id && S.blocks.find(x => x.id === id && x.status === "planned"); startFocus(b ? id : null); }
 const mmss = ms => { const s = Math.ceil(ms / 1000); return `${pad(Math.floor(s / 60))}:${pad(s % 60)}`; };
+// Keeps the end of the page clear of the timer: main gets bottom padding for the timer's height.
 function renderTimer() {
+  renderTimerBox();
+  const box = $("#timer"), h = box ? box.getBoundingClientRect().height : 0;
+  document.body.style.setProperty("--timer-h", h ? `${Math.ceil(h + 16)}px` : "0px");
+}
+function renderTimerBox() {
   const box = $("#timer"); if (!box) return;
   const run = TM.phase === "focus" || TM.phase === "short" || TM.phase === "long";
   if (run) document.title = `${mmss(tmLeft())} ${TM.phase === "focus" ? "Focus" : "Break"} · Exam Coach`;
@@ -713,22 +1124,24 @@ function renderTimer() {
   }
   if (!TM.open) {
     const cls = TM.paused ? "paused" : TM.phase === "focus" ? "run" : run ? "brk" : "";
-    box.innerHTML = `<button class="timer-pill ${cls}" data-t="open">${TM.phase === "ready" ? "Break over · start next" : `${TM.phase === "focus" ? "Focus" : "Break"} <span class="mono">${mmss(tmLeft())}</span>${TM.paused ? " · paused" : ""}`}</button>`;
+    box.innerHTML = `<button class="timer-pill ${cls}" data-t="open">${TM.phase === "checkin" || TM.phase === "lighter" ? "Check in to start" : TM.phase === "ready" ? "Break over · start next" : `${TM.phase === "focus" ? "Focus" : "Break"} <span class="mono">${mmss(tmLeft())}</span>${TM.paused ? " · paused" : ""}`}</button>`;
     return;
   }
   const P = S.settings.pomo, b = TM.blockId && S.blocks.find(x => x.id === TM.blockId);
   const pct = run ? 100 * (1 - tmLeft() / TM.dur) : 0;
   const inCycle = (TM.cycle || 0) % P.every, filled = TM.phase === "long" ? P.every : inCycle;
-  const head = { idle: "Focus timer", focus: "Focus", short: "Short break", long: "Long break", ready: "Break over" }[TM.phase];
+  const head = { idle: "Focus timer", focus: "Focus", short: "Short break", long: "Long break", ready: "Break over", checkin: "Before you start", lighter: "Low energy" }[TM.phase];
   const target = b && b.focusMin >= b.minutes && b.status === "planned";
   let controls;
   if (TM.phase === "idle") controls = `<button class="btn primary" data-t="start">Start ${P.focus} min focus</button>`;
+  else if (TM.phase === "checkin") controls = `<div class="stack" style="gap:8px; justify-items:center"><span class="small">How is your energy right now?</span><div class="row">${ENERGY.map(([v, l]) => `<button class="btn" data-t="energy" data-v="${v}">${l}</button>`).join("")}<button class="btn ghost" data-t="energy" data-v="">Skip</button></div></div>`;
+  else if (TM.phase === "lighter") controls = `<div class="stack" style="gap:8px"><span class="small">${esc(lighterText(b))}</span><div class="row"><button class="btn primary" data-t="light-yes">Go lighter</button><button class="btn ghost" data-t="light-no">Keep the plan</button></div></div>`;
   else if (TM.phase === "ready") controls = `<button class="btn primary" data-t="next">Start next session</button><button class="btn ghost" data-t="stop">Finish</button>`;
   else controls = `<button class="btn ${TM.paused ? "primary" : ""}" data-t="pause">${TM.paused ? "Resume" : "Pause"}</button><button class="btn ghost" data-t="skip">${TM.phase === "focus" ? "Break now" : "Skip break"}</button><button class="btn ghost" data-t="stop">Stop</button>`;
   box.innerHTML = `<div class="timer-card ${TM.phase === "focus" ? "focus" : run || TM.phase === "ready" ? "brk" : ""}" role="region" aria-label="Focus timer">
     <div class="timer-head"><span class="label">${head}${TM.paused ? " · paused" : ""}</span><button class="btn sm ghost" data-t="min" aria-label="Minimise timer">Hide</button></div>
     <div class="small" style="text-align:center; overflow-wrap:anywhere">${esc(TM.phase === "idle" ? "Pick a block on Today or Plan, or start a free session." : TM.label || "")}</div>
-    <div class="clock">${TM.phase === "idle" ? mmss(P.focus * 60000) : TM.phase === "ready" ? mmss(P.focus * 60000) : mmss(tmLeft())}</div>
+    ${TM.phase === "checkin" || TM.phase === "lighter" ? "" : `<div class="clock">${TM.phase === "idle" ? mmss(P.focus * 60000) : TM.phase === "ready" ? mmss((TM.light ? lightFocusMin() : P.focus) * 60000) : mmss(tmLeft())}</div>`}
     ${run ? `<div class="ring"><i style="width:${pct.toFixed(1)}%"></i></div>` : ""}
     <div class="cycles" title="Sessions until the long break">${Array.from({ length: P.every }, (_, i) => `<span class="${i < filled ? "f" : ""}"></span>`).join("")}</div>
     ${b ? `<div class="small muted" style="text-align:center">${b.focusMin || 0} of ${b.minutes} min focused on this block</div>` : ""}
@@ -747,6 +1160,21 @@ $("#timer").addEventListener("click", ev => {
   else if (a === "skip") tmSkip();
   else if (a === "stop") tmStop();
   else if (a === "markdone") markDone(S.blocks.find(x => x.id === TM.blockId));
+  else if (a === "energy") {
+    const v = el.dataset.v;
+    Object.assign(TM, { asked: true, energy: v || null });
+    if (!v && TM.blockId) busy.noCheck[TM.blockId] = true;
+    if (v) TM.checkin = checkIn(v, TM.blockId).at;
+    if (v === "low") { TM.phase = "lighter"; tmSave(); renderTimer(); }
+    else startFocus(TM.blockId, { ask: false });
+  }
+  else if (a === "light-yes" || a === "light-no") {
+    const light = a === "light-yes", b = TM.blockId && S.blocks.find(x => x.id === TM.blockId);
+    decideLighter(S.fp.energy.find(x => x.at === TM.checkin), light);
+    TM.light = light;
+    startFocus(TM.blockId, { ask: false });
+    if (light && lighterFits(b) && view !== "study") { studyId = b.id; go("study"); }
+  }
 });
 setInterval(() => {
   const run = TM.phase === "focus" || TM.phase === "short" || TM.phase === "long";
@@ -774,7 +1202,7 @@ const bucketOf = h => (BUCKETS.find(b => h >= b.from && h < b.to) || BUCKETS[0])
 const avg = a => a.length ? sum(a) / a.length : null;
 const median = a => { if (!a.length) return null; const s = [...a].sort((x, y) => x - y), m = Math.floor(s.length / 2); return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; };
 const ENJOY = ["", "dragged", "fine", "liked it"];
-function fpInit() { return { profile: null, quizLog: [], sessions: [], conf: [], enjoy: [], assign: 0, applied: {}, demo: false, demoRealism: null }; }
+function fpInit() { return { profile: null, quizLog: [], sessions: [], conf: [], enjoy: [], energy: [], assign: 0, applied: {}, demo: false, demoRealism: null, realismPast: null }; }
 function allowedMethods() {
   const ex = (S.fp.profile && S.fp.profile.exclude) || [];
   const a = MKEYS.filter(m => !ex.includes(m));
@@ -789,10 +1217,11 @@ function strength(nA, nB, diff) {
 }
 function fingerprint() {
   const F = S.fp, L = F.quizLog, allowed = allowedMethods(), P = F.profile, t0 = today();
-  const pending = {}; for (const { t } of allTopics()) if (t.method && t.retention == null) pending[t.method] = (pending[t.method] || 0) + 1;
+  // topics learned partly in a "Go lighter" session (flashcards instead of the assigned method) don't count for the method comparison
+  const pending = {}; for (const { t } of allTopics()) if (t.method && t.retention == null && !wentLighter(t)) pending[t.method] = (pending[t.method] || 0) + 1;
   const methods = MKEYS.map(m => {
-    const ret = L.filter(q => q.kind === "retention" && q.method === m).map(q => q.score);
-    const imm = L.filter(q => q.kind === "immediate" && q.method === m).map(q => q.score);
+    const ret = L.filter(q => q.kind === "retention" && q.method === m && !q.light).map(q => q.score);
+    const imm = L.filter(q => q.kind === "immediate" && q.method === m && !q.light).map(q => q.score);
     const enj = F.enjoy.filter(x => x.m === m).map(x => x.v);
     return { m, n: ret.length, mean: avg(ret), imm: avg(imm), enjoy: avg(enj), nEnjoy: enj.length, allowed: allowed.includes(m), pending: pending[m] || 0 };
   });
@@ -820,6 +1249,7 @@ function fingerprint() {
   const past = S.blocks.filter(b => b.date < t0);
   let done = past.filter(b => b.status === "done").length, n = past.length;
   if (F.demoRealism) { done += F.demoRealism.done; n += F.demoRealism.total; }
+  if (F.realismPast) { done += F.realismPast.done; n += F.realismPast.total; }
   const realism = { n, done, rate: n ? done / n : null };
   // focus span
   const ses = F.sessions.slice(-20);
@@ -834,9 +1264,19 @@ function fingerprint() {
   const acc = a => a.length ? Math.round(100 * a.filter(x => x.right).length / a.length) : null;
   const over = [...new Set(C.filter(x => x.c === "sure" && !x.right && x.concept).reverse().map(x => x.concept))].slice(0, 6);
   const calib = { sureN: grp("sure").length, sureAcc: acc(grp("sure")), unsureN: grp("unsure").length, unsureAcc: acc(grp("unsure")), guessN: grp("guess").length, guessAcc: acc(grp("guess")), over };
+  // energy vs. results: quiz scores and finished focus sessions by the energy level checked in before
+  const levels = ENERGY.map(([v, label]) => {
+    const s = L.filter(q => q.energy === v).map(q => q.score), se = F.sessions.filter(x => x.energy === v);
+    return { v, label, mean: avg(s), n: s.length, nSes: se.length, fullRate: se.length ? se.filter(x => x.full).length / se.length : null };
+  });
+  const rest = L.filter(q => q.energy === "ok" || q.energy === "high").map(q => q.score), low = levels[0];
+  const eReady = low.n >= 3 && rest.length >= 3, eGap = eReady ? avg(rest) - low.mean : null;
+  const energy = { levels, low, restMean: avg(rest), restN: rest.length, ready: eReady, gap: eGap, lowHurts: eReady ? eGap >= 8 : null,
+    strength: !eReady ? "none" : eGap >= 8 ? strength(rest.length, low.n, eGap) : low.n >= 5 && rest.length >= 5 ? "likely" : "hint",
+    checkins: F.energy.length, lighter: F.energy.filter(x => x.light).length };
   const checksDone = sum(methods.filter(x => x.allowed), x => Math.min(2, x.n)), checksNeeded = allowed.length * 2;
   const nextCheck = S.blocks.find(b => b.type === "check" && b.status === "planned" && b.date >= t0) || null;
-  return { methods, tested, best, second, untested, methodStrength, forget, time, realism, focus, calib, checksDone, checksNeeded, nextCheck, P };
+  return { methods, tested, best, second, untested, methodStrength, forget, time, realism, focus, calib, energy, checksDone, checksNeeded, nextCheck, P };
 }
 function spacingGaps() { return [2, fingerprint().forget.gap2]; }
 function assignMethods(active) {
@@ -883,7 +1323,11 @@ function markDone(b) {
     t.learnedOn = today(); t.checkPending = true; t.checkDue = addDays(today(), 2);
     msg = `${t.name} learned. Quiz yourself now, then a short retention check in 2 days shows what stuck.`;
   }
-  if (b.type === "learn" && b.method) busy.rate = b.id;
+  const en = blockEnergy(b);
+  // a "Go lighter" block was not studied with the assigned method: keep it out of the method comparison
+  if (b.type === "learn" && en && en.light) b.light = true;
+  if (b.type === "learn" && b.method && !(en && en.light)) busy.rate = b.id;
+  if (b.type === "mock") msg = "Well done. Enter your points per task so the plan can react.";
   commit(); toast(msg);
 }
 function quizKind(t) {
@@ -892,16 +1336,60 @@ function quizKind(t) {
   if (t.learnedOn && diffDays(t.learnedOn, today()) <= 1) return "immediate";
   return "other";
 }
+function wentLighter(t) { return !!t && S.blocks.some(b => b.topicId === t.id && b.type === "learn" && b.status === "done" && b.light); }
 function logQuiz(e, t, score, kind) {
-  S.fp.quizLog.push({ d: today(), h: new Date().getHours(), score, examId: e.id, topicId: t.id, method: t.method || null, kind, delay: t.learnedOn ? diffDays(t.learnedOn, today()) : null });
+  S.fp.quizLog.push({ d: today(), h: new Date().getHours(), score, examId: e.id, topicId: t.id, method: t.method || null, kind, delay: t.learnedOn ? diffDays(t.learnedOn, today()) : null, energy: recentEnergy(t.id), light: wentLighter(t) });
   S.fp.quizLog = S.fp.quizLog.slice(-300);
   if (kind === "retention") { t.checkPending = false; t.retention = score; }
 }
 function logSession(min, full) {
   if (min < 1) return;
-  S.fp.sessions.push({ d: today(), h: new Date().getHours(), min, full });
+  S.fp.sessions.push({ d: today(), h: new Date().getHours(), min, full, energy: TM.energy || null, light: !!TM.light });
   S.fp.sessions = S.fp.sessions.slice(-80);
 }
+/* energy check-in: one tap before a session, linked to the quizzes and focus sessions that follow */
+const ENERGY = [["low", "Low"], ["ok", "OK"], ["high", "High"]];
+function lightFocusMin() { const f = S.settings.pomo.focus; return Math.max(10, Math.min(f - 5, Math.round(f * 0.6 / 5) * 5)); }
+// today's check-in for a block; matched by topic and type too, because re-planning gives blocks new ids
+function blockEnergy(b) {
+  if (!b) return null;
+  for (let i = S.fp.energy.length - 1; i >= 0; i--) {
+    const x = S.fp.energy[i];
+    if (x.demo || x.d !== today()) continue;
+    if (x.blockId === b.id || (x.topicId && x.topicId === b.topicId && x.type === b.type)) return x;
+  }
+  return null;
+}
+function checkIn(v, blockId) {
+  const b = blockId && S.blocks.find(x => x.id === blockId);
+  const x = { d: today(), h: new Date().getHours(), at: Date.now(), v, blockId: b ? b.id : null, examId: b ? b.examId : null, topicId: b && b.topicId || null, type: b ? b.type : null, light: false, decided: v !== "low" };
+  S.fp.energy.push(x); S.fp.energy = S.fp.energy.slice(-200);
+  commit({ plan: false });
+  return x;
+}
+function decideLighter(x, light) { if (!x) return; x.light = !!light; x.decided = true; commit({ plan: false }); }
+// energy level to attach to a quiz: the last check-in in the past 4 hours for this topic (or a free session)
+function recentEnergy(topicId) {
+  const now = Date.now();
+  for (let i = S.fp.energy.length - 1; i >= 0; i--) {
+    const x = S.fp.energy[i];
+    if (x.demo || !x.at || now - x.at > 4 * 3600000) continue;
+    if (!x.topicId || x.topicId === topicId) return x.v;
+  }
+  return null;
+}
+function lighterFits(b) { return b && b.type === "learn" && b.method && b.method !== "flashcards"; }
+function studyMethod(b) {
+  const t = topicById(examById(b.examId), b.topicId), m = b.method || (t && t.method) || "summary";
+  const en = blockEnergy(b);
+  return en && en.light && b.type === "learn" ? "flashcards" : m;
+}
+function lighterText(b) {
+  const f = lightFocusMin(), cur = S.settings.pomo.focus, E = fingerprint().energy;
+  const what = lighterFits(b) ? `Go lighter: flashcards on this topic instead of new material, with ${f} min focus sessions instead of ${cur}.` : `Go lighter: ${f} min focus sessions instead of ${cur}.`;
+  return `Low energy happens. ${what}${E.lowHurts === false ? " Your results on low-energy days are usually fine, so keeping the plan is OK too." : ""}`;
+}
+
 function loadDemoFingerprint() {
   const F = S.fp, t0 = today();
   const ret = { practice: [78, 72, 75, 71], worked: [70, 66, 73], flashcards: [63, 69, 58], explain: [88, 83, 86, 84], summary: [55, 49, 58] };
@@ -914,8 +1402,13 @@ function loadDemoFingerprint() {
     F.quizLog.push({ demo: true, d, h, score: s, topicId: tid, method: m, kind: "retention", delay: 2 });
     k++;
   });
-  [[9, 62], [10, 66], [9, 59], [14, 71], [15, 69], [13, 74], [19, 82], [18, 79], [20, 84], [22, 67], [23, 63], [21, 70]].forEach(([h, s], i) => F.quizLog.push({ demo: true, d: addDays(t0, -(20 - i)), h, score: s, topicId: "demo-x" + i, method: null, kind: "other" }));
-  [25, 18, 25, 20, 17, 25, 19, 22, 25, 16, 21, 18].forEach((min, i) => F.sessions.push({ demo: true, d: addDays(t0, -(14 - i)), h: 18, min, full: min === 25 }));
+  const qEn = ["low", "ok", "low", "ok", "ok", "high", "high", "ok", "high", "low", "low", "ok"];
+  [[9, 62], [10, 66], [9, 59], [14, 71], [15, 69], [13, 74], [19, 82], [18, 79], [20, 84], [22, 67], [23, 63], [21, 70]].forEach(([h, s], i) => {
+    F.quizLog.push({ demo: true, d: addDays(t0, -(20 - i)), h, score: s, topicId: "demo-x" + i, method: null, kind: "other", energy: qEn[i] });
+    F.energy.push({ demo: true, d: addDays(t0, -(20 - i)), h, v: qEn[i], topicId: "demo-x" + i, light: qEn[i] === "low" && i % 2 === 0, decided: true });
+  });
+  const sEn = ["ok", "low", "high", "ok", "low", "high", "ok", "ok", "high", "low", "ok", "low"];
+  [25, 18, 25, 20, 17, 25, 19, 22, 25, 16, 21, 18].forEach((min, i) => F.sessions.push({ demo: true, d: addDays(t0, -(14 - i)), h: 18, min, full: min === 25, energy: sEn[i] }));
   const conf = [["sure", 1, "Sampling distribution"], ["sure", 1, "Mean vs median"], ["sure", 0, "p-value interpretation"], ["sure", 1, "Standard error"], ["sure", 0, "Type I vs Type II error"], ["sure", 1, "Bayes' theorem"], ["sure", 1, "Variance rules"], ["sure", 0, "Sign of price elasticity"], ["sure", 1, "Demand curve shifts"], ["sure", 1, "Marginal cost"], ["sure", 0, "p-value interpretation"], ["sure", 1, "Z-scores"], ["sure", 1, "Opportunity cost"], ["sure", 0, "Meaning of a confidence level"],
     ["unsure", 1, ""], ["unsure", 0, ""], ["unsure", 1, ""], ["unsure", 0, ""], ["unsure", 1, ""], ["unsure", 0, ""], ["unsure", 1, ""], ["unsure", 0, ""], ["unsure", 1, ""], ["unsure", 0, ""],
     ["guess", 0, ""], ["guess", 1, ""], ["guess", 0, ""], ["guess", 0, ""], ["guess", 0, ""], ["guess", 0, ""]];
@@ -929,7 +1422,7 @@ function loadDemoFingerprint() {
 }
 function removeDemoFingerprint() {
   const F = S.fp;
-  for (const k of ["quizLog", "sessions", "conf", "enjoy"]) F[k] = F[k].filter(x => !x.demo);
+  for (const k of ["quizLog", "sessions", "conf", "enjoy", "energy"]) F[k] = F[k].filter(x => !x.demo);
   F.demoRealism = null; F.demo = false;
   if (F.profile && F.profile.demo) F.profile = null;
   clearUnstartedMethods();
@@ -1087,6 +1580,16 @@ function calibCard(fp) {
     `<p class="big">${s}</p><p class="small muted">Share of right answers, by how sure you said you were.</p>${bars}${C.over.length ? `<div class="stack" style="gap:6px"><span class="label">Sure, but wrong</span><div class="row">${C.over.map(c => `<span class="chip bad" style="text-transform:none; letter-spacing:0">${esc(c)}</span>`).join("")}</div></div>` : ""}`,
     C.over.length ? "These concepts get priority in your next quizzes and reviews." : "");
 }
+function energyCard(fp) {
+  const E = fp.energy;
+  const bars = `<div class="hbars">${E.levels.map(x => hbar(x.label, x.mean, x.mean == null ? "—" : Math.round(x.mean) + "%", `${x.n} quiz${x.n === 1 ? "" : "zes"}${x.nSes ? ` · ${Math.round(100 * x.fullRate)}% of ${x.nSes} focus session${x.nSes === 1 ? "" : "s"} finished` : ""}`, false)).join("")}</div>`;
+  const offer = `When you check in with low energy, the coach suggests flashcards instead of new material and ${lightFocusMin()} min focus sessions.`;
+  if (!E.ready) return fpCard("Your energy and your results", "none", `<p>Check in with your energy before a study session. After 3 quizzes on low-energy days and 3 on OK or high days, this shows whether low energy changes your results. So far: ${E.low.n} low, ${E.restN} OK or high.</p>${bars}`, offer);
+  const s = E.lowHurts ? `On low-energy days you score ${Math.round(E.low.mean)}% on quizzes, compared with ${Math.round(E.restMean)}% when your energy is OK or high.`
+    : `Your quiz scores on low-energy days (${Math.round(E.low.mean)}%) are about the same as on other days (${Math.round(E.restMean)}%).`;
+  return fpCard("Your energy and your results", E.strength, `<p class="big">${s}</p>${bars}<p class="small muted">Average quiz score after each energy check-in. You took the lighter session ${E.lighter} time${E.lighter === 1 ? "" : "s"}.</p>`,
+    E.lowHurts ? offer : "Low energy doesn't seem to hurt your results. The coach still offers a lighter session, but keeping the plan is fine too.");
+}
 function answersCard(P) {
   const names = a => a && a.length ? a.map(m => METHODS[m].name).join(", ") : "None";
   return `<section class="panel fpcard"><div class="row" style="justify-content:space-between"><h3>Your answers</h3><button class="btn sm" data-act="fp-setup">Edit</button></div>
@@ -1111,7 +1614,8 @@ function vYou() {
     <span class="small muted">${calibrated ? "Every method has been tested at least twice. The coach keeps re-testing now and then in case things change." : `Each method needs 2 retention checks. ${fp.nextCheck ? `Next check: ${esc(topicName(fp.nextCheck))} on ${fmtDay(fp.nextCheck.date)}.` : "Checks appear in your plan 2 days after you finish learning a topic."}`}</span>
   </section>
   ${methodCard(fp)}
-  <div class="grid2">${forgetCard(fp)}${timeCard(fp)}${realismCard(fp)}${focusCard(fp)}${calibCard(fp)}${answersCard(F.profile)}</div>
+  <div class="grid2">${forgetCard(fp)}${timeCard(fp)}${realismCard(fp)}${focusCard(fp)}${calibCard(fp)}${energyCard(fp)}${answersCard(F.profile)}</div>
+  ${pastExamsCard()}
   ${whyNote()}
   <div><button class="btn danger" data-act="fp-reset">${confirmKey === "fpreset" ? "Click again to erase all fingerprint results" : "Reset fingerprint"}</button></div>`;
 }
@@ -1127,8 +1631,8 @@ ${e.style ? "Old-exam style: " + e.style + "\n" : ""}${t.weakConcepts && t.weakC
 async function genStudy(b) {
   if (!b) return;
   if (!sample) return toast(aiOffMsg());
-  const e = examById(b.examId), t = topicById(e, b.topicId), m = b.method;
-  ST[b.id] = { phase: "loading" }; render();
+  const e = examById(b.examId), t = topicById(e, b.topicId), m = studyMethod(b);
+  ST[b.id] = { phase: "loading", m }; render();
   aiCtl = new AbortController();
   try {
     const ctx = e.materials.length ? await topicContext(e, t, 30000) : "";
@@ -1143,8 +1647,8 @@ async function genStudy(b) {
     if (m === "practice") d.items = d.items.filter(x => x && x.problem).map(x => ({ problem: String(x.problem), solution: String(x.solution || ""), source: String(x.source || "") }));
     if (m === "worked") { d.example = { problem: String(d.example.problem || ""), steps: d.example.steps.map(String), answer: String(d.example.answer || "") }; d.tryIt = { problem: String(d.tryIt.problem || ""), solution: String(d.tryIt.solution || "") }; }
     if (m === "flashcards") d.cards = d.cards.filter(c => c && c.front).map(c => ({ front: String(c.front), back: String(c.back || "") }));
-    ST[b.id] = { phase: "ready", data: d, step: 0, pos: 0, order: m === "flashcards" ? d.cards.map((_, i) => i) : [], flipped: false, known: 0, missedOnce: {} };
-  } catch (err) { ST[b.id] = { phase: err.code === "cancelled" ? "idle" : "error", error: aiError(err) }; }
+    ST[b.id] = { phase: "ready", m, data: d, step: 0, pos: 0, order: m === "flashcards" ? d.cards.map((_, i) => i) : [], flipped: false, known: 0, missedOnce: {} };
+  } catch (err) { ST[b.id] = { phase: err.code === "cancelled" ? "idle" : "error", m, error: aiError(err) }; }
   render();
 }
 async function studyFeedback(b) {
@@ -1186,11 +1690,218 @@ function studyContent(m, st) {
     <div class="flash ${st.flipped ? "back" : ""}"><span class="label">${st.flipped ? "Answer" : "Question"}</span><div>${esc(st.flipped ? c.back : c.front)}</div></div>
     <div class="row">${st.flipped ? `<button class="btn primary" data-act="s-knew">Knew it</button><button class="btn" data-act="s-miss">Missed it</button>` : `<button class="btn primary" data-act="s-flip">Show answer</button>`}</div>`;
 }
+/* study modes: "Teach the AI" (Feynman method) and oral exam practice, both on the Study page.
+   One session per topic in SM (memory only; studyTopic = topic of the open Study page). Each AI call sends the whole transcript, so a failed
+   call can be retried without losing anything. Results go through applyQuizResult() like a quiz and
+   into fp.quizLog with kind "teach" / "oral": they count for mastery, time of day and energy, but not
+   for the study-method comparison (that stays on quizzes right after learning and retention checks). */
+const SM = {};
+let studyTopic = null;
+const ORAL_MIN = 3, ORAL_MAX = 5, MODE_CTX = 24000;
+const gradeFromScore = s => s >= 88 ? 1 : s >= 75 ? 2 : s >= 63 ? 3 : s >= 50 ? 4 : 5;
+const strs = x => Array.isArray(x) ? x.map(v => String(v ?? "").trim()).filter(Boolean) : [];
+const modeScore = v => { const n = Math.round(+v); if (v === "" || v == null || !Number.isFinite(n)) throw { code: "invalid_json" }; return Math.min(100, Math.max(0, n)); };
+function startMode(b, kind) {
+  if (!b) return;
+  if (!sample) return toast(aiOffMsg());
+  SM[b.topicId] = { kind, phase: kind === "oral" ? "waiting" : "write", turns: [], text: "", ctx: null, round: 0 };
+  if (kind === "oral") modeStep(b); else render();
+}
+function transcriptOf(st) {
+  return st.turns.map(x => `${x.who === "me" ? "STUDENT" : x.who === "ai" ? (st.kind === "oral" ? "EXAMINER" : "AI (curious student)") : "AI"}: ${x.text}`).join("\n\n");
+}
+function teachPrompt(e, t, st) {
+  const [expl, answers = ""] = st.turns.filter(x => x.who === "me").map(x => x.text), qs = st.feedback ? st.feedback.questions : [];
+  const round2 = st.round === 2;
+  return `You help a university student learn with the Feynman method: the student explains a topic in their own words, and you play a curious fellow student who doesn't know the topic yet.
+${studyBase(e, t, st.ctx)}
+The student's explanation:
+"""${expl.slice(0, 6000)}"""
+${round2 ? `\nYou asked these follow-up questions:\n${qs.map((q, i) => `${i + 1}. ${q}`).join("\n")}\nThe student's answers:\n"""${answers.slice(0, 4000)}"""\n` : ""}
+Tasks:
+1. "reply": react in character as the curious student, 1–3 sentences, in the language the student wrote in. ${round2 ? "Say whether the answers cleared things up." : "Mention what you now understand and what still confuses you."}
+2. "good": points the student explained well (each under 25 words, in English).
+3. "gaps": gaps and misconceptions, compared with the course material where there is any. Each has "point" (under 30 words, in English) and "source" (the bracketed source from the material excerpts it is based on, or "general").
+4. "questions": ${round2 ? "[] (no more questions)" : "1–2 follow-up questions a curious student would ask about the gaps, in the language the student wrote in"}.
+5. "score": 0–100, how completely and correctly the student explained the topic${round2 ? ", including the answers to the follow-up questions" : ""}. 90+ only if a classmate could learn the topic from this explanation.
+6. "missed": the specific concepts the student didn't explain or got wrong (2–5 words each).
+
+Reply with only JSON: {"reply":"","good":[""],"gaps":[{"point":"","source":""}],"questions":[""],"score":0,"missed":[""]}`;
+}
+function oralPrompt(e, t, st) {
+  const n = st.turns.filter(x => x.who === "me").length;
+  const rule = n === 0 ? "Start the exam: greet the student in one short sentence and ask the first question."
+    : n < ORAL_MIN ? `The student has answered ${n} question${n > 1 ? "s" : ""}. Ask the next question ("end": false). Adapt it to the last answer: if it was weak or vague, follow up on the same point; if it was good, go deeper or move to another important part of the topic.`
+    : n < ORAL_MAX ? `The student has answered ${n} questions. Either ask one more question adapted to the last answer ("end": false), or end the exam ("end": true) if you have seen enough to grade.`
+    : `The student has answered ${n} questions. End the exam now ("end": true).`;
+  return `You are a fair but demanding university examiner holding a short oral exam (${ORAL_MIN}–${ORAL_MAX} questions, one at a time).
+${studyBase(e, t, st.ctx)}
+Ask about the content of the course material excerpts where there are any. Ask one question at a time, short and spoken-style, in the language of the course material (English if none). You may react to the last answer in a few words before the next question, but don't give away the right answer.
+${n ? `Exam so far:\n${transcriptOf(st)}\n` : ""}
+${rule}
+When you end the exam, grade the whole exam: "score" 0–100 (88+ = 1 Sehr gut, 75+ = 2 Gut, 63+ = 3 Befriedigend, 50+ = 4 Genügend, below = 5 Nicht genügend on the Austrian scale), "summary" (one or two sentences in English), "strengths" and "improve" (short points in English), "missed" (concepts the student didn't know, 2–5 words each).
+
+Reply with only JSON, either {"end":false,"question":""} or {"end":true,"score":0,"summary":"","strengths":[""],"improve":[""],"missed":[""]}`;
+}
+// Sends the next request for a session; on error the transcript stays and modeStep can run again.
+async function modeStep(b) {
+  const st = b && SM[b.topicId]; if (!st) return;
+  if (!sample) { st.phase = "error"; st.error = aiOffMsg(); return render(); }
+  const e = examById(b.examId), t = topicById(e, b.topicId); if (!t) return;
+  st.phase = "waiting"; st.error = null; render();
+  aiCtl = new AbortController();
+  try {
+    if (st.ctx == null) st.ctx = e.materials.length ? await topicContext(e, t, MODE_CTX) : "";
+    if (st.kind === "teach") {
+      const r = await sample.json(teachPrompt(e, t, st), { signal: aiCtl.signal, cache: false, modelTier: "default" });
+      const gaps = Array.isArray(r && r.gaps) ? r.gaps.map(g => g && typeof g === "object" ? { point: String(g.point || "").trim(), source: String(g.source || "").trim() } : { point: String(g ?? "").trim(), source: "" }).filter(g => g.point) : [];
+      const f = { reply: String((r && r.reply) || "").trim(), good: strs(r && r.good), gaps, questions: st.round === 2 ? [] : strs(r && r.questions).slice(0, 2), score: modeScore(r && r.score), missed: strs(r && r.missed) };
+      if (f.reply) st.turns.push({ who: "ai", text: f.reply });
+      st.feedback = f; st.phase = "feedback"; st.text = "";
+      if (st.round === 2 || !f.questions.length) finishMode(b);
+    } else {
+      const r = await sample.json(oralPrompt(e, t, st), { signal: aiCtl.signal, cache: false, modelTier: "default" });
+      const n = st.turns.filter(x => x.who === "me").length, q = String((r && r.question) || "").trim();
+      const end = n >= ORAL_MAX || (n >= ORAL_MIN && r && r.end === true) || (n >= ORAL_MIN && !q);
+      if (end) {
+        st.result = { score: modeScore(r && r.score), summary: String((r && r.summary) || "").trim(), strengths: strs(r && r.strengths), improve: strs(r && r.improve), missed: strs(r && r.missed) };
+        st.result.grade = gradeFromScore(st.result.score);
+        finishMode(b);
+      } else {
+        if (!q) throw { code: "invalid_json" };
+        st.turns.push({ who: "ai", text: q }); st.phase = "answer"; st.text = "";
+      }
+    }
+  } catch (err) {
+    if (err && err.code === "cancelled") {
+      // stopped: give the last answer back to the text box so nothing is lost
+      const last = st.turns[st.turns.length - 1];
+      if (last && last.who === "me") { st.turns.pop(); st.text = last.text; if (st.kind === "teach") st.round--; }
+      st.phase = st.kind === "teach" ? (st.feedback ? "feedback" : "write") : st.turns.length ? "answer" : "idle";
+      if (st.phase === "idle") delete SM[b.topicId];
+    } else { st.phase = "error"; st.error = aiError(err); }
+  }
+  render();
+}
+function sendMode(b) {
+  const st = b && SM[b.topicId]; if (!st) return;
+  const text = (st.text || "").trim();
+  if (st.kind === "teach" && st.round === 0 && text.length < 40) return toast("Write a few sentences first.");
+  if (!text) return toast(st.kind === "oral" ? "Type or say your answer first." : "Write your answers first.");
+  micStop();
+  st.turns.push({ who: "me", text: text.slice(0, st.kind === "teach" && st.round === 0 ? 6000 : 4000) });
+  if (st.kind === "teach") st.round++;
+  st.text = "";
+  modeStep(b);
+}
+// "Change my answer" after an error: takes the last answer back into the text box.
+function editMode(b) {
+  const st = b && SM[b.topicId]; if (!st) return;
+  const last = st.turns[st.turns.length - 1];
+  if (last && last.who === "me") { st.turns.pop(); st.text = last.text; if (st.kind === "teach") st.round--; }
+  st.phase = st.kind === "teach" ? (st.feedback ? "feedback" : "write") : "answer"; st.error = null;
+  render();
+}
+function finishMode(b) {
+  const st = SM[b.topicId], e = examById(b.examId), t = topicById(e, b.topicId);
+  if (!st || st.phase === "done" || !t) return;
+  const score = st.kind === "teach" ? st.feedback.score : st.result.score;
+  const missed = (st.kind === "teach" ? st.feedback.missed : st.result.missed).slice(0, 4);
+  st.phase = "done"; st.score = score;
+  bumpActivity("quiz", 1);
+  logQuiz(e, t, score, st.kind);
+  st.change = applyQuizResult(e, t, score, missed, st.kind);
+  // re-planning gives future blocks new ids: keep the Study page on this topic's block
+  if (studyId === b.id && !S.blocks.some(x => x.id === b.id)) {
+    const nb = S.blocks.filter(x => x.examId === b.examId && x.topicId === b.topicId && x.type === b.type && x.status === "planned")
+      .sort((x, y) => (y.date === b.date) - (x.date === b.date) || (x.date < y.date ? -1 : x.date > y.date ? 1 : 0))[0];
+    if (nb) { if (ST[b.id]) ST[nb.id] = ST[b.id]; if (busy.noCheck[b.id]) busy.noCheck[nb.id] = true; studyId = nb.id; }
+    render();
+  }
+}
+/* optional speech input: only offered when the browser has the Web Speech API */
+const speechAPI = () => window.SpeechRecognition || window.webkitSpeechRecognition || null;
+let MIC = null;
+function micStart(key) {
+  const SR = speechAPI(), st = SM[key]; if (!SR || !st) return;
+  if (MIC) return micStop();
+  const rec = new SR();
+  rec.lang = navigator.language || "en-GB";
+  rec.continuous = true; rec.interimResults = false;
+  rec.onresult = ev => {
+    let add = "";
+    for (let i = ev.resultIndex; i < ev.results.length; i++) if (ev.results[i].isFinal) add += ev.results[i][0].transcript;
+    if (!add.trim() || !SM[key]) return;
+    const s = SM[key]; s.text = (s.text ? s.text.replace(/\s*$/, " ") : "") + add.trim();
+    const ta = $("#mode-text"); if (ta) ta.value = s.text;
+  };
+  rec.onerror = ev => { if (ev && ev.error !== "aborted" && ev.error !== "no-speech") toast("The microphone isn't available. You can type your answer instead."); };
+  rec.onend = () => { if (MIC && MIC.rec === rec) { MIC = null; render(); } };
+  MIC = { rec, key };
+  try { rec.start(); } catch (err) { MIC = null; toast("The microphone isn't available. You can type your answer instead."); }
+  render();
+}
+function micStop() { if (!MIC) return; const r = MIC.rec; MIC = null; try { r.stop(); } catch (e) {} }
+function modeTurns(st) {
+  if (!st.turns.length) return "";
+  const who = x => x.who === "me" ? "You" : st.kind === "oral" ? "Examiner" : "The AI";
+  return `<div class="chat" id="mode-chat">${st.turns.map(x => `<div class="turn ${x.who}"><span class="label">${who(x)}</span><div>${esc(x.text)}</div></div>`).join("")}</div>`;
+}
+function modeInput(b, st, label, placeholder, sendLabel) {
+  const mic = !!speechAPI();
+  return `<label class="field"><span>${label}</span><textarea id="mode-text" style="min-height:${st.kind === "teach" && st.round === 0 ? 180 : 110}px" placeholder="${placeholder}">${esc(st.text || "")}</textarea></label>
+    <div class="row"><button class="btn primary" data-act="m-send">${sendLabel}</button>${mic ? `<button class="btn" data-act="m-mic" aria-pressed="${MIC && MIC.key === b.topicId ? "true" : "false"}">${MIC && MIC.key === b.topicId ? "Stop listening" : "Speak"}</button>` : ""}
+    ${mic && MIC && MIC.key === b.topicId ? `<span class="small muted">Listening… your words appear in the box. Check them before you send.</span>` : mic ? `<span class="small muted">Speech is turned into text by your browser. Some browsers, like Chrome, send the audio to their own servers for this.</span>` : ""}</div>`;
+}
+function modeResult(st, gone) {
+  const c = st.change;
+  const head = st.kind === "oral"
+    ? `<div><span class="label">Grade estimate</span><div class="score-big mono">${st.result.grade}</div><span>${esc(GRADES[st.result.grade])} · ${st.score}%</span></div>`
+    : `<div><span class="label">Your explanation</span><div class="score-big mono">${st.score}%</div></div>`;
+  const list = (title, arr, cls) => arr && arr.length ? `<div class="stack" style="gap:4px"><span class="label">${title}</span><ul class="fl ${cls}">${arr.map(x => `<li>${esc(x)}</li>`).join("")}</ul></div>` : "";
+  return `<section class="fb" style="gap:10px" id="mode-result">${head}
+    ${st.kind === "oral" ? `${st.result.summary ? `<b>${esc(st.result.summary)}</b>` : ""}${list("Went well", st.result.strengths, "good")}${list("Work on", st.result.improve, "warn")}<span class="small muted">An estimate from a short practice exam, not a real grade.</span>` : ""}
+    ${c ? `<div class="stack" style="gap:4px"><span class="label">What the coach changed</span><span>${esc(c.detail)}</span>${c.changes && c.changes.length ? c.changes.slice(0, 6).map(x => `<div class="change"><span>${esc(x.name)} <span class="muted">· ${esc(x.exam)}</span></span><span class="${x.delta > 0 ? "plus" : "minus"}">${x.delta > 0 ? "+" : "−"}${hrs(Math.abs(x.delta))}</span></div>`).join("") : ""}</div>` : ""}
+    <div class="row"><button class="btn sm" data-act="m-close">Done</button>${gone ? "" : `<button class="btn sm ghost" data-act="m-start" data-k="${st.kind}">Start again</button>`}</div></section>`;
+}
+function teachFeedback(f) {
+  const list = (title, arr, cls) => arr.length ? `<div class="stack" style="gap:4px"><span class="label">${title}</span><ul class="fl ${cls}">${arr.join("")}</ul></div>` : "";
+  return `<div class="fb" style="gap:10px">${list("You explained well", f.good.map(x => `<li>${esc(x)}</li>`), "good")}
+    ${list("Gaps and mix-ups", f.gaps.map(g => `<li>${esc(g.point)}${g.source && g.source.toLowerCase() !== "general" ? ` <span class="small muted">(${esc(g.source)})</span>` : ""}</li>`), "warn")}</div>`;
+}
+function modePanel(b, t) {
+  const st = SM[b.topicId];
+  if (!t) return "";
+  if (!st) return `<section class="panel stack" id="modes"><h3>Check yourself</h3>
+    <div class="row"><button class="btn" data-act="m-start" data-k="teach" ${sample ? "" : "disabled"}>Teach the AI</button><button class="btn" data-act="m-start" data-k="oral" ${sample ? "" : "disabled"}>Oral exam practice</button></div>
+    <span class="small muted">${sample ? `Teach the AI: explain the topic, the AI asks what a classmate would ask and finds the gaps. Oral exam practice: ${ORAL_MIN}–${ORAL_MAX} examiner questions, one at a time, with a grade estimate. Both count like a quiz.` : aiOffMsg()}</span></section>`;
+  const title = st.kind === "oral" ? "Oral exam practice" : "Teach the AI";
+  const n = st.turns.filter(x => x.who === "me").length;
+  let body = "";
+  if (st.phase === "waiting") body = `<div class="row"><span class="spinner"></span> ${st.kind === "oral" ? (n ? "The examiner is thinking…" : "The examiner is getting ready…") : "The AI is reading your explanation…"} <button class="btn sm" data-act="stop">Stop</button></div>`;
+  else if (st.phase === "error") body = `<div class="alert bad"><span>${esc(st.error)}</span><span class="small">Nothing is lost. Your conversation is still here.</span><div class="row"><button class="btn sm" data-act="m-retry">Try again</button>${st.turns.length && st.turns[st.turns.length - 1].who === "me" ? `<button class="btn sm ghost" data-act="m-edit">Change my answer</button>` : ""}</div></div>`;
+  else if (st.phase === "write") body = modeInput(b, st, "Explain the topic in your own words, without your notes", "Explain it so a classmate who missed the lecture understands it…", "Explain it to the AI");
+  else if (st.phase === "feedback") body = `${teachFeedback(st.feedback)}${st.feedback.questions.length ? `<div class="stack" style="gap:4px"><span class="label">The AI asks</span><ol class="wsteps">${st.feedback.questions.map(q => `<li>${esc(q)}</li>`).join("")}</ol></div>
+    ${modeInput(b, st, "Your answers", "Answer the questions in your own words…", "Send answers")}<div class="row"><button class="btn sm ghost" data-act="m-finish">Skip the questions and save ${st.feedback.score}%</button></div>` : ""}`;
+  else if (st.phase === "answer") body = modeInput(b, st, `Your answer · question ${n + 1}`, "Answer as you would in the exam…", "Send answer");
+  else if (st.phase === "done") body = (st.kind === "teach" ? teachFeedback(st.feedback) : "") + modeResult(st);
+  return `<section class="panel stack" id="modes"><div class="row" style="justify-content:space-between"><h3>${title}</h3>${st.phase !== "done" ? `<button class="btn sm ghost" data-act="m-close">${confirmKey === "mclose" ? "Click again to end without saving" : "End"}</button>` : ""}</div>
+    ${st.kind === "oral" && st.phase !== "done" ? `<span class="small muted">Question ${Math.min(ORAL_MAX, n + (st.phase === "answer" ? 1 : 0)) || 1} of ${ORAL_MIN}–${ORAL_MAX}. Answer from memory, as in the real exam.</span>` : ""}
+    ${modeTurns(st)}${body}</section>`;
+}
 function vStudy() {
   const b = S.blocks.find(x => x.id === studyId);
-  if (!b) return `<div class="panel row">This block isn't in your plan anymore. <button class="btn sm" data-view="dashboard">Back to Today</button></div>`;
-  const e = examById(b.examId), t = topicById(e, b.topicId), m = b.method || (t && t.method) || "summary", M = METHODS[m];
-  const st = ST[b.id] || { phase: "idle" };
+  if (!b) {
+    // the block left the plan after a Teach the AI / oral exam result: still show that result
+    const st = SM[studyTopic];
+    if (st && st.phase === "done") return `<section class="panel stack" id="modes"><div class="section-head"><h2>${st.kind === "oral" ? "Oral exam practice" : "Teach the AI"}</h2><button class="btn sm ghost" data-view="dashboard">Back</button></div>${modeTurns(st)}${st.kind === "teach" ? teachFeedback(st.feedback) : ""}${modeResult(st, true)}</section>`;
+    return `<div class="panel row">This block isn't in your plan anymore. <button class="btn sm" data-view="dashboard">Back to Today</button></div>`;
+  }
+  studyTopic = b.topicId;
+  const e = examById(b.examId), t = topicById(e, b.topicId), m = studyMethod(b), M = METHODS[m];
+  let st = ST[b.id] || { phase: "idle" };
+  if (st.m && st.m !== m) st = { phase: "idle" };
+  const en = blockEnergy(b), light = en && en.light;
   const genLabel = { practice: "Get practice problems", worked: "Get a worked example", flashcards: "Make flashcards" }[m];
   let body;
   if (genLabel) {
@@ -1204,14 +1915,136 @@ function vStudy() {
       ${st.error ? `<div class="alert bad">${esc(st.error)}</div>` : ""}
       ${st.feedback ? feedbackBox(st.feedback) : ""}`;
   }
-  return `${rateCard()}<section class="panel stack" style="border-top:4px solid ${examColor(e)}">
+  const check = b.status !== "planned" ? ""
+    : !en && !busy.noCheck[b.id] ? `<section class="alert info"><div class="row" style="justify-content:space-between"><b>How is your energy right now?</b><button class="btn sm ghost" data-act="energy" data-id="${b.id}" data-v="">Skip</button></div><div class="row">${ENERGY.map(([v, l]) => `<button class="btn sm" data-act="energy" data-id="${b.id}" data-v="${v}">${l}</button>`).join("")}</div><span class="small muted">One tap. Over time the coach shows how your energy relates to your quiz results.</span></section>`
+    : en && en.v === "low" && !en.decided ? `<section class="alert mark"><b>${esc(lighterText(b))}</b><div class="row"><button class="btn sm primary" data-act="light" data-id="${b.id}" data-v="yes">Go lighter</button><button class="btn sm ghost" data-act="light" data-id="${b.id}" data-v="no">Keep the plan</button></div></section>` : "";
+  return `${rateCard()}${check}<section class="panel stack" style="border-top:4px solid ${examColor(e)}">
     <div class="section-head"><div class="stack" style="gap:4px; min-width:0"><span class="label">${esc(e.subject)} · ${fmtDay(b.date)} ${esc(b.start)} · ${b.minutes} min</span><h2>${esc(t ? t.name : b.label)}</h2></div><button class="btn sm ghost" data-view="dashboard">Back</button></div>
-    <div class="row"><span class="chip method">${M.name}</span><span class="small muted">${esc(t && t.methodWhy || "")}</span></div>
+    <div class="row"><span class="chip method">${M.name}</span>${light ? `<span class="chip review">Lighter session</span><span class="small muted">Flashcards and ${lightFocusMin()} min focus sessions today, because your energy is low.</span>` : `<span class="small muted">${esc(t && t.methodWhy || "")}</span>`}</div>
     <p style="max-width:70ch">${M.how}</p>
     ${t && t.sources ? `<p class="small"><span class="label">Where</span> ${esc(t.sources)}</p>` : ""}
     <div class="row">${b.status === "planned" ? `<button class="btn" data-act="focus" data-id="${b.id}">Start focus timer</button><button class="btn" data-act="s-done">Mark block done</button>` : `<span class="chip good">${b.status}</span>`}</div>
   </section>
-  <section class="panel stack">${body}</section>`;
+  <section class="panel stack">${body}</section>
+  ${modePanel(b, t)}`;
+}
+
+/* ---------- post-exam review & new semester ---------- */
+const fmtYear = s => pd(s).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
+function examStats(e) {
+  const bl = S.blocks.filter(b => b.examId === e.id && b.date < e.date);
+  const qs = e.topics.flatMap(t => (t.quizzes || []).filter(q => !q.mock)).sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0).map(q => q.score);
+  const k = Math.min(3, Math.floor(qs.length / 2));
+  const by = {};
+  for (const q of S.fp.quizLog) if (!q.demo && !q.light && q.examId === e.id && q.kind === "retention" && q.method) (by[q.method] = by[q.method] || []).push(q.score);
+  const best = Object.entries(by).map(([m, a]) => ({ m, mean: Math.round(avg(a)), n: a.length })).sort((a, b) => b.mean - a.mean)[0] || null;
+  return { plannedMin: sum(bl, b => b.minutes), doneMin: sum(bl.filter(b => b.status === "done"), b => b.minutes), nQuiz: qs.length,
+    first: k ? Math.round(avg(qs.slice(0, k))) : null, last: k ? Math.round(avg(qs.slice(-k))) : null, best, readiness: readiness(e).score, mock: mockStats(e) };
+}
+// score of the latest scored mock exam, or null
+function mockStats(e) {
+  const m = lastMock(e); if (!m) return null;
+  const got = sum(m.mock.tasks, x => x.got), max = sum(m.mock.tasks, x => x.max);
+  return max > 0 ? { got, max, pct: Math.round(100 * got / max), date: m.date } : null;
+}
+// review stats are frozen when the review is saved; a mock scored later is still added
+function reviewStats(e) {
+  const fresh = examStats(e), st = e.review && e.review.stats;
+  return st ? { ...st, mock: st.mock || fresh.mock } : fresh;
+}
+const gradeText = n => n ? `${n} (${GRADES[n]})` : "";
+// Numbers from saved stats (also from restored backups): a finite number, or null / 0.
+const numOr = (v, d = null) => v != null && v !== "" && Number.isFinite(+v) ? +v : d;
+function statsList(st, rv) {
+  st = st && typeof st === "object" ? st : {};
+  const nQuiz = Math.round(numOr(st.nQuiz, 0)), first = numOr(st.first), last = numOr(st.last), readiness = numOr(st.readiness);
+  const plannedMin = numOr(st.plannedMin, 0), doneMin = numOr(st.doneMin, 0), best = st.best && typeof st.best === "object" ? st.best : null;
+  const mk = st.mock && typeof st.mock === "object" ? { got: numOr(st.mock.got, 0), max: numOr(st.mock.max, 0), pct: Math.round(numOr(st.mock.pct, 0)) } : null;
+  const q = first != null && last != null ? `${nQuiz} quizzes · ${Math.round(first)}% at the start, ${Math.round(last)}% at the end` : nQuiz ? `${nQuiz} quiz${nQuiz > 1 ? "zes" : ""}` : "No quizzes taken";
+  const g = rv && rv.gradeNum ? gradeText(gradeNum(rv.gradeNum)) : "";
+  const res = rv && rv.grade ? esc(rv.grade) : "";
+  const pred = readiness != null && (nQuiz || mk) ? `plan predicted ${Math.round(readiness)}% readiness` : "no readiness estimate (no quizzes)";
+  return `<dl class="dl">${g ? `<dt>Grade</dt><dd><b>${esc(g)}</b> · <span class="muted">${pred}</span></dd>` : ""}${res ? `<dt>Result</dt><dd><b>${res}</b></dd>` : ""}
+    ${mk ? `<dt>Mock exam</dt><dd>${fmtPts(mk.got)}/${fmtPts(mk.max)} points (${mk.pct}%)</dd>` : ""}
+    <dt>Study time</dt><dd>${plannedMin > 0 ? `${hrs(doneMin)} done of ${hrs(plannedMin)} planned (${Math.round(100 * doneMin / plannedMin)}%)` : "No study blocks recorded"}</dd>
+    <dt>Quiz trend</dt><dd>${q}</dd>
+    <dt>Best method</dt><dd>${best && Object.hasOwn(METHODS, best.m) ? `${METHODS[best.m].name} · ${Math.round(numOr(best.mean, 0))}% kept after 2 days` : "Not enough retention checks"}</dd>
+    ${rv && rv.helped ? `<dt>What helped</dt><dd>${esc(rv.helped)}</dd>` : ""}${rv && rv.didnt ? `<dt>What didn't</dt><dd>${esc(rv.didnt)}</dd>` : ""}</dl>`;
+}
+function reviewForm(e) {
+  const d = busy.rv[e.id] || (e.review && !e.review.skipped ? e.review : {});
+  const ta = (k, label, ph) => `<label class="field"><span>${label}</span><textarea id="rv-${k}-${e.id}" data-rv="${e.id}" data-k="${k}" maxlength="600" style="min-height:80px" placeholder="${ph}">${esc(d[k] || "")}</textarea></label>`;
+  return `<section class="panel stack" style="border-top:4px solid ${examColor(e)}">
+    <div class="stack" style="gap:4px"><span class="label">Exam done · ${fmtLong(e.date)}</span><h3>How did ${esc(e.subject)} go?</h3></div>
+    ${statsList(reviewStats(e))}
+    <div class="fields"><label class="field"><span>Grade (optional)</span><select id="rv-gradeNum-${e.id}" data-rv="${e.id}" data-k="gradeNum"><option value="">No grade</option>${[1, 2, 3, 4, 5].map(n => `<option value="${n}" ${+d.gradeNum === n ? "selected" : ""}>${gradeText(n)}</option>`).join("")}</select></label>
+    <label class="field"><span>Your result in words</span><input type="text" id="rv-grade-${e.id}" data-rv="${e.id}" data-k="grade" maxlength="40" placeholder="For example passed, 78% or 2 in the written part" value="${esc(d.grade || "")}"></label></div>
+    <div class="fields">${ta("helped", "What helped?", "For example: the mock exam, flashcards on the bus…")}${ta("didnt", "What didn't help?", "For example: starting too late, long reading sessions…")}</div>
+    <div class="row"><button class="btn primary" data-act="rv-save" data-exam="${e.id}">Save review</button><button class="btn ghost" data-act="rv-skip" data-exam="${e.id}">${e.review ? "Cancel" : "Skip"}</button></div>
+    <span class="small muted">Your review stays in your learning profile and comes along into the next semester.</span>
+  </section>`;
+}
+function saveReview(e) {
+  const val = k => { const el = $(`#rv-${k}-${e.id}`); return String(el ? el.value : ((busy.rv[e.id] || {})[k] || "")).trim(); };
+  const grade = val("grade").slice(0, 40), num = gradeNum(val("gradeNum"));
+  if (!grade && !num) return toast("Pick your grade or enter your result first, or skip the review.");
+  const st = examStats(e);
+  e.review = { grade, gradeNum: num, helped: val("helped").slice(0, 600), didnt: val("didnt").slice(0, 600), at: today(), stats: st };
+  delete busy.rv[e.id]; busy.rvEdit = null;
+  commit({ plan: false, log: { examId: e.id, kind: "review", title: `${e.subject}: ${[num ? gradeText(num) : "", grade].filter(Boolean).join(" · ")}`, detail: `Exam review saved. You studied ${hrs(st.doneMin)} of ${hrs(st.plannedMin)} planned.${st.best && METHODS[st.best.m] ? ` Best method for this exam: ${METHODS[st.best.m].name.toLowerCase()}.` : ""}` } });
+}
+function skipReview(e) {
+  if (e.review) { busy.rvEdit = null; delete busy.rv[e.id]; return render(); }
+  e.review = { skipped: true, at: today(), stats: examStats(e) };
+  commit({ plan: false });
+}
+function finishedExams() { const t0 = today(); return S.exams.filter(e => e.date < t0).sort((a, b) => a.date < b.date ? -1 : 1); }
+function reviewPrompts() { return finishedExams().filter(e => !e.review || busy.rvEdit === e.id).map(reviewForm).join(""); }
+function pastSection() {
+  const past = finishedExams();
+  if (!past.length) return "";
+  const done = past.filter(e => e.review && busy.rvEdit !== e.id), n = past.length;
+  return `${done.length ? `<div class="exams">${done.map(e => `<article class="panel exam" style="--ec:${examColor(e)}">
+      <div><h3>${esc(e.subject)}</h3><p class="small muted">${fmtLong(e.date)} · finished</p></div>
+      ${statsList(reviewStats(e), e.review.skipped ? null : e.review)}
+      <div><button class="btn sm ghost" data-act="rv-edit" data-exam="${e.id}">${e.review.skipped ? "Add your result" : "Edit review"}</button></div></article>`).join("")}</div>` : ""}
+    <div class="panel stack"><div class="row" style="justify-content:space-between"><b>Start a new semester</b><button class="btn sm" data-act="new-semester">${confirmKey === "semester" ? `Click again to archive ${n} exam${n > 1 ? "s" : ""}` : "Start a new semester"}</button></div>
+    <span class="small muted">Archives your ${n} finished exam${n > 1 ? "s" : ""} with ${n > 1 ? "their" : "its"} topics and study blocks, and removes ${n > 1 ? "their" : "its"} uploaded files from this browser. Upcoming exams stay. Your learning profile stays too, so your next plan starts from what the coach already knows about you.</span></div>`;
+}
+function startSemester() {
+  const past = finishedExams();
+  if (!past.length) return;
+  const ids = new Set(past.map(e => e.id)), t0 = today();
+  // archived blocks leave S.blocks, so keep their count for "how much of your plan you do"
+  const old = S.blocks.filter(b => ids.has(b.examId) && b.date < t0), R = S.fp.realismPast || { done: 0, total: 0 };
+  S.fp.realismPast = { done: R.done + old.filter(b => b.status === "done").length, total: R.total + old.length };
+  S.archive.push({ id: uid(), name: `Semester ending ${fmtYear(past[past.length - 1].date)}`, archivedOn: t0,
+    exams: past.map(e => ({ id: e.id, subject: e.subject, date: e.date, format: e.format, target: e.target, mode: e.mode, passPct: e.passPct, style: e.style || "",
+      review: e.review && !e.review.skipped ? { grade: e.review.grade, gradeNum: e.review.gradeNum || null, helped: e.review.helped, didnt: e.review.didnt, at: e.review.at } : null,
+      stats: reviewStats(e),
+      // topic ids are kept so old-exam tasks and mock tasks still point at their topics
+      topics: e.topics.map(t => ({ id: t.id, name: t.name, weight: t.weight, effortH: t.effortH, mastery: t.mastery, method: t.method || null, retention: t.retention ?? null })),
+      oldTasks: e.oldTasks.map(x => ({ ...x })),
+      mocks: S.blocks.filter(b => b.examId === e.id && b.mock).sort((a, b) => a.mock.at < b.mock.at ? -1 : 1).map(b => ({ date: b.date, at: b.mock.at, energy: b.mock.energy || null, tasks: b.mock.tasks.map(x => ({ ...x })) })) })) });
+  for (const e of past) e.materials.forEach(m => dropMaterial(m.id));
+  S.exams = S.exams.filter(e => !ids.has(e.id));
+  S.blocks = S.blocks.filter(b => !ids.has(b.examId));
+  if (ids.has(selExam)) selExam = null;
+  if (quiz && ids.has(quiz.examId)) quiz = null;
+  if (TM.blockId && !S.blocks.some(b => b.id === TM.blockId)) TM.blockId = null;
+  if (MK && !S.blocks.some(b => b.id === MK.blockId)) MK = null;
+  const n = past.length;
+  commit({ log: { kind: "setup", title: "New semester started", detail: `Archived ${n} finished exam${n > 1 ? "s" : ""}. Your learning profile stays: study method results, how fast you forget, your best time of day, focus span and energy carry over to your next plan.` } });
+  toast("New semester started. Add your next exams.");
+}
+function pastExamsCard() {
+  const rows = [...S.archive.flatMap(a => a.exams.map(x => ({ ...x, sem: a.name }))),
+    ...finishedExams().filter(e => e.review && !e.review.skipped).map(e => ({ subject: e.subject, date: e.date, review: e.review, stats: reviewStats(e) }))]
+    .sort((a, b) => a.date < b.date ? 1 : -1).slice(0, 12);
+  if (!rows.length) return "";
+  return `<section class="panel fpcard wide"><div class="row" style="justify-content:space-between"><h3>Past exams</h3><span class="small muted">${S.archive.length} archived semester${S.archive.length === 1 ? "" : "s"}</span></div>
+    ${rows.map(x => `<div class="stack" style="gap:6px"><div class="row" style="justify-content:space-between"><b>${esc(x.subject)}</b><span class="small muted">${fmtYear(x.date)}${x.sem ? " · " + esc(x.sem) : ""}</span></div>${statsList(x.stats, x.review)}</div>`).join(`<hr class="sep">`)}
+    <p class="small muted">Your method results, timing, focus and energy from these exams stay in your profile, so new plans start from what already worked.</p></section>`;
 }
 
 /* ---------- views ---------- */
@@ -1225,22 +2058,26 @@ function readiness(e) {
 function heatClass(t, target) { if (t.mastery == null) return "h-none"; if (t.mastery >= target) return "h-good"; if (t.mastery >= target - 20) return "h-warn"; return "h-bad"; }
 function blockRow(b, { actions = true, showDate = false } = {}) {
   const e = examById(b.examId), t = topicById(e, b.topicId);
-  const typ = { learn: "Learn", review: "Review", mock: "Mock", check: "Check" }[b.type] || b.type;
+  const TYPES = { learn: "Learn", review: "Review", mock: "Mock", check: "Check" };
+  const type = Object.hasOwn(TYPES, b.type) ? b.type : "review", typ = TYPES[type];
+  const status = ["planned", "done", "skipped"].includes(b.status) ? b.status : "planned", minutes = Math.round(numOr(b.minutes, 0));
   const past = b.date < today();
   let acts = "";
   if (actions) {
-    if (b.status === "planned") {
-      acts = `<button class="btn sm" data-act="done" data-id="${b.id}">Done</button><button class="btn sm ghost" data-act="skip" data-id="${b.id}">${past ? "Missed" : "Skip"}</button>`;
-      const studyable = b.type === "learn" && b.method && METHODS[b.method];
-      if (t) acts = (b.type === "check" ? `<button class="btn sm primary" data-act="quiz" data-exam="${e.id}" data-topic="${t.id}" data-n="4">Take check</button>`
-        : studyable ? `<button class="btn sm primary" data-act="study" data-id="${b.id}">Study</button><button class="btn sm" data-act="quiz" data-exam="${e.id}" data-topic="${t.id}">Quiz</button>`
-        : `<button class="btn sm primary" data-act="quiz" data-exam="${e.id}" data-topic="${t.id}">Quiz</button>`) + acts;
-      if (!past && !studyable) acts = `<button class="btn sm" data-act="focus" data-id="${b.id}" title="Start a focus session for this block">${TM.blockId === b.id && TM.phase !== "idle" ? "Timer on" : "Focus"}</button>` + acts;
-    } else acts = `<span class="chip ${b.status === "done" ? "good" : ""}">${b.status}</span><button class="btn sm ghost" data-act="undo" data-id="${b.id}" aria-label="Undo">Undo</button>`;
+    if (status === "planned") {
+      acts = `<button class="btn sm" data-act="done" data-id="${esc(b.id)}">Done</button><button class="btn sm ghost" data-act="skip" data-id="${esc(b.id)}">${past ? "Missed" : "Skip"}</button>`;
+      const studyable = type === "learn" && b.method && Object.hasOwn(METHODS, b.method);
+      if (t) acts = (type === "check" ? `<button class="btn sm primary" data-act="quiz" data-exam="${esc(e.id)}" data-topic="${esc(t.id)}" data-n="4">Take check</button>`
+        : studyable ? `<button class="btn sm primary" data-act="study" data-id="${esc(b.id)}">Study</button><button class="btn sm" data-act="quiz" data-exam="${esc(e.id)}" data-topic="${esc(t.id)}">Quiz</button>`
+        : `<button class="btn sm primary" data-act="quiz" data-exam="${esc(e.id)}" data-topic="${esc(t.id)}">Quiz</button>`) + acts;
+      if (type === "mock") acts = `<button class="btn sm primary" data-act="mock" data-id="${esc(b.id)}">Enter results</button>` + acts;
+      if (!past && !studyable) acts = `<button class="btn sm" data-act="focus" data-id="${esc(b.id)}" title="Start a focus session for this block">${TM.blockId === b.id && TM.phase !== "idle" ? "Timer on" : "Focus"}</button>` + acts;
+    } else acts = (type === "mock" && status === "done" ? (b.mock ? `<button class="btn sm ghost" data-act="mock" data-id="${esc(b.id)}">${mockScore(b)}</button>` : `<button class="btn sm primary" data-act="mock" data-id="${esc(b.id)}">Enter results</button>`) : "")
+      + `<span class="chip ${status === "done" ? "good" : ""}">${status}</span><button class="btn sm ghost" data-act="undo" data-id="${esc(b.id)}" aria-label="Undo">Undo</button>`;
   }
-  return `<div class="block ${b.status}" style="--ec:${e ? examColor(e) : "var(--line)"}">
-    <div class="time">${showDate ? fmtDay(b.date) + "<br>" : ""}${esc(b.start)}<br><span class="small">${b.minutes} min</span></div>
-    <div class="what"><b>${esc(b.label)}</b><div class="meta"><span class="chip ${b.type}">${typ}</span>${b.method && METHODS[b.method] ? `<span class="chip method" title="${esc(t && t.methodWhy || "")}">${METHODS[b.method].name}</span>` : ""}${e ? esc(e.subject) : ""}${b.focusMin ? ` · <span class="mono">${b.focusMin}/${b.minutes} min focused</span>` : ""}${t && t.sources ? ` · ${esc(t.sources)}` : ""}</div></div>
+  return `<div class="block ${status}" style="--ec:${e ? examColor(e) : "var(--line)"}">
+    <div class="time">${showDate ? fmtDay(b.date) + "<br>" : ""}${esc(b.start)}<br><span class="small">${minutes} min</span></div>
+    <div class="what"><b>${esc(b.label)}</b><div class="meta"><span class="chip ${type}">${typ}</span>${b.method && Object.hasOwn(METHODS, b.method) ? `<span class="chip method" title="${esc(t && t.methodWhy || "")}">${METHODS[b.method].name}</span>` : ""}${e ? esc(e.subject) : ""}${b.focusMin ? ` · <span class="mono">${Math.round(numOr(b.focusMin, 0))}/${minutes} min focused</span>` : ""}${t && t.sources ? ` · ${esc(t.sources)}` : ""}</div></div>
     <div class="acts">${acts}</div></div>`;
 }
 function vEmpty() {
@@ -1253,6 +2090,7 @@ function vEmpty() {
       <li><b>Quiz yourself after each block</b><span class="muted small">If you score below where the plan expects you to be, it adds study time and moves blocks around, and tells you why.</span></li>
     </ol>
     <div class="row"><button class="btn primary" data-act="new-exam">Add your first exam</button><button class="btn" data-act="example">Try it with example exams</button></div>
+    ${S.archive.length ? `<p class="small">Welcome back. Your learning profile from ${S.archive.length === 1 ? "last semester" : "earlier semesters"} is kept, so your new plan starts from what already worked for you.</p>` : ""}
     <p class="small muted">Your plan and materials are saved in this browser only. Nobody else can see them. Download a backup under Plan if you want to move to another device.</p>
   </section>`;
 }
@@ -1260,14 +2098,15 @@ function vDashboard() {
   if (!S.exams.length) return vEmpty();
   const t0 = today();
   const todays = S.blocks.filter(b => b.date === t0);
-  const pending = S.blocks.filter(b => b.status === "planned" && b.date < t0);
+  // past blocks still open, only for exams that are still ahead (a finished exam gets its review instead)
+  const pending = S.blocks.filter(b => { const e = examById(b.examId); return b.status === "planned" && b.date < t0 && e && e.date >= t0; });
   const next = S.blocks.filter(b => b.status === "planned" && b.date > t0).slice(0, 4);
   const upcoming = S.exams.filter(e => e.date >= t0).sort((a, b) => a.date < b.date ? -1 : 1);
-  const past = S.exams.filter(e => e.date < t0);
   const short = upcoming.filter(e => S.shortfall[e.id]);
   return `
   ${pending.length ? `<section class="alert mark"><div class="section-head"><h3>Did you do these?</h3><span class="small">${pending.length} block${pending.length > 1 ? "s" : ""} from earlier days. Missed blocks get rescheduled.</span></div><div class="blocks">${pending.slice(0, 6).map(b => blockRow(b, { showDate: true })).join("")}</div></section>` : ""}
   ${short.map(e => `<section class="alert bad"><b>Not enough time for ${esc(e.subject)}</b><span class="small">${hrs(S.shortfall[e.id])} of learning doesn't fit before ${fmtDay(e.date)}. Add study hours under Plan → Availability, or lower the effort of less important topics.</span></section>`).join("")}
+  ${reviewPrompts()}
   ${rateCard()}
   ${streakPanel()}
   ${S.exams.length ? fpTeaser() : ""}
@@ -1278,7 +2117,7 @@ function vDashboard() {
   <section class="section">
     <div class="section-head"><h2>Exams</h2><button class="btn sm" data-act="new-exam">Add exam</button></div>
     <div class="exams">${upcoming.map(examCard).join("") || `<div class="panel muted">No upcoming exams.</div>`}</div>
-    ${past.length ? `<p class="small muted">${past.length} past exam${past.length > 1 ? "s" : ""} hidden. Remove ${past.length > 1 ? "them" : "it"} under Exams &amp; materials.</p>` : ""}
+    ${pastSection()}
   </section>
   ${S.log.length ? `<section class="section"><div class="section-head"><h2>Latest plan changes</h2><button class="btn sm ghost" data-view="history">See all</button></div><div class="panel log">${S.log.slice(0, 3).map(logItem).join("")}</div></section>` : ""}`;
 }
@@ -1373,6 +2212,7 @@ function vExams() {
         <label class="field"><span>Exam date</span><input type="date" id="f-date" data-field="date" value="${esc(e.date)}"></label>
         <label class="field"><span>Format</span><select id="f-format" data-field="format">${["written", "multiple-choice", "oral"].map(f => `<option ${e.format === f ? "selected" : ""}>${f}</option>`).join("")}</select></label>
         <label class="field"><span>Target score (%)</span><input type="number" id="f-target" min="40" max="100" step="5" data-field="target" value="${e.target}"></label>
+        <label class="field"><span>Pass mark (%)</span><input type="number" id="f-pass" min="10" max="100" step="5" data-field="passPct" value="${e.passPct}"></label>
       </div>
     </section>
     <section class="panel stack">
@@ -1385,10 +2225,10 @@ function vExams() {
         </div>
         ${busy.upload ? `<span class="small"><span class="spinner"></span> Reading files…</span>` : ""}
       </div>
-      ${e.materials.length ? `<div class="mats">${e.materials.map(m => `<div class="mat"><span class="chip ${m.kind === "oldexam" ? "mock" : m.kind === "slides" ? "review" : "learn"}">${{ script: "Script", slides: "Slides", oldexam: "Old exam" }[m.kind]}</span><b>${esc(m.name)}</b><span class="small muted mono">${m.pages} ${/\.pdf$/i.test(m.name) ? "pages" : "parts"}${m.truncated ? " · shortened" : ""}</span>${m.empty ? `<span class="chip warn" title="Scanned PDFs without a text layer can't be read">little text found</span>` : ""}<button class="btn sm ghost" data-act="rm-mat" data-id="${m.id}">${confirmKey === "mat" + m.id ? "Click to remove" : "Remove"}</button></div>`).join("")}</div>` : ""}
+      ${e.materials.length ? `<div class="mats">${e.materials.map(m => `<div class="mat"><span class="chip ${m.kind === "oldexam" ? "mock" : m.kind === "slides" ? "review" : "learn"}">${{ script: "Script", slides: "Slides", oldexam: "Old exam" }[m.kind]}</span><b>${esc(m.name)}</b><span class="small muted mono">${m.pages} ${/\.pdf$/i.test(m.name) ? "pages" : "parts"}${m.truncated ? " · shortened" : ""}</span>${m.empty ? `<span class="chip warn" title="${isPdf(m.name) ? "Scanned PDFs without a text layer can't be read yet" : "This file has almost no text"}">${isPdf(m.name) ? "scanned? no text found" : "little text found"}</span>` : ""}<button class="btn sm ghost" data-act="rm-mat" data-id="${m.id}">${confirmKey === "mat" + m.id ? "Click to remove" : "Remove"}</button></div>`).join("")}</div>` : ""}
       <div class="row">
         ${busy.analyze === e.id
-          ? `<span><span class="spinner"></span> The AI is reading your materials. This can take a minute or two.</span><button class="btn sm" data-act="stop">Stop</button>`
+          ? `<span id="analyze-progress"><span class="spinner"></span> ${busy.progress ? `${busy.progress.retry ? "That was too much at once, so the AI is trying smaller parts. " : "Your materials are long, so the AI reads them in parts. "}Reading part ${busy.progress.i} of ${busy.progress.n}…` : "The AI is reading your materials. This can take a minute or two."}</span><button class="btn sm" data-act="stop">Stop</button>`
           : `<button class="btn primary" data-act="analyze" ${e.materials.length && sample ? "" : "disabled"}>${T.length ? "Re-analyze materials" : "Analyze materials with AI"}</button>
              ${!sample ? `<span class="small muted">${aiOffMsg()}</span>` : !e.materials.length ? `<span class="small muted">Add at least one file first.</span>` : T.length ? `<span class="small muted">Replaces the topic list. Quiz results stay with topics of the same name.</span>` : ""}`}
       </div>
@@ -1397,20 +2237,28 @@ function vExams() {
     <section class="panel stack">
       <div class="section-head"><h2>Topics</h2><span class="small muted mono">${T.length} topics · ${sum(T, t => +t.effortH || 0)} h estimated</span></div>
       ${T.length ? `<div class="tablewrap"><table>
-        <thead><tr><th>Topic</th><th>Weight</th><th>Effort (h)</th><th>Mastery</th><th>Method</th><th>Where</th><th></th></tr></thead>
+        <thead><tr><th>Topic</th><th>Weight</th><th>Effort (h)</th><th>Mastery</th><th>Method</th><th>Builds on</th><th>Where</th><th></th></tr></thead>
         <tbody>${T.map(t => `<tr>
-          <td><input type="text" id="t-name-${t.id}" data-topic="${t.id}" data-tf="name" value="${esc(t.name)}" aria-label="Topic name">${t.extraMin > 0 ? `<div class="small" style="color:var(--warn)">+${hrs(t.extraMin)} added after quizzes</div>` : ""}</td>
+          <td><input type="text" id="t-name-${t.id}" data-topic="${t.id}" data-tf="name" value="${esc(t.name)}" aria-label="Topic name" style="min-width:170px">${t.extraMin > 0 ? `<div class="small" style="color:var(--warn)">+${hrs(t.extraMin)} added after quizzes</div>` : ""}</td>
           <td><select id="t-w-${t.id}" data-topic="${t.id}" data-tf="weight" aria-label="Weight">${[1, 2, 3, 4, 5].map(w => `<option ${t.weight == w ? "selected" : ""}>${w}</option>`).join("")}</select>${t.oldExamHits ? `<div class="small muted">${t.oldExamHits}× in old exams</div>` : ""}</td>
           <td><input type="number" id="t-e-${t.id}" min="0.5" max="20" step="0.5" data-topic="${t.id}" data-tf="effortH" value="${t.effortH}" aria-label="Effort in hours"></td>
           <td class="mono">${t.mastery == null ? `<span class="muted">—</span>` : `<span class="chip ${t.mastery >= e.target ? "good" : t.mastery >= e.target - 20 ? "warn" : "bad"}">${t.mastery}%</span>`}</td>
           <td><select id="t-m-${t.id}" data-topic="${t.id}" data-tf="method" aria-label="Study method"><option value="auto" ${!t.methodLock ? "selected" : ""}>Auto${!t.methodLock && t.method && METHODS[t.method] ? ` · ${METHODS[t.method].name}` : ""}</option>${MKEYS.map(m => `<option value="${m}" ${t.methodLock && t.method === m ? "selected" : ""}>${METHODS[m].name}</option>`).join("")}</select></td>
+          <td>${buildsOnSelect(e, t)}</td>
           <td class="small muted" style="max-width:220px">${esc(t.sources || "")}</td>
           <td><button class="btn sm ghost" data-act="rm-topic" data-id="${t.id}">${confirmKey === "t" + t.id ? "Click to remove" : "Remove"}</button></td></tr>`).join("")}</tbody></table></div>` : `<p class="muted">No topics yet. Analyze your materials, or add topics by hand.</p>`}
       <div class="row"><input type="text" id="new-topic" placeholder="New topic name" style="flex:1; min-width:180px"><button class="btn" data-act="add-topic">Add topic</button></div>
-      <p class="small muted">Weight: how important the topic is for the exam (5 = comes up in almost every old exam). Effort: hours you need to learn it the first time.</p>
+      <p class="small muted">Weight: how important the topic is for the exam (5 = comes up in almost every old exam). Effort: hours you need to learn it the first time. Builds on: topics you need to understand first, so the plan puts them earlier (Ctrl or Cmd + click to pick more than one).</p>
     </section>
+    ${T.length ? pphPanel(e) : ""}
     <div><button class="btn danger" data-act="rm-exam">${confirmKey === "exam" + e.id ? "Click again to delete this exam and its materials" : "Delete exam"}</button></div>
   </div></div>`;
+}
+// Multi-select of the topics this one builds on. Topics that build on this one are left out (no loops).
+function buildsOnSelect(e, t) {
+  const opts = e.topics.filter(x => x.id !== t.id && !prereqsOf(e, x.id).has(t.id));
+  if (!opts.length) return `<span class="muted">—</span>`;
+  return `<select multiple id="t-p-${t.id}" data-topic="${t.id}" data-tf="prereqs" size="${Math.min(3, opts.length)}" aria-label="Builds on" style="min-width:150px; font-size:.85em">${opts.map(x => `<option value="${x.id}" ${t.prereqs.includes(x.id) ? "selected" : ""}>${esc(x.name)}</option>`).join("")}</select>`;
 }
 function vQuiz() {
   if (!S.exams.length) return vEmpty();
@@ -1469,13 +2317,80 @@ function quizSummary(e, t) {
     </div><div class="row"><button class="btn sm" data-view="plan">See updated plan</button>${c.changes && c.changes.length ? `<button class="btn sm ghost" data-act="ics">Export calendar again</button>` : ""}</div>` : ""}
   </section>`;
 }
+function pphPanel(e) {
+  const P = pointsTable(e), pass = e.mode === "pass", f1 = n => (Math.round(n * 10) / 10).toFixed(1);
+  const pill = (v, label) => `<label class="cpill"><input type="radio" name="mode-${e.id}" id="mode-${v}" data-mode="1" value="${v}" ${e.mode === v ? "checked" : ""}>${label}</label>`;
+  return `<section class="panel stack" id="pph">
+    <div class="section-head"><h2>Where your time pays off</h2><span class="small muted">Exam points estimated from ${esc(P.source)}</span></div>
+    <div class="conf"><span class="label">I'm aiming for</span>${pill("pass", "Pass")}${pill("top", "Top grade")}</div>
+    <p class="small muted" style="max-width:70ch">${pass ? `Pass: the plan picks the topics with the most points per hour until you reach the pass mark (${e.passPct}%) and learns those first, in the order of your material. Change the pass mark under Exam details.` : "Top grade: the plan goes through your material in order and aims at full mastery of every topic."}${e.topics.some(t => t.prereqs.length) ? " Either way, a topic is only learned after the topics it builds on." : ""}</p>
+    <p class="small" id="pph-sum">You have about ${Math.round(P.have)} of 100 points now. ${pass
+      ? (P.have >= e.passPct ? `That already reaches the pass mark of ${e.passPct}%.` : `About ${f1(P.passHours)} h more should get you to ${Math.round(Math.min(100, P.passReach))} points${P.passReach < e.passPct ? ", still below the pass mark" : ""}.`)
+      : `About ${f1(P.topHours)} h of study left to full mastery.`}</p>
+    <div class="tablewrap"><table id="pph-table">
+      <thead><tr><th>Topic</th><th>Exam points</th><th>You have</th><th>Hours left</th><th>Points per hour</th>${pass ? "<th>For a pass</th>" : ""}</tr></thead>
+      <tbody>${P.rows.map(r => `<tr>
+        <td>${esc(r.t.name)}</td><td class="mono">${Math.round(r.points)}</td><td class="mono">${Math.round(r.have)}</td>
+        <td class="mono">${r.hours ? f1(r.hours) : "—"}</td><td class="mono"><b>${r.hours ? f1(r.pph) : "—"}</b></td>
+        ${pass ? `<td>${r.needed ? `<span class="chip good">Needed</span>${r.first ? `<div class="small muted">${esc(r.first)} builds on it</div>` : ""}` : `<span class="chip">After the pass</span>`}</td>` : ""}</tr>`).join("")}</tbody></table></div>
+    <p class="small muted">"You have" uses your quiz and mock results, or the progress the plan expects if a topic wasn't quizzed yet.</p>
+  </section>`;
+}
+/* mock exam scoring */
+let MK = null;
+function mockScore(b) { const g = sum(b.mock.tasks, x => x.got), m = sum(b.mock.tasks, x => x.max); return `${fmtPts(g)}/${fmtPts(m)} points`; }
+function mockRows(e) {
+  if (e.oldTasks.length) return { from: "the tasks the AI found in your old exams", rows: e.oldTasks.map(x => ({ label: x.label, topicId: topicById(e, x.topicId) ? x.topicId : "", got: "", max: x.points })) };
+  const m = lastMock(e);
+  if (m) return { from: "your last mock exam", rows: m.mock.tasks.map(x => ({ label: x.label, topicId: x.topicId || "", got: "", max: x.max })) };
+  const { pts, source } = topicPoints(e);
+  return { from: `one task per topic, points estimated from ${source}`, rows: e.topics.filter(t => pts[t.id] > 0).map((t, i) => ({ label: `Task ${i + 1}`, topicId: t.id, got: "", max: Math.max(1, Math.round(pts[t.id])) })) };
+}
+function openMock(b) {
+  const e = b && examById(b.examId); if (!e) return;
+  if (b.mock) MK = { blockId: b.id, rows: b.mock.tasks.map(x => ({ ...x })), change: null, editing: false };
+  else { const r = mockRows(e); MK = { blockId: b.id, rows: r.rows, from: r.from, change: null }; }
+  go("mock");
+}
+function mkTotal() {
+  const ok = MK.rows.filter(r => +r.max > 0 && String(r.got ?? "").trim() !== "");
+  return `${fmtPts(sum(ok, r => Math.min(+r.max, Math.max(0, +r.got || 0))))} of ${fmtPts(sum(ok, r => +r.max))} points`;
+}
+function vMock() {
+  const b = MK && S.blocks.find(x => x.id === MK.blockId), e = b && examById(b.examId);
+  if (!e) return `<div class="panel">This mock exam is no longer in your plan. <button class="btn sm" data-view="dashboard">Back to today</button></div>`;
+  const head = `<div class="section-head"><h2>Mock exam results</h2><span class="small muted">${esc(e.subject)} · ${fmtDay(b.date)}</span></div>`;
+  if (b.mock && !MK.editing) {
+    const c = MK.change;
+    return `<section class="panel stack" style="border-top:4px solid ${examColor(e)}">${head}
+      <div><span class="label">Your score</span><div class="score-big mono">${mockScore(b)}</div></div>
+      ${c ? `<div class="fb"><b>What the coach changed</b><span>${esc(c.detail)}</span>
+        ${c.changes.slice(0, 6).map(x => `<div class="change"><span>${esc(x.name)} <span class="muted">· ${esc(x.exam)}</span></span><span class="${x.delta > 0 ? "plus" : "minus"}">${x.delta > 0 ? "+" : "−"}${hrs(Math.abs(x.delta))}</span></div>`).join("")}</div>` : ""}
+      <div class="tablewrap"><table><thead><tr><th>Task</th><th>Topic</th><th>Points</th></tr></thead><tbody>${b.mock.tasks.map(x => { const t = topicById(e, x.topicId); return `<tr><td>${esc(x.label)}</td><td>${t ? esc(t.name) : `<span class="muted">No topic</span>`}</td><td class="mono"><span class="chip ${x.got >= x.max * 0.7 ? "good" : x.got >= x.max * 0.4 ? "warn" : "bad"}">${fmtPts(x.got)}/${fmtPts(x.max)}</span></td></tr>`; }).join("")}</tbody></table></div>
+      <div class="row"><button class="btn sm" data-view="plan">See updated plan</button>${canEditMock(b) ? `<button class="btn sm" data-act="mk-edit">Edit results</button>` : ""}<button class="btn sm ghost" data-act="edit" data-exam="${e.id}">See where your time pays off</button></div>
+    </section>`;
+  }
+  return `<section class="panel stack">${head}
+    <p class="small muted" style="max-width:70ch">${b.mock ? "Change the points or topics. The coach takes back what your earlier results changed and adjusts the plan to the new ones." : "Enter the points you got on each task and pick the topic it belongs to. Topics where you lost points get extra study time and a repair review."}</p>
+    ${MK.from ? `<p class="small">Pre-filled with ${esc(MK.from)}. Change the tasks and points to match the mock you did. Leave points reached empty to skip a task.</p>` : ""}
+    <div class="tablewrap"><table id="mk-table"><thead><tr><th>Task</th><th>Topic</th><th>Points reached</th><th>Points possible</th><th></th></tr></thead>
+      <tbody>${MK.rows.map((r, i) => `<tr>
+        <td class="mk-wide" data-label="Task"><input type="text" id="mk-label-${i}" data-mk="label" data-i="${i}" value="${esc(r.label)}" aria-label="Task"></td>
+        <td class="mk-wide" data-label="Topic"><select id="mk-topic-${i}" data-mk="topicId" data-i="${i}" aria-label="Topic"><option value="">No topic</option>${e.topics.map(t => `<option value="${t.id}" ${t.id === r.topicId ? "selected" : ""}>${esc(t.name)}</option>`).join("")}</select></td>
+        <td data-label="Points reached"><input type="number" id="mk-got-${i}" min="0" step="0.5" data-mk="got" data-i="${i}" value="${esc(r.got)}" aria-label="Points reached"></td>
+        <td data-label="Points possible"><input type="number" id="mk-max-${i}" min="0" step="0.5" data-mk="max" data-i="${i}" value="${esc(r.max)}" aria-label="Points possible"></td>
+        <td class="mk-rm"><button class="btn sm ghost" data-act="mk-rm" data-i="${i}" aria-label="Remove task">Remove</button></td></tr>`).join("")}</tbody></table></div>
+    <div class="row"><button class="btn sm" data-act="mk-add">Add task</button><span class="small muted mono" id="mk-total">${mkTotal()}</span></div>
+    <div class="row"><button class="btn primary" data-act="mk-save">Save results</button><button class="btn ghost" data-act="mk-cancel">Cancel</button></div>
+  </section>`;
+}
 function vHistory() {
   return `<section class="section"><div class="section-head"><h2>Plan changes</h2><span class="small muted">Every time the coach changed your plan, and why</span></div>
   <div class="panel log">${S.log.length ? S.log.map(logItem).join("") : `<p class="muted">No changes yet. They appear here after quizzes, skipped blocks and edits.</p>`}</div></section>`;
 }
 function render() {
   document.querySelectorAll("#nav button").forEach(b => b.setAttribute("aria-current", b.dataset.view === view ? "page" : "false"));
-  const v = { dashboard: vDashboard, plan: vPlan, exams: vExams, quiz: vQuiz, you: vYou, study: vStudy, history: vHistory }[view] || vDashboard;
+  const v = { dashboard: vDashboard, plan: vPlan, exams: vExams, quiz: vQuiz, you: vYou, study: vStudy, mock: vMock, history: vHistory }[view] || vDashboard;
   $("#main").innerHTML = aiBanner() + v();
   const st = streakInfo(), chip = $("#streakchip");
   chip.hidden = !S.exams.length && !st.current;
@@ -1483,7 +2398,7 @@ function render() {
   chip.textContent = st.current ? `${st.current}-day streak${st.today ? "" : " · keep it today"}` : "No streak yet";
   renderTimer();
 }
-function go(v) { view = v; confirmKey = null; try { history.replaceState(null, "", "#" + v); } catch (e) { location.hash = v; } render(); window.scrollTo(0, 0); }
+function go(v) { if (v !== "study") micStop(); view = v; confirmKey = null; try { history.replaceState(null, "", "#" + v); } catch (e) { location.hash = v; } render(); window.scrollTo(0, 0); }
 
 /* ---------- events ---------- */
 $("#nav").addEventListener("click", ev => { const b = ev.target.closest("button[data-view]"); if (b) go(b.dataset.view); });
@@ -1492,7 +2407,7 @@ $("#main").addEventListener("click", async ev => {
   const nv = ev.target.closest("[data-view]"); if (nv) return go(nv.dataset.view);
   const el = ev.target.closest("[data-act]"); if (!el) return;
   const a = el.dataset.act, e = examById(el.dataset.exam) || examById(selExam);
-  if (a !== "rm-mat" && a !== "rm-topic" && a !== "rm-exam" && a !== "fp-reset") confirmKey = null;
+  if (a !== "rm-mat" && a !== "rm-topic" && a !== "rm-exam" && a !== "fp-reset" && a !== "new-semester" && a !== "m-close") confirmKey = null;
   const blk = id => S.blocks.find(b => b.id === id);
   switch (a) {
     case "example": loadExample(); break;
@@ -1513,6 +2428,23 @@ $("#main").addEventListener("click", async ev => {
     }
     case "s-restart": { const st = ST[studyId]; if (st) { st.order = st.data.cards.map((_, i) => i); st.pos = 0; st.known = 0; st.flipped = false; st.missedOnce = {}; render(); } break; }
     case "s-feedback": studyFeedback(S.blocks.find(x => x.id === studyId)); break;
+    case "m-start": micStop(); startMode(blk(studyId), el.dataset.k === "oral" ? "oral" : "teach"); break;
+    case "m-send": sendMode(blk(studyId)); break;
+    case "m-retry": modeStep(blk(studyId)); break;
+    case "m-edit": editMode(blk(studyId)); break;
+    case "m-finish": { const b = blk(studyId), st = b && SM[b.topicId]; if (st && st.phase === "feedback") { micStop(); finishMode(b); } break; }
+    case "m-mic": micStart(studyTopic); break;
+    case "m-close": {
+      const st = SM[studyTopic];
+      if (st && st.phase !== "done" && st.turns.length && confirmKey !== "mclose") { confirmKey = "mclose"; render(); break; }
+      confirmKey = null; micStop(); if (st && st.phase === "waiting") aiCtl && aiCtl.abort(); delete SM[studyTopic]; if (blk(studyId)) render(); else go("dashboard"); break;
+    }
+    case "energy": { const v = el.dataset.v; if (v) checkIn(v, el.dataset.id); else { busy.noCheck[el.dataset.id] = true; render(); } break; }
+    case "rv-save": saveReview(e); break;
+    case "rv-skip": skipReview(e); break;
+    case "rv-edit": busy.rvEdit = e.id; render(); break;
+    case "new-semester": if (confirmKey !== "semester") { confirmKey = "semester"; render(); break; } confirmKey = null; startSemester(); break;
+    case "light": decideLighter(blockEnergy(blk(el.dataset.id)), el.dataset.v === "yes"); break;
     case "s-done": markDone(S.blocks.find(x => x.id === studyId)); break;
     case "rate": {
       const b = S.blocks.find(x => x.id === busy.rate), v = +el.dataset.v;
@@ -1535,10 +2467,24 @@ $("#main").addEventListener("click", async ev => {
       break;
     }
     case "focus": startFocus(el.dataset.id || null); break;
+    case "mock": openMock(blk(el.dataset.id)); break;
+    case "mk-add": MK.rows.push({ label: `Task ${MK.rows.length + 1}`, topicId: "", got: "", max: "" }); render(); break;
+    case "mk-rm": MK.rows.splice(+el.dataset.i, 1); render(); break;
+    case "mk-edit": { const b = blk(MK.blockId); if (!canEditMock(b)) break; Object.assign(MK, { editing: true, from: null, change: null, rows: b.mock.tasks.map(x => ({ ...x })) }); render(); break; }
+    case "mk-cancel": if (MK.editing) { MK.editing = false; render(); break; } MK = null; go("dashboard"); break;
+    case "mk-save": {
+      const b = blk(MK.blockId); if (!b) break;
+      if (b.mock && !canEditMock(b)) break;
+      const entry = applyMockResult(b, MK.rows);
+      if (!entry) { toast("Enter points reached and points possible for at least one task."); break; }
+      MK.change = entry; MK.editing = false; render(); window.scrollTo(0, 0); break;
+    }
     case "new-exam": newExam(); break;
     case "done": markDone(blk(el.dataset.id)); break;
     case "skip": { const b = blk(el.dataset.id); b.status = "skipped"; commit({ log: { examId: b.examId, kind: "skip", title: `${b.date < today() ? "Missed" : "Skipped"}: ${b.label}`, detail: `The ${b.minutes} min from ${fmtDay(b.date)} were moved to the next free slots.` } }); break; }
-    case "undo": { const b = blk(el.dataset.id); b.status = "planned"; const t = topicById(examById(b.examId), b.topicId); if (t && t.learnedOn && t.checkPending && remainingLearn(t) > 0) { t.learnedOn = null; t.checkPending = false; t.checkDue = null; } commit(); break; }
+    case "undo": { const b = blk(el.dataset.id); if (!b) break;
+      if (b.mock) { toast("A scored mock exam can't be undone. Open its score to edit the results instead."); break; }
+      b.status = "planned"; const t = topicById(examById(b.examId), b.topicId); if (t && t.learnedOn && t.checkPending && remainingLearn(t) > 0) { t.learnedOn = null; t.checkPending = false; t.checkDue = null; } commit(); break; }
     case "quiz": quiz = { examId: el.dataset.exam, topicId: el.dataset.topic, phase: "pick", n: el.dataset.n ? +el.dataset.n : undefined }; go("quiz"); break;
     case "goquiz": quiz = { examId: el.dataset.exam, topicId: null, phase: "pick" }; go("quiz"); break;
     case "edit": selExam = el.dataset.exam; go("exams"); break;
@@ -1558,7 +2504,7 @@ $("#main").addEventListener("click", async ev => {
     case "rm-topic": {
       const id = el.dataset.id;
       if (confirmKey !== "t" + id) { confirmKey = "t" + id; render(); break; }
-      confirmKey = null; e.topics = e.topics.filter(t => t.id !== id); S.blocks = S.blocks.filter(b => b.topicId !== id || b.status !== "planned"); commit(); break;
+      confirmKey = null; e.topics = e.topics.filter(t => t.id !== id); cleanPrereqs(e); S.blocks = S.blocks.filter(b => b.topicId !== id || b.status !== "planned"); commit(); break;
     }
     case "add-topic": { const n = $("#new-topic").value.trim(); if (!n) { $("#new-topic").focus(); break; } e.topics.push(mkTopic(n, 3, 3)); commit(); setTimeout(() => $("#new-topic") && $("#new-topic").focus(), 20); break; }
     case "rm-exam": {
@@ -1578,15 +2524,23 @@ $("#main").addEventListener("change", ev => {
     const f = el.dataset.field;
     let v = el.value;
     if (f === "target") v = Math.min(100, Math.max(40, +v || 80));
+    if (f === "passPct") v = Math.min(100, Math.max(10, Math.round(+v) || 50));
     if (f === "date" && !v) return;
     if (f === "subject") v = v.trim() || "Untitled exam";
     e[f] = v;
-    commit({ plan: f === "date" || f === "target", log: f === "date" ? { examId: e.id, kind: "setup", title: `${e.subject}: exam date set to ${fmtDay(v)}`, detail: "The plan was rebuilt backwards from the new date." } : null });
+    commit({ plan: ["date", "target", "passPct"].includes(f), log: f === "date" ? { examId: e.id, kind: "setup", title: `${e.subject}: exam date set to ${fmtDay(v)}`, detail: "The plan was rebuilt backwards from the new date." } : null });
     return;
   }
   if (el.dataset.tf && e) {
     const t = topicById(e, el.dataset.topic); if (!t) return;
     const f = el.dataset.tf;
+    if (f === "prereqs") {
+      t.prereqs = [...el.selectedOptions].map(o => o.value); t.prereqsSet = true; cleanPrereqs(e);
+      const names = t.prereqs.map(id => topicById(e, id).name).join(", ");
+      commit({ log: { examId: e.id, kind: "manual", title: names ? `${e.subject}: ${t.name} builds on ${names}` : `${e.subject}: ${t.name} builds on no other topic`,
+        detail: names ? `The plan now has you learn ${names} before ${t.name}.` : `${t.name} no longer waits for other topics.` } });
+      return;
+    }
     if (f === "name") t.name = el.value.trim() || t.name;
     if (f === "weight") t.weight = +el.value;
     if (f === "effortH") t.effortH = Math.min(20, Math.max(0.5, +el.value || 1));
@@ -1607,6 +2561,12 @@ $("#main").addEventListener("change", ev => {
     commit();
     return;
   }
+  if (el.dataset.mode && e && (el.value === "pass" || el.value === "top") && e.mode !== el.value) {
+    e.mode = el.value;
+    commit({ log: { examId: e.id, kind: "manual", title: `${e.subject}: aiming for ${el.value === "pass" ? "a pass" : "a top grade"}`,
+      detail: el.value === "pass" ? `Learning now starts with the topics that give the most points per hour until you reach the pass mark of ${e.passPct}%, in the order of your material.` : "Learning now follows the order of your material, aiming at full mastery of every topic." } });
+    return;
+  }
   if (el.id === "restore-file") { if (el.files[0]) readBackup(el.files[0]); el.value = ""; return; }
   if (el.id === "mat-file" && e) { addFiles(e, [...el.files], $("#mat-kind").value); el.value = ""; return; }
   if (el.dataset.q === "exam") { quiz = { examId: el.value, topicId: null, phase: "pick" }; render(); return; }
@@ -1616,7 +2576,14 @@ $("#main").addEventListener("change", ev => {
 });
 $("#main").addEventListener("input", ev => {
   const el = ev.target;
+  if (el.dataset.mk && MK) {
+    const r = MK.rows[+el.dataset.i]; if (r) r[el.dataset.mk] = el.value;
+    const tot = $("#mk-total"); if (tot) tot.textContent = mkTotal();
+    return;
+  }
+  if (el.dataset.rv) { (busy.rv[el.dataset.rv] = busy.rv[el.dataset.rv] || {})[el.dataset.k] = el.value; return; }
   if (el.id === "study-text" && studyId) { (ST[studyId] = ST[studyId] || {}).text = el.value; return; }
+  if (el.id === "mode-text" && SM[studyTopic]) { SM[studyTopic].text = el.value; return; }
   if (el.dataset.ans != null && el.tagName === "TEXTAREA" && quiz) {
     const had = Object.keys(quiz.answers).length;
     if (el.value.trim()) quiz.answers[+el.dataset.ans] = el.value; else delete quiz.answers[+el.dataset.ans];
