@@ -45,6 +45,7 @@ const TEX_SYM = {
   leftrightarrow: "↔", Leftrightarrow: "⇔", iff: "⇔", implies: "⇒", mapsto: "↦", in: "∈", notin: "∉", subset: "⊂", subseteq: "⊆", supset: "⊃", cup: "∪", cap: "∩",
   forall: "∀", exists: "∃", emptyset: "∅", neg: "¬", land: "∧", lor: "∨", ldots: "…", cdots: "⋯", dots: "…", prime: "′", circ: "∘", degree: "°", ell: "ℓ",
   langle: "⟨", rangle: "⟩", lfloor: "⌊", rfloor: "⌋", lceil: "⌈", rceil: "⌉", perp: "⊥", parallel: "∥", angle: "∠", star: "⋆", ast: "∗", bullet: "•",
+  triangle: "△", sinh: "sinh", cosh: "cosh", tanh: "tanh",
   ln: "ln", log: "log", exp: "exp", max: "max", min: "min", lim: "lim", sup: "sup", inf: "inf", sin: "sin", cos: "cos", tan: "tan", det: "det", arg: "arg",
   quad: " ", qquad: " ", "%": "%", "$": "$", "&": "&", "#": "#", "_": "_", "{": "{", "}": "}", ",": " ", ";": " ", ":": " ", " ": " ", "!": "", "\\": " "
 };
@@ -77,7 +78,10 @@ function texMath(s) {
     if (c === "\\") {
       const m = s.slice(i).match(/^\\([a-zA-Z]+|.)/); if (!m) { i++; continue; }
       const cmd = m[1]; i += m[0].length;
-      if (cmd === "frac" || cmd === "dfrac" || cmd === "tfrac") {
+      if (cmd === "binom") {
+        const [a, j] = texArg(s, i), [b, k] = texArg(s, j); i = k;
+        out += `C(${texMath(a).trim()}, ${texMath(b).trim()})`;
+      } else if (cmd === "frac" || cmd === "dfrac" || cmd === "tfrac") {
         const [a, j] = texArg(s, i), [b, k] = texArg(s, j); i = k;
         const A = texMath(a).trim(), B = texMath(b).trim();
         out += `${simple(A) ? A : `(${A})`}/${simple(B) ? B : `(${B})`}`;
@@ -104,21 +108,25 @@ function texMath(s) {
 }
 // JSON turns "\tau", "\frac", "\beta", "\rho", "\nu" into a tab, form feed, backspace, CR or new line
 // plus the rest of the word when the AI forgets to double the backslash; this takes them back.
-const TEX_LOST = /\t(?=au|heta|imes|ext|ilde|o\b)|\f(?=rac)|\x08(?=eta|ar|ig|oldsymbol)|\r(?=ho|ight)|\n(?=u\b|eq\b|abla|eg\b|otin\b)/g;
+// "\ne" only before a space ("\ne y"), so a new line followed by "e.g." stays.
+const TEX_LOST = /\t(?=au|heta|imes|ext|ilde|o\b|anh?\b|frac|riangle)|\f(?=rac|orall)|\x08(?=eta|ar|ig|oldsymbol|ullet|inom)|\r(?=ho|ight|angle|floor|ceil)|\n(?=u\b|eq\b|e |abla|eg\b|otin\b|exists)/g;
 function mathText(s) {
   s = String(s ?? "");
   if (!/[\\$^_]/.test(s) && !/[\t\f\x08\r]/.test(s)) return s;
   if (/[$\\]|_\{/.test(s)) s = s.replace(TEX_LOST, c => "\\" + { "\t": "t", "\f": "f", "\x08": "b", "\r": "r", "\n": "n" }[c]);
   // $$…$$, $…$, \(…\), \[…\]: math if it holds LaTeX or is a single symbol ("$x$"), not "$5 and $10".
-  s = s.replace(/\$\$([^$]{1,400})\$\$|\\\[([\s\S]{1,400}?)\\\]|\\\(([\s\S]{1,400}?)\\\)|\$([^$\n]{1,200})\$/g, (all, a, b, c, d) => {
+  // $…$ only with no space just inside the dollars and no digit right after the closing one,
+  // so "earns $5 and its profit π_B is $10" and "echo $PATH_VAR and $HOME" stay as they are.
+  s = s.replace(/\$\$([^$]{1,400})\$\$|\\\[([\s\S]{1,400}?)\\\]|\\\(([\s\S]{1,400}?)\\\)|\$(?!\s)([^$\n]{1,200}?)(?<!\s)\$(?!\d)/g, (all, a, b, c, d) => {
     const t = a ?? b ?? c ?? d;
     if (d != null && !/[\\_^{]/.test(t) && !/^\s*[A-Za-z]\s*$/.test(t)) return all;
     return texMath(t.trim());
   });
-  // LaTeX outside $…$: known commands (with their arguments) and X_{…} / X^{…}.
-  s = s.replace(/\\(?:frac|dfrac|sqrt|mathbb|text|mathrm|mathbf|hat|bar|tilde|overline)\s*(?:\[[^\]]*\])?(?:\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}|\\?[A-Za-z]){1,2}/g, m => texMath(m))
+  // LaTeX outside $…$: known commands (with their arguments) and X_{…} / X^{…}. The base is only
+  // looked at (lookbehind), so a second script right after the first converts too: τ_{ij}^{2} → τᵢⱼ².
+  s = s.replace(/\\(?:frac|dfrac|tfrac|binom|sqrt|mathbb|text|mathrm|mathbf|hat|bar|tilde|overline)\s*(?:\[[^\]]*\])?(?:\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}|\\?[A-Za-z]){1,2}/g, m => texMath(m))
     .replace(/\\([a-zA-Z]+)(?![a-zA-Z])/g, (m, cmd) => cmd in TEX_SYM && cmd.length > 1 ? TEX_SYM[cmd] : m)
-    .replace(/([\p{L}\p{N})′])([_^])(\{[^{}\s]{1,30}\}|\{[^{}]{1,30}\})/gu, (m, x, op, arg) => x + texMath(op + arg));
+    .replace(/(?<=[^\s{_^$])([_^])(\{[^{}\s]{1,30}\}|\{[^{}]{1,30}\})/gu, (m, op, arg) => texMath(op + arg));
   return s;
 }
 // Applies mathText() to every string in an AI answer (objects and arrays, any depth).

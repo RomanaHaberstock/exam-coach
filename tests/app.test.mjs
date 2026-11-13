@@ -694,6 +694,17 @@ test("shows formulas from the AI as readable symbols instead of LaTeX", async ()
     [[{ text: "Estimate β₁ by OLS", src: "p. 3" }, { text: "Interpret R²", src: "" }], ["σ²", "plain"]]);
 });
 
+test("leaves dollar amounts and shell variables alone and converts every script and lost backslash", async () => {
+  const cases = await page.evaluate(() => [
+    "Firm A earns $5 and its profit π_B is $10.", "echo $PATH_VAR and $HOME", "$ x $ is not math", "τ_{ij}^{1-σ}", "X_{ij}^{2}", "\\sum_{i=1}^{n} x_i",
+    "a_{t-1} stays", "$x$ and $y$"].map(mathText));
+  assert.deepEqual(cases, ["Firm A earns $5 and its profit π_B is $10.", "echo $PATH_VAR and $HOME", "$ x $ is not math", "τᵢⱼ^(1−σ)", "Xᵢⱼ²", "∑ᵢ₌₁ⁿ x_i",
+    "aₜ₋₁ stays", "x and y"]);
+  // Commands whose backslash JSON read as \f, \t, \b, \r or \n come back; a new line before "e.g." stays.
+  const lost = await page.evaluate(() => JSON.parse(String.raw`["$\forall x$","$\tan \\alpha$","$x \ne y$","$x \neq y$","$a \bullet b$","$\\langle x, y \rangle$","$\binom{n}{k}$","Line\ne.g. $x$"]`).map(mathText));
+  assert.deepEqual(lost, ["∀ x", "tan α", "x ≠ y", "x ≠ y", "a • b", "⟨ x, y ⟩", "C(n, k)", "Line\ne.g. x"]);
+});
+
 test("adds a whole folder: lists the files with a guessed type, imports the ticked ones", async () => {
   await page.evaluate(() => { window.__savedFold = JSON.stringify(S); newExam(); go("exams"); });
   // Fallback for browsers without the folder picker: <input webkitdirectory>
