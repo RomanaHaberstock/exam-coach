@@ -67,7 +67,8 @@ No build step. Plain HTML/CSS/JS in the browser plus one Netlify Edge Function.
 ## Current status (13 Nov 2026)
 
 - Live and public on Netlify with a Gemini key.
-- The team saw "Something went wrong talking to the AI" when analysing two large PDFs (a 130-page slide deck and a 16-page old exam). Most likely cause: the 40-second Netlify limit before the first byte. Fixed by the keep-alive stream; error messages now include details. **Not yet confirmed on the live site** — the fixed files may still need to be uploaded to GitHub. If it still fails, ask for the "Details: …" text from the error message.
+- The team saw "Something went wrong talking to the AI" when analysing two large PDFs (a 130-page slide deck and a 16-page old exam). Cause: the 40-second Netlify limit before the first byte (the keep-alive fix had never been uploaded). Deployed on 13 Nov with chunked analysis; the live backend answers same-origin requests with the keep-alive stream. **Still to confirm with the real 130-page deck.** If it still fails, ask for the "Details: …" text from the error message.
+- GitHub access for Claude is set up, so changes can be pushed to `main` directly (no more manual uploads needed).
 - Tip given to the team: upload old exams with the "Old exams" type so topic weights use them.
 
 ## Ideas not built yet
