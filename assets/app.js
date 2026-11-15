@@ -296,6 +296,43 @@ async function boot() {
   render();
   checkAI();
   recheckMaterials();
+  registerSW();
+}
+/* ---------- offline app (service worker, sw.js) ---------- */
+// Only on https or localhost (browsers allow service workers nowhere else). "?nosw" in the address
+// or localStorage "examcoach-nosw" switches it off and removes an installed one (for debugging).
+// When a new version is waiting, one toast offers to reload; Reload tells the new worker to take
+// over and reloads the page once it has (controllerchange).
+let swReloading = false;
+function registerSW() {
+  const sw = navigator.serviceWorker;
+  if (!sw || !(location.protocol === "https:" || /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname))) return;
+  let off = /[?&]nosw\b/.test(location.search);
+  try { off = off || !!localStorage.getItem("examcoach-nosw"); } catch (e) {}
+  if (off) { sw.getRegistrations().then(rs => rs.forEach(r => r.unregister())).catch(() => {}); return; }
+  sw.addEventListener("controllerchange", () => { if (swReloading) location.reload(); });
+  sw.register("sw.js").then(reg => {
+    const offer = w => { if (w && sw.controller) swUpdateToast(w); };
+    if (reg.waiting) offer(reg.waiting);
+    reg.addEventListener("updatefound", () => {
+      const w = reg.installing;
+      if (w) w.addEventListener("statechange", () => { if (w.state === "installed") offer(w); });
+    });
+    // a tab left open for days still finds new deploys
+    setInterval(() => reg.update().catch(() => {}), 3600 * 1000);
+  }).catch(() => {});
+}
+function swUpdateToast(w) {
+  const t = $("#toast");
+  clearTimeout(toast.t);
+  t.innerHTML = `<span>A new version of Exam Coach is ready.</span> <button class="btn sm" id="sw-reload">Reload</button>`;
+  t.hidden = false;
+  t.onclick = async ev => {
+    if (!ev.target.closest("#sw-reload")) { t.hidden = true; return; }
+    // unsaved changes are written first (saving is debounced)
+    swReloading = true; clearTimeout(saveTimer); try { await flush(); } catch (e) {}
+    w.postMessage({ type: "skip-waiting" });
+  };
 }
 function loadLocal() { try { const raw = localStorage.getItem("examcoach"); if (raw) S = Object.assign(DEFAULTS(), JSON.parse(raw)); } catch (e) {} }
 let saveTimer = null, saving = false, dirty = false;

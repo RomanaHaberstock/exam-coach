@@ -17,7 +17,7 @@ import { handle, RETRY } from "../netlify/edge-functions/ai.js";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ORIGIN = "http://exam-coach.test";
 const CSP = fs.readFileSync(path.join(ROOT, "netlify.toml"), "utf8").match(/Content-Security-Policy = "([^"]+)"/)[1];
-const TYPES = { ".html": "text/html", ".css": "text/css", ".js": "text/javascript", ".svg": "image/svg+xml", ".woff2": "font/woff2", ".json": "application/json" };
+const TYPES = { ".html": "text/html", ".css": "text/css", ".js": "text/javascript", ".svg": "image/svg+xml", ".woff2": "font/woff2", ".json": "application/json", ".webmanifest": "application/manifest+json", ".png": "image/png" };
 
 // ---- fake Anthropic API -------------------------------------------------------
 const realFetch = globalThis.fetch;
