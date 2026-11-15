@@ -973,6 +973,8 @@ test("keeps Go lighter sessions out of the study-method comparison", async () =>
 
 test("puts repair time on a weak prerequisite first, for quizzes and mock exams", async () => {
   const r = await page.evaluate(() => {
+    // enough time every day, so the other exams' due reviews (late in the evening: all moved to tomorrow) leave room
+    const days0 = { ...S.settings.dayMinutes }; for (const k in S.settings.dayMinutes) S.settings.dayMinutes[k] = 600;
     newExam(); const e = examById(selExam); e.subject = "Algebra";
     const B = mkTopic("Fractions", 3, 2), A = mkTopic("Equations", 3, 2), U = mkTopic("Units", 3, 2), P = mkTopic("Word problems", 3, 2), G = mkTopic("Graphs", 3, 2);
     e.topics.push(B, A, U, P, G); A.prereqs = [B.id]; P.prereqs = [U.id]; G.prereqs = [B.id];
@@ -1004,7 +1006,7 @@ test("puts repair time on a weak prerequisite first, for quizzes and mock exams"
       L.forEach((b, k) => { if (!(b.topicId in first)) first[b.topicId] = k; last[b.topicId] = k; });
       return e.topics.every(t => t.prereqs.every(p => !(p in last) || !(t.id in first) || last[p] < first[t.id])); })();
     // clean up for the tests below
-    S.exams = S.exams.filter(x => x !== e); S.blocks = S.blocks.filter(b => b.examId !== e.id); selExam = null; commit();
+    S.exams = S.exams.filter(x => x !== e); S.blocks = S.blocks.filter(b => b.examId !== e.id); selExam = null; S.settings.dayMinutes = days0; commit();
     return out;
   });
   assert.match(r.quiz.detail, /Your trouble with Equations probably comes from Fractions — reviewing Fractions first\./);
