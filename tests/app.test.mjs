@@ -123,7 +123,16 @@ globalThis.fetch = async (url, init) => {
 let browser, context, page;
 const problems = [];
 
+// TEST_CLOCK=HH:MM runs the pages as if the local time were HH:MM when each page loads (the clock keeps
+// running), to check that no test depends on the time of day: e.g. TEST_CLOCK=23:55 npm test.
+const CLOCK_SHIFT = hm => {
+  const [h, m] = hm.split(":").map(Number), R = Date, t = new R(); t.setHours(h, m, 0, 0);
+  const off = t - R.now();
+  class D extends R { constructor(...a) { super(...(a.length ? a : [R.now() + off])); } static now() { return R.now() + off; } }
+  window.Date = D;
+};
 async function serve(ctx) {
+  if (process.env.TEST_CLOCK) await ctx.addInitScript(CLOCK_SHIFT, process.env.TEST_CLOCK);
   await ctx.route("**/*", async route => {
     const req = route.request(), url = new URL(req.url());
     if (url.origin !== ORIGIN) { problems.push("external request: " + url.href); return route.abort(); }
@@ -1835,7 +1844,7 @@ test("works on a 375 px phone screen", async () => {
   await p.click('[data-act="example"]');
   // every section is reachable: the tabs get their own row and none is cut off
   const nav = await p.evaluate(() => [...document.querySelectorAll("#nav button")].map(b => { const r = b.getBoundingClientRect(); return [r.left >= 0 && r.right <= innerWidth, r.width > 30]; }));
-  assert.equal(nav.length, 6);
+  assert.equal(nav.length, 7);
   assert.ok(nav.every(([inside, wide]) => inside && wide), JSON.stringify(nav));
   await p.click('#nav [data-view="history"]');
   assert.equal(await p.evaluate(() => view), "history");
@@ -1870,8 +1879,11 @@ test("colour tokens meet WCAG contrast in the light and the dark theme", async (
   const TEXT = [["ink", "bg"], ["ink", "surface"], ["ink", "sunk"], ["muted", "bg"], ["muted", "surface"], ["muted", "sunk"], ["muted", "accent-soft"],
     ["accent", "surface"], ["accent", "bg"], ["accent", "accent-soft"], ["accent-ink", "accent"], ["good", "surface"], ["good", "good-soft"],
     ["warn", "surface"], ["warn", "warn-soft"], ["bad", "surface"], ["bad", "bad-soft"], ["mark-ink", "mark-soft"], ["ink", "mark-soft"],
-    ["ink", "hl"], ["on-strong", "bad"], ["on-strong", "good"], ["bg", "ink"]];
-  const UI = [["field", "surface"], ["field", "bg"]];
+    ["ink", "hl"], ["on-strong", "bad"], ["on-strong", "good"], ["bg", "ink"],
+    // demo: example banner (alert mark), How it works diagram nodes and comparison table
+    ["accent", "mark-soft"], ["muted", "mark-soft"], ["ink", "accent-soft"], ["ink", "good-soft"]];
+  // non-text: field borders, the diagram's arrows (WCAG 1.4.11, 3:1)
+  const UI = [["field", "surface"], ["field", "bg"], ["accent", "surface"], ["mark-ink", "surface"]];
   for (const scheme of ["light", "dark"]) {
     await p.emulateMedia({ colorScheme: scheme });
     const bad = await p.evaluate(([TEXT, UI]) => {
@@ -1899,7 +1911,7 @@ test("works with the keyboard: every action is a reachable button, focus is visi
   assert.ok(ring, "the focused button shows a focus ring");
   await p.keyboard.press("Enter");
   await p.waitForFunction(() => S.exams.length === 2);
-  for (const v of ["dashboard", "plan", "exams", "quiz", "you", "history"]) {
+  for (const v of ["dashboard", "plan", "exams", "quiz", "you", "history", "how", "cards"]) {
     await p.evaluate(v => go(v), v);
     // a view change moves focus to the view's heading
     assert.match(await p.evaluate(() => document.activeElement.tagName), /^H[12]$/, v);
@@ -1971,8 +1983,13 @@ test("fits a 375 px phone on every view: no sideways scrolling, 44 px tap target
     assert.deepEqual(r.small, [], `${name}: buttons under 44 px`);
   };
   await check("first visit");
-  await p.click('[data-act="example"]');
-  for (const v of ["dashboard", "plan", "exams", "quiz", "you", "history"]) { await p.evaluate(v => go(v), v); await check(v); }
+  // the example exams with history, as in the presentation; the tour box fits too
+  await p.click('[data-act="demo"]');
+  await p.waitForSelector("#tour"); await check("tour");
+  const tour = await p.evaluate(() => { const r = $("#tour").getBoundingClientRect(), n = $("#nav").getBoundingClientRect(); return { left: r.left, right: r.right, bottom: r.bottom, navTop: n.top }; });
+  assert.ok(tour.left >= 0 && tour.right <= 375 && tour.bottom <= tour.navTop, `the tour card fits and leaves the tab bar free: ${JSON.stringify(tour)}`);
+  await p.keyboard.press("Escape");
+  for (const v of ["dashboard", "plan", "exams", "quiz", "you", "history", "how", "cards"]) { await p.evaluate(v => go(v), v); await check(v); }
   await p.evaluate(() => { busy.openSettings = true; go("plan"); }); await check("plan with settings");
   await p.evaluate(() => { studyId = S.blocks.find(b => b.type === "learn" && b.status === "planned").id; go("study"); }); await check("study");
   await p.evaluate(() => openMock(S.blocks.find(b => b.type === "mock"))); await check("mock");
@@ -1997,6 +2014,148 @@ test("fits a 375 px phone on every view: no sideways scrolling, 44 px tap target
   // reduced motion: the spinner doesn't spin
   await p.evaluate(() => { document.getElementById("main").insertAdjacentHTML("beforeend", '<span class="spinner" id="spin-test"></span>'); });
   assert.ok(parseFloat(await p.evaluate(() => getComputedStyle(document.getElementById("spin-test")).animationDuration)) < 0.01);
+  await ctx.close();
+});
+
+test("the header keeps all seven tabs, the streak and the save state on one row from tablet to desktop", async () => {
+  for (const width of [768, 1024, 1100, 1440]) {
+    const ctx = await browser.newContext({ viewport: { width, height: 800 } }); await serve(ctx); const p = await open(ctx);
+    await p.click('[data-act="demo"]'); await p.keyboard.press("Escape");
+    const r = await p.evaluate(() => {
+      const box = s => document.querySelector(s).getBoundingClientRect(), nav = document.getElementById("nav");
+      const tabs = [...nav.querySelectorAll("button")].map(b => b.getBoundingClientRect());
+      return { tabs: tabs.length, cut: nav.scrollWidth > nav.clientWidth, row: Math.max(...tabs.map(t => t.top)) - Math.min(...tabs.map(t => t.top)),
+        chipBesideNav: box("#streakchip").left >= box("#nav").right - 1 && box("#streakchip").top < box("#nav").bottom,
+        header: box(".top").height, over: document.documentElement.scrollWidth - innerWidth, chip: document.getElementById("streakchip").getAttribute("aria-label") };
+    });
+    assert.ok(r.tabs === 7 && !r.cut && r.row === 0 && r.chipBesideNav && r.header < 80 && r.over <= 0, `${width}px: ${JSON.stringify(r)}`);
+    assert.match(r.chip, /day streak/);
+    await ctx.close();
+  }
+});
+
+// ---- demo experience: example data with history, guided tour, How it works ----
+async function freshPage() {
+  const ctx = await browser.newContext();
+  await serve(ctx);
+  const posts = [];
+  ctx.on("request", r => { if (r.url().endsWith("/api/ai") && r.method() === "POST") posts.push(r.url()); });
+  return { ctx, p: await open(ctx), posts };
+}
+test("example exams load instantly with two weeks of history and no AI request", async () => {
+  const { ctx, p, posts } = await freshPage();
+  const t0 = Date.now();
+  await p.click('[data-act="demo"]');
+  await p.waitForSelector("#tour");
+  assert.ok(Date.now() - t0 < 3000, "loads without waiting");
+  const r = await p.evaluate(() => {
+    const st = S.exams[0], t = n => st.topics.find(x => x.name === n), t0 = today();
+    return { exams: S.exams.map(e => e.subject), done: S.blocks.filter(b => b.status === "done" && b.date < t0).length,
+      skipped: S.blocks.filter(b => b.status === "skipped").length, future: S.blocks.some(b => b.status === "planned" && b.date >= t0),
+      quizzed: st.topics.filter(x => x.mastery != null).map(x => x.name), prob: t("Probability basics").mastery,
+      repairToday: S.blocks.some(b => b.status === "planned" && b.label === "Repair review: Probability basics" && b.date <= addDays(t0, 1)),
+      root: S.log.find(l => /Your trouble with Random variables & distributions probably comes from Probability basics/.test(l.detail)),
+      top: S.log[0].title, logPast: S.log.every(l => l.at.slice(0, 10) <= new Date().toISOString().slice(0, 10)),
+      demoFp: S.fp.demo && S.fp.quizLog.every(q => q.demo), banner: (go("dashboard"), !!$("#demo-banner")), deck: [st.cards.length, deckStats().due, !!$("#deck [data-act=deck-start]"), st.cards.every(c => c.added <= t0 && c.due >= t0)], streak: streakInfo().current, dates: st.topics.flatMap(x => x.quizzes.map(q => q.date)) };
+  });
+  assert.equal(r.exams.length, 2);
+  assert.ok(r.done >= 20 && r.skipped === 1 && r.future, JSON.stringify(r));
+  assert.deepEqual(r.quizzed, ["Descriptive statistics", "Probability basics", "Random variables & distributions"]);
+  assert.ok(r.prob < 70, "the prerequisite is weak");
+  assert.ok(r.root, "a result below plan with the root-cause message");
+  assert.ok(r.root.changes.some(c => c.name === "Probability basics" && c.delta > 0), "the plan change shows the extra time on the prerequisite");
+  assert.match(r.top, /Random variables & distributions: 52% \(expected 80%\)/, "the newest plan change is on top");
+  assert.ok(r.repairToday, "the repair review is planned for today or tomorrow");
+  assert.ok(r.logPast && r.demoFp && r.banner && r.streak >= 10, JSON.stringify(r));
+  assert.deepEqual(r.deck, [5, 4, true, true], "missed example questions are review cards, 4 due today");
+  // every page has something to show, without the AI
+  for (const [v, re] of [["plan", /Week by week/], ["history", /probably comes from Probability basics/], ["you", /Explain it back works best for you/], ["exams", /Probability basics/]]) {
+    await p.evaluate(x => go(x), v);
+    assert.match(await p.textContent("main"), re, v);
+  }
+  // a quiz with the built-in example questions, graded on the page; the plan reacts
+  await p.evaluate(() => { const e = S.exams[0]; quiz = { examId: e.id, topicId: e.topics.find(t => t.name === "Probability basics").id, phase: "pick" }; go("quiz"); });
+  await p.click('[data-act="quiz-example"]');
+  const n = await p.locator(".panel.q").count();
+  assert.equal(n, 5);
+  for (let i = 0; i < n; i++) await p.check(`#q${i}-0`);
+  await p.click('[data-act="submit"]');
+  await p.waitForSelector("text=What the coach changed");
+  assert.match(await p.textContent("main"), /Your score · Probability basics/);
+  assert.equal(posts.length, 0, "no AI request at all");
+  // removing the example data leaves an empty start page
+  await p.evaluate(() => go("dashboard"));
+  await p.keyboard.press("Escape");
+  await p.click('[data-act="rm-example"]');
+  await p.click('[data-act="rm-example"]');
+  assert.deepEqual(await p.evaluate(() => [S.exams.length, S.blocks.length, S.fp.demo, S.fp.quizLog.length, S.log.length]), [0, 0, false, 0, 1]);
+  assert.match(await p.textContent("main"), /Try it with example exams/);
+  await ctx.close();
+});
+
+test("the example works when the AI is not available", async () => {
+  delete process.env.GEMINI_API_KEY;
+  try {
+    const { ctx, p } = await freshPage();
+    assert.equal(await p.evaluate(() => aiState), "off");
+    await p.click('[data-act="demo"]');
+    await p.keyboard.press("Escape");
+    await p.evaluate(() => { const e = S.exams[1]; quiz = { examId: e.id, topicId: e.topics[0].id, phase: "pick" }; go("quiz"); });
+    assert.ok(await p.isDisabled('[data-act="gen"]'), "AI quiz is off");
+    await p.click('[data-act="quiz-example"]');
+    for (let i = 0; i < 4; i++) await p.check(`#q${i}-1`);
+    await p.click('[data-act="submit"]');
+    await p.waitForSelector("text=What the coach changed");
+    await ctx.close();
+  } finally { process.env.GEMINI_API_KEY = "test-key"; }
+});
+
+test("guided tour: can be completed with the keyboard and skipped", async () => {
+  const { ctx, p } = await freshPage();
+  await p.click('[data-act="demo"]');
+  const seen = [];
+  for (let i = 0; i < 6; i++) {
+    await p.waitForFunction(k => $("#tour") && $("#tour").dataset.step === String(k), i);
+    const s = await p.evaluate(() => ({ view, title: $("#tour-title").textContent, focus: document.activeElement.dataset.tour, marked: !!$("#main .tour-on"), role: $("#tour").getAttribute("role") }));
+    assert.equal(s.focus, "next", "focus is on Next");
+    assert.ok(s.marked, `step ${i + 1} points at something on the page (${s.view})`);
+    assert.equal(s.role, "dialog");
+    seen.push(s.view);
+    await p.keyboard.press(i % 2 ? "Enter" : "ArrowRight");
+  }
+  assert.deepEqual(seen, ["plan", "dashboard", "quiz", "history", "you", "how"]);
+  assert.equal(await p.locator("#tour").count(), 0, "finished");
+  assert.equal(await p.locator(".tour-on").count(), 0);
+  // back, then skip with Esc and with the button
+  await p.evaluate(() => go("dashboard"));
+  await p.click('#demo-banner [data-act="tour"]');
+  await p.keyboard.press("ArrowRight");
+  await p.keyboard.press("ArrowLeft");
+  assert.equal(await p.evaluate(() => $("#tour").dataset.step), "0");
+  await p.keyboard.press("Escape");
+  assert.equal(await p.locator("#tour").count(), 0);
+  assert.deepEqual(await p.evaluate(() => [view, document.activeElement.dataset.view]), ["plan", "plan"], "focus goes to the current page's tab");
+  await p.evaluate(() => go("dashboard"));
+  await p.click('#demo-banner [data-act="tour"]');
+  await p.click('#tour [data-tour="skip"]');
+  assert.equal(await p.locator("#tour").count(), 0);
+  await ctx.close();
+});
+
+test("How it works explains the loop with a diagram and the chatbot comparison", async () => {
+  const { ctx, p } = await freshPage();
+  await p.click('#nav [data-view="how"]');
+  const r = await p.evaluate(() => ({ text: $("main").textContent, svg: !!$("#how-loop title"), nodes: document.querySelectorAll("#how-loop .hw-node").length, rows: document.querySelectorAll("#how-chatbot tbody tr").length, hash: location.hash }));
+  assert.match(r.text, /The feedback loop/);
+  assert.match(r.text, /The learning profile/);
+  assert.match(r.text, /What a chatbot can't do here/);
+  assert.ok(r.svg && r.nodes === 6 && r.rows >= 4, JSON.stringify(r));
+  assert.equal(r.hash, "#how");
+  await p.reload();
+  await p.waitForFunction(() => aiState !== "checking");
+  assert.equal(await p.evaluate(() => view), "how", "opens from its link");
+  await p.click('main [data-act="demo"]');
+  assert.equal(await p.evaluate(() => S.exams.length), 2);
   await ctx.close();
 });
 

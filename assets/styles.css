@@ -50,18 +50,28 @@ button,input,select,textarea{font:inherit; color:inherit}
   padding-block:10px; padding-left:max(16px, env(safe-area-inset-left,0px)); padding-right:max(16px, env(safe-area-inset-right,0px))}
 .brand{font-family:var(--display); font-weight:700; font-size:1.25rem; letter-spacing:-.02em; white-space:nowrap}
 .brand span{background:linear-gradient(transparent 58%, var(--hl) 58%, var(--hl) 92%, transparent 92%); padding:0 2px}
-nav{display:flex; gap:4px; overflow-x:auto; flex:1; min-width:0}
-nav button{border:0; background:none; padding:8px 12px; border-radius:8px; cursor:pointer; color:var(--muted); font-weight:500; white-space:nowrap}
+nav{display:flex; gap:2px; overflow-x:auto; flex:1; min-width:0}
+nav button{border:0; background:none; padding:8px 10px; border-radius:8px; cursor:pointer; color:var(--muted); font-weight:500; white-space:nowrap}
+/* streak chip above the save state, right-aligned: the tabs keep one row next to the brand */
+.topstat{display:grid; justify-items:end; gap:2px; flex:none}
+.topstat .savestate{font-size:.72rem}
 nav button:hover{background:var(--sunk); color:var(--ink)}
 nav button[aria-current="page"]{background:var(--accent-soft); color:var(--accent); font-weight:600}
 .savestate{font-size:.78rem; color:var(--muted); white-space:nowrap}
 nav .ico, nav .short{display:none}
-/* narrow screens: the sections become a tab bar fixed at the bottom (thumb reach, 56 px tall targets,
-   always reachable on long pages); the header shrinks to the brand and the save state */
-@media (max-width:560px){
+/* mid-size screens (tablets, small laptops): short tab names, so all seven tabs fit in one row */
+@media (min-width:768px) and (max-width:1099px){
+  .top-in{gap:12px}
+  nav .long{display:none} nav .short{display:inline}
+  nav [data-view="how"] .long{display:inline} nav [data-view="how"] .short{display:none}
+  .streakchip .keep{display:none}
+}
+/* narrow screens (phones, small tablets): the sections become a tab bar fixed at the bottom (thumb
+   reach, 56 px tall targets, always reachable on long pages); the header shrinks to the brand and the streak */
+@media (max-width:767px){
   .top-in{gap:6px 12px; padding-block:8px}
   .brand{flex:1}
-  nav{position:fixed; z-index:16; left:0; right:0; bottom:0; display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:0;
+  nav{position:fixed; z-index:16; left:0; right:0; bottom:0; display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:0;
     overflow:visible; background:var(--surface); border-top:1px solid var(--line); padding:0 env(safe-area-inset-right,0px) env(safe-area-inset-bottom,0px) env(safe-area-inset-left,0px)}
   nav button{display:grid; justify-items:center; align-content:center; gap:2px; min-height:56px; padding:6px 0; font-size:.7rem; border-radius:0; white-space:nowrap; min-width:0}
   nav button[aria-current="page"]{background:none; box-shadow:inset 0 3px 0 var(--accent)}
@@ -348,7 +358,7 @@ details.more[open] > summary{color:var(--muted)}
   #topics-table td input, #topics-table td select{width:100%; min-width:0!important}
   #topics-table td:empty{display:none}
 }
-@media (max-width:560px){
+@media (max-width:767px){
   .timer{bottom:calc(68px + env(safe-area-inset-bottom,0px))}
   .toast{bottom:calc(76px + env(safe-area-inset-bottom,0px))}
   /* room for the tab bar, and for the open timer card above it */
@@ -359,3 +369,33 @@ details.more[open] > summary{color:var(--muted)}
   .block .time{display:flex; flex-wrap:wrap; gap:0 10px}
   .block .time br{display:none}
 }
+/* Demo experience: link-style buttons, guided tour, "How it works" (assets/demo.js) */
+.linkbtn{border:0; background:none; padding:0; color:var(--accent); text-decoration:underline; cursor:pointer; font:inherit}
+.tour{position:fixed; z-index:20; right:max(16px, env(safe-area-inset-right,0px)); bottom:max(16px, env(safe-area-inset-bottom,0px)); width:min(400px, calc(100vw - 32px));
+  max-height:min(60vh, 440px); overflow:auto; display:grid; gap:10px; padding:16px 18px; background:var(--surface); color:var(--ink);
+  border:2px solid var(--accent); border-radius:var(--r); box-shadow:0 12px 40px rgba(10,16,40,.28)}
+.tour h2{font-size:1.15rem}
+.tour p{font-size:.92rem}
+.tour-dots{list-style:none; margin:0; padding:0; display:flex; gap:6px}
+.tour-dots li{width:8px; height:8px; border-radius:50%; background:var(--line)}
+.tour-dots li.on{background:var(--accent)}
+.tour-on{outline:3px solid var(--mark); outline-offset:4px; border-radius:var(--r); scroll-margin-top:90px}
+@media (max-width:767px){ .tour{bottom:calc(68px + env(safe-area-inset-bottom,0px))} }
+@media (max-width:560px){ .tour{left:8px; right:8px; width:auto; max-height:60vh} .tour-keys{display:none} }
+.how-svg{width:100%; height:auto; max-width:760px; justify-self:center}
+.how-svg .hw-node rect{fill:var(--sunk); stroke:var(--line); stroke-width:1.5}
+.how-svg .hw-node.key rect{fill:var(--accent-soft); stroke:var(--accent)}
+.how-svg .hw-node.profile rect{fill:var(--mark-soft); stroke:var(--mark)}
+.how-svg .hw-t{font:700 16px var(--display); fill:var(--ink); text-anchor:middle}
+.how-svg .hw-s{font:13px var(--body); fill:var(--muted); text-anchor:middle}
+.how-svg .hw-l{font:12px var(--body); fill:var(--muted)}
+.how-svg .hw-a{fill:none; stroke:var(--accent); stroke-width:2}
+.how-svg .hw-a.dashed{stroke:var(--mark-ink); stroke-dasharray:5 4}
+.how-svg .hw-head{fill:var(--accent)}
+.how-list{margin:0; padding-left:18px; display:grid; gap:6px}
+.how-table{min-width:560px}
+.how-table th,.how-table td{text-align:left; vertical-align:top; padding:8px 10px; border-top:1px solid var(--line); font-size:.9rem}
+.how-table thead th{border-top:0; font-size:.75rem; text-transform:uppercase; letter-spacing:.06em; color:var(--muted)}
+.how-table td:last-child{background:var(--good-soft)}
+.how-table tbody th{text-transform:none; letter-spacing:0; font-size:.9rem; color:var(--ink); font-weight:600; min-width:150px}
+

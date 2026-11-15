@@ -7,6 +7,7 @@
  * material extraction · AI backend · calendar export · example data · streaks ·
  * focus timer · learning fingerprint · fingerprint views · study sessions ·
  * post-exam review · views · events
+ * Example data with history, the guided tour and the "How it works" page are in assets/demo.js.
  */
 "use strict";
 /* ---------- helpers ---------- */
@@ -295,7 +296,7 @@ async function boot() {
   await loadState();
   normalize();
   setSave(storeMode === "idb" ? "Saved in this browser" : "Saved in this browser (limited)");
-  const h = location.hash.slice(1); if (["dashboard", "plan", "exams", "quiz", "you", "history"].includes(h)) view = h;
+  const h = location.hash.slice(1); if (["dashboard", "plan", "exams", "quiz", "you", "history", "how"].includes(h)) view = h;
   if (S.exams.length) replan();
   tmLoad();
   if ((TM.phase === "focus" || TM.phase === "short" || TM.phase === "long") && !TM.paused && Date.now() >= TM.endsAt) phaseEnd();
@@ -1912,18 +1913,23 @@ function exampleTopics(list) {
   list.forEach(([, , , pre = []], i) => { topics[i].prereqs = pre.map(n => id[n]); });
   return topics;
 }
-function loadExample() {
+// The two example exams (Statistics in 23 days, Microeconomics in 37), without any history.
+function exampleExams() {
   const t = today();
-  S.exams.push({ id: uid(), example: true, subject: "Statistics I (example)", date: addDays(t, 23), format: "written", target: 80, materials: [],
+  return [{ id: uid(), example: true, subject: "Statistics I (example)", date: addDays(t, 23), format: "written", target: 80, materials: [],
     style: "Example data: 6 tasks in 90 minutes, mostly calculations (probabilities, confidence intervals, tests) plus short definitions.",
     topics: exampleTopics([["Descriptive statistics", 2, 2], ["Probability basics", 4, 4], ["Random variables & distributions", 5, 5, ["Probability basics"]],
       ["Normal distribution & CLT", 4, 4, ["Random variables & distributions"]], ["Confidence intervals", 4, 3, ["Normal distribution & CLT"]],
-      ["Hypothesis tests", 5, 5, ["Normal distribution & CLT", "Confidence intervals"]], ["Linear regression", 3, 3, ["Descriptive statistics", "Hypothesis tests"]]]) });
-  S.exams.push({ id: uid(), example: true, subject: "Microeconomics (example)", date: addDays(t, 37), format: "multiple-choice", target: 75, materials: [],
+      ["Hypothesis tests", 5, 5, ["Normal distribution & CLT", "Confidence intervals"]], ["Linear regression", 3, 3, ["Descriptive statistics", "Hypothesis tests"]]]) },
+    { id: uid(), example: true, subject: "Microeconomics (example)", date: addDays(t, 37), format: "multiple-choice", target: 75, materials: [],
     style: "Example data: 40 multiple-choice questions, about a third with small graphs or calculations.",
     topics: exampleTopics([["Supply & demand", 3, 2], ["Elasticities", 4, 3, ["Supply & demand"]], ["Consumer theory", 4, 4], ["Production & costs", 4, 4],
-      ["Market forms", 5, 4, ["Production & costs"]], ["Market failure", 3, 3, ["Supply & demand"]]]) });
-  S.exams.forEach(normExam);
+      ["Market forms", 5, 4, ["Production & costs"]], ["Market failure", 3, 3, ["Supply & demand"]]]) }].map(normExam);
+}
+// Example exams without history ("Example exams without history" on the start page). The
+// "Try it with example exams" button loads them with two weeks of history instead (loadDemo, demo.js).
+function loadExample() {
+  S.exams.push(...exampleExams());
   selExam = S.exams[S.exams.length - 2].id;
   commit({ log: { kind: "setup", title: "Example exams added", detail: "Two example exams with sample topics, so you can try the plan and quizzes. Delete them under Exams & materials once you add your own." } });
 }
@@ -2311,6 +2317,11 @@ function lighterText(b) {
 }
 
 function loadDemoFingerprint() {
+  fillDemoFingerprint();
+  commit({ log: { kind: "profile", title: "Example fingerprint loaded", detail: "Simulated results from about five weeks of studying, so you can see how the coach adapts. Remove them on the About you page." } });
+}
+// Adds the simulated fingerprint results (each marked demo: true), without saving or re-planning.
+function fillDemoFingerprint() {
   const F = S.fp, t0 = today();
   const ret = { practice: [78, 72, 75, 71], worked: [70, 66, 73], flashcards: [63, 69, 58], explain: [88, 83, 86, 84], summary: [55, 49, 58] };
   const imm = { practice: 88, worked: 86, flashcards: 81, explain: 89, summary: 83 };
@@ -2338,15 +2349,17 @@ function loadDemoFingerprint() {
   if (!F.profile) F.profile = { uses: ["summary", "flashcards"], believe: "summary", sharpest: "morning", exclude: [], experiment: true, demo: true };
   F.demo = true;
   clearUnstartedMethods();
-  commit({ log: { kind: "profile", title: "Example fingerprint loaded", detail: "Simulated results from about five weeks of studying, so you can see how the coach adapts. Remove them on the About you page." } });
 }
 function removeDemoFingerprint() {
+  clearDemoFingerprint();
+  commit({ log: { kind: "profile", title: "Example fingerprint removed", detail: "The coach now uses only your own results." } });
+}
+function clearDemoFingerprint() {
   const F = S.fp;
   for (const k of ["quizLog", "sessions", "conf", "enjoy", "energy"]) F[k] = F[k].filter(x => !x.demo);
   F.demoRealism = null; F.demo = false;
   if (F.profile && F.profile.demo) F.profile = null;
   clearUnstartedMethods();
-  commit({ log: { kind: "profile", title: "Example fingerprint removed", detail: "The coach now uses only your own results." } });
 }
 function saveProfile() {
   const val = n => [...document.querySelectorAll(`input[name="${n}"]:checked`)].map(x => x.value);
@@ -3123,7 +3136,7 @@ const detailText = d => d ? [d.covers.length ? "Covers: " + d.covers.map(g => g.
 // Short note on what this does that a one-off chatbot plan doesn't (empty state and Plan page).
 function chatbotNote() {
   return `<details class="small" id="why"><summary>Why not just ask a chatbot for a plan?</summary>
-    <p class="muted" style="max-width:70ch">A chatbot writes a plan once and then forgets it. Exam Coach keeps your plan and your results. After every quiz it compares your score with where you should be by now and changes the plan by itself (see Plan changes). It puts spaced reviews and 2-day retention checks at the right time, and it measures which study methods work for you instead of guessing.</p></details>`;
+    <p class="muted" style="max-width:70ch">A chatbot writes a plan once and then forgets it. Exam Coach keeps your plan and your results. After every quiz it compares your score with where you should be by now and changes the plan by itself (see Plan changes). It puts spaced reviews and 2-day retention checks at the right time, and it measures which study methods work for you instead of guessing. <button class="linkbtn" data-view="how">How it works</button></p></details>`;
 }
 function vEmpty() {
   return `<section class="panel hero">
@@ -3135,7 +3148,8 @@ function vEmpty() {
       <li><b>Get your plan right away</b><span class="muted small">Week by week, and for each study block: which pages, what to do and what you should have at the end.</span></li>
       <li><b>Quiz yourself after each block</b><span class="muted small">If you score below where the plan expects you to be, it adds study time and moves blocks around, and tells you why.</span></li>
     </ol>
-    <div class="row"><button class="btn primary" data-act="new-exam">Add your first exam</button><button class="btn" data-act="example">Try it with example exams</button></div>
+    <div class="row"><button class="btn primary" data-act="new-exam">Add your first exam</button><button class="btn" data-act="demo">Try it with example exams</button><button class="btn ghost sm" data-act="example">Example exams without history</button></div>
+    <p class="small muted">The example comes with two weeks of made-up quizzes and plan changes and a short tour. It needs no AI. Or read <button class="linkbtn" data-view="how">how it works</button> first.</p>
     ${S.archive.length ? `<p class="small">Welcome back. Your learning profile from ${S.archive.length === 1 ? "last semester" : "earlier semesters"} is kept, so your new plan starts from what already worked for you.</p>` : ""}
     <p class="small muted">Your plan and materials are saved in this browser only. Nobody else can see them. Download a backup under Plan if you want to move to another device.</p>
     ${chatbotNote()}
@@ -3230,6 +3244,7 @@ function vDashboard() {
   return `
   ${pending.length ? `<section class="alert mark"><div class="section-head"><h3>Did you do these?</h3><span class="small">${pending.length} block${pending.length > 1 ? "s" : ""} from earlier days. Missed blocks get rescheduled.</span></div><div class="blocks">${pending.slice(0, 6).map(b => blockRow(b, { showDate: true, detail: false })).join("")}</div></section>` : ""}
   ${short.map(e => `<section class="alert bad"><b>Not enough time for ${esc(e.subject)}</b><span class="small">${hrs(S.shortfall[e.id])} of learning doesn't fit before ${fmtDay(e.date)}. Add study hours under Plan → Availability, or lower the effort of less important topics.</span></section>`).join("")}
+  ${demoBanner()}
   ${reviewPrompts()}
   ${rateCard()}
   ${nowCard()}
@@ -3446,7 +3461,7 @@ function vQuiz() {
   const e = examById(quiz.examId);
   if (!topicById(e, quiz.topicId)) quiz.topicId = ([...e.topics].sort((a, b) => (a.mastery ?? -1) - (b.mastery ?? -1))[0] || {}).id;
   const t = topicById(e, quiz.topicId);
-  const picker = `<section class="panel stack">
+  const picker = `<section class="panel stack" id="quiz-pick">
     <h2>Quiz yourself</h2>
     <div class="fields">
       <label class="field"><span>Exam</span><select id="q-exam" data-q="exam" ${["loading", "grading"].includes(quiz.phase) ? "disabled" : ""}>${withTopics.map(x => `<option value="${x.id}" ${x.id === e.id ? "selected" : ""}>${esc(x.subject)}</option>`).join("")}</select></label>
@@ -3456,6 +3471,7 @@ function vQuiz() {
     ${kindBanner(t)}
     ${t && t.weakConcepts && t.weakConcepts.length ? `<p class="small"><span class="label">Will focus on</span> ${t.weakConcepts.map(esc).join(" · ")}</p>` : ""}
     <div class="row"><button class="btn primary" data-act="gen" ${sample && !["loading", "grading"].includes(quiz.phase) ? "" : "disabled"}>${quiz.phase === "done" ? "New quiz" : "Generate quiz"}</button>
+    ${exampleQuizButton(e, t)}
     ${!sample ? `<span class="small muted">${aiOffMsg()}</span>` : `<span class="small muted">Questions come from your materials${e.materials.length ? "" : " (none uploaded, so general questions)"} in the style of your old exams.</span>`}</div>
   </section>`;
   let body = "";
@@ -3750,7 +3766,7 @@ let lastBusyText = "", changedEl = null, lastTab = { at: 0, back: false };
 document.addEventListener("keydown", ev => { if (ev.key === "Tab") lastTab = { at: Date.now(), back: ev.shiftKey }; }, true);
 function render() {
   document.querySelectorAll("#nav button").forEach(b => b.setAttribute("aria-current", b.dataset.view === view ? "page" : "false"));
-  const v = { dashboard: vDashboard, plan: vPlan, exams: vExams, quiz: vQuiz, you: vYou, study: vStudy, mock: vMock, practice: vPractice, history: vHistory, cards: vCards }[view] || vDashboard;
+  const v = { dashboard: vDashboard, plan: vPlan, exams: vExams, quiz: vQuiz, you: vYou, study: vStudy, mock: vMock, practice: vPractice, history: vHistory, cards: vCards, how: vHow }[view] || vDashboard;
   // a change event (fired while Tab moves on from a field) re-renders before the focus lands: keep the field as the anchor
   let key = focusKey(document.activeElement), moveOn = 0;
   if (key == null && changedEl) { key = focusKey(changedEl); moveOn = Date.now() - lastTab.at < 500 ? (lastTab.back ? -1 : 1) : 0; }
@@ -3773,10 +3789,14 @@ function render() {
   const st = streakInfo(), chip = $("#streakchip");
   chip.hidden = !S.exams.length && !st.current;
   chip.className = "streakchip" + (st.current ? "" : " off");
-  chip.textContent = st.current ? `${st.current}-day streak${st.today ? "" : " · keep it today"}` : "No streak yet";
+  // the reminder part is hidden on mid-size screens (header room) but stays in the button's name
+  chip.innerHTML = st.current ? `${st.current}-day streak${st.today ? "" : `<span class="keep"> · keep it today</span>`}` : "No streak yet";
+  chip.setAttribute("aria-label", chip.textContent);
   renderTimer();
+  tourAfterRender();
 }
 function focusHeading() {
+  if (document.activeElement && document.activeElement.closest("#tour")) return; // the guided tour keeps the focus on its card
   const h = $("#main").querySelector("h1, h2");
   if (!h) return $("#main").focus({ preventScroll: true });
   h.setAttribute("tabindex", "-1"); h.focus({ preventScroll: true });
@@ -3785,7 +3805,7 @@ function go(v) { if (v !== "study") micStop(); view = v; confirmKey = null; try 
 
 /* ---------- events ---------- */
 $("#nav").addEventListener("click", ev => { const b = ev.target.closest("button[data-view]"); if (b) go(b.dataset.view); });
-window.addEventListener("hashchange", () => { const h = location.hash.slice(1); if (h && h !== view && ["dashboard", "plan", "exams", "quiz", "you", "history"].includes(h)) go(h); });
+window.addEventListener("hashchange", () => { const h = location.hash.slice(1); if (h && h !== view && ["dashboard", "plan", "exams", "quiz", "you", "history", "how"].includes(h)) go(h); });
 $("#main").addEventListener("click", async ev => {
   const nv = ev.target.closest("[data-view]"); if (nv) return go(nv.dataset.view);
   const el = ev.target.closest("[data-act]"); if (!el) return;
@@ -4010,4 +4030,5 @@ $("#main").addEventListener("drop", ev => {
 });
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden" && dirty) flush(); });
 
-boot();
+// assets/demo.js (loaded after this file) adds the example history, the tour and "How it works"; start once both are in.
+if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot); else boot();
