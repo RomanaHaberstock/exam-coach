@@ -321,3 +321,5 @@ details.panel > summary{font-family:var(--display)}
 .how-table thead th{border-top:0; font-size:.75rem; text-transform:uppercase; letter-spacing:.06em; color:var(--muted)}
 .how-table td:last-child{background:var(--good-soft)}
 .how-table tbody th{text-transform:none; letter-spacing:0; font-size:.9rem; color:var(--ink); font-weight:600; min-width:150px}
+/* wide screens: the tabs never get cut off; the streak chip and save state move to a second row instead */
+@media (min-width:1000px){ nav{flex:1 0 auto} }

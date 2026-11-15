@@ -282,13 +282,13 @@ function howDiagram() {
     ${node(260, 20, 200, "2 · Study a block", "pages, method, goal")}
     ${node(500, 20, 200, "3 · Quiz", "from your materials")}
     ${node(500, 170, 200, "4 · Compare", "score vs. expected by now")}
-    ${node(140, 170, 220, "5 · Change the plan", "more time, repair review", "key")}
+    ${node(140, 170, 200, "5 · Change the plan", "more time, repair review", "key")}
     ${node(20, 292, 680, "Learning profile", "which methods work for you · how fast you forget · when you're sharpest", "profile")}
     ${arrow("M220 53 L256 53")}${arrow("M460 53 L496 53")}${arrow("M600 86 L600 166")}
-    ${arrow("M500 203 L364 203")}${arrow("M200 170 C 200 130, 120 130, 120 90")}
+    ${arrow("M500 203 L344 203")}${arrow("M200 170 C 200 130, 120 130, 120 90")}
     ${arrow("M640 236 L640 288", true)}${arrow("M250 288 L250 240", true)}
-    ${lab(432, 194, "more than 10 points below")}
-    ${lab(152, 128, "rebuilt from today", "end")}
+    ${lab(422, 194, "10+ points below")}
+    ${lab(128, 146, "rebuilt from today", "end")}
     ${lab(648, 268, "every result", "start")}
     ${lab(258, 268, "methods, review gaps", "start")}
   </svg>`;
