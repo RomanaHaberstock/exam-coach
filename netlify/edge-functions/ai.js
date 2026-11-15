@@ -60,7 +60,7 @@ const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, 
 const sseHeaders = { "content-type": "text/event-stream", "cache-control": "no-store", "x-accel-buffering": "no" };
 const event = obj => `data: ${JSON.stringify(obj)}\n\n`;
 // `fallback`: the quick model was tried too and didn't help (the page says so).
-const errorEvent = (code, message = "", fallback = false) => event({ type: "error", error: { type: code, message: String(message).slice(0, 300), ...(fallback ? { fallback: true } : {}) } });
+const errorEvent = (code, message = "", fallback = false, retryS = 0) => event({ type: "error", error: { type: code, message: String(message).slice(0, 300), ...(fallback ? { fallback: true } : {}), ...(retryS ? { retryS } : {}) } });
 
 // CPU budget: Netlify stops an edge function that uses more than 50 ms of CPU time per request
 // (waiting for the AI doesn't count), and the page then only sees the connection break off.
@@ -120,8 +120,9 @@ export async function handle(request, context) {
   const opts = { maxTokens: clampTokens(body.maxTokens), think: body.think === "default" ? "default" : "low" };
   const prefix = prov === "gemini" ? "GEMINI" : "ANTHROPIC";
   const modelFor = t => env(t === "quick" ? `${prefix}_MODEL_QUICK` : `${prefix}_MODEL`) || DEFAULT_MODELS[prov][t];
-  // The model asked for, then the quick model as a fallback when the first stays busy.
-  const models = [...new Set([modelFor(tier), modelFor("quick")])];
+  // The model asked for, then the other one as a fallback when the first stays busy or its quota
+  // is used up (free-tier quotas are per model): default → quick, quick → default.
+  const models = [...new Set([modelFor(tier), modelFor(tier === "quick" ? "default" : "quick")])];
 
   return streamResponse((send, signal) => prov === "gemini" ? runGemini(send, key, models, prompt, signal, opts) : runAnthropic(send, key, models, prompt, signal, opts));
 }
@@ -281,10 +282,20 @@ async function pipe(res, onText, signal) {
   onText(dec.decode());
 }
 
+// A quota error says when to try again ("Please retry in 41.7s."; Gemini also sends RetryInfo
+// "retryDelay": "41s"). Passed to the page as `retryS`, so its banner can say when the AI works again.
+export function retryAfter(status, text, headers) {
+  if (status !== 429 && status !== 503) return 0;
+  const h = headers && headers.get && Number(headers.get("retry-after"));
+  const m = /retry in\s+([\d.]+)\s*s/i.exec(text) || /"retryDelay"\s*:\s*"([\d.]+)s"/.exec(text);
+  const s = m ? +m[1] : h > 0 ? h : 0;
+  return s > 0 ? Math.min(86400, Math.ceil(s)) : 0;
+}
 async function sendError(send, name, res, fallbackTried) {
-  const msg = await readError(res);
-  console.log(`Exam Coach AI error: ${name} ${res.status} ${msg}${fallbackTried ? " (the quick model was tried too)" : ""}`);
-  send(errorEvent(errorCode(res.status, msg), `${statusLabel(res.status)}: ${msg}`, fallbackTried));
+  let raw = ""; try { raw = await res.clone().text(); } catch (e) {}
+  const msg = await readError(res), retryS = retryAfter(res.status, raw, res.headers);
+  console.log(`Exam Coach AI error: ${name} ${res.status} ${msg}${fallbackTried ? " (the other model was tried too)" : ""}`);
+  send(errorEvent(errorCode(res.status, msg), `${statusLabel(res.status)}: ${msg}`, fallbackTried, retryS));
 }
 
 // ---- Anthropic: its stream already has the format the page reads -------------------

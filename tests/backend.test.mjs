@@ -129,11 +129,11 @@ test("Gemini: falls back to the quick model once when the default stays busy", a
   assert.equal(err.type, "busy", "a failing fallback doesn't hide that the service is busy");
   assert.match(err.message, /^503 unavailable: The model is overloaded/);
 
-  // a quick request has no other model to fall back to
+  // a quick request falls back to the default model (its own quota on the free tier)
   calls = 0; models.length = 0;
   next = () => { models.push(modelOf(lastCall.url)); return busy503(); };
   assert.equal((await lastError(await post({ prompt: "x", tier: "quick" }))).type, "busy");
-  assert.deepEqual(models, Array(4).fill("gemini-3.5-flash-lite"), "no fallback to the same model");
+  assert.deepEqual(models, [...Array(4).fill("gemini-3.5-flash-lite"), "gemini-3.8-flash"], "quick model 4 tries, then the default once");
 
   // the same when GEMINI_MODEL_QUICK is set to the default model
   calls = 0; models.length = 0; process.env.GEMINI_MODEL_QUICK = "gemini-3.8-flash";
@@ -170,12 +170,17 @@ test("falls back to the quick model once when the default model's quota is used 
     assert.match(err.message, /^429 rate limit: You exceeded your current quota/);
     assert.ok(logs.some(l => /gemini-3\.5-flash-lite answered 429 too/.test(l)));
 
-    // a quick request has no other model: no fallback flag
+    // a quick request (short-answer grading) falls back to the default model the same way
     models.length = 0;
     const quick = await lastError(await post({ prompt: "x", tier: "quick" }));
-    assert.deepEqual(models, ["gemini-3.5-flash-lite"]);
+    assert.deepEqual(models, ["gemini-3.5-flash-lite", "gemini-3.8-flash"]);
     assert.equal(quick.type, "rate_limited");
-    assert.equal(quick.fallback, undefined);
+    assert.equal(quick.fallback, true);
+    // with only one model configured there is nothing to fall back to
+    models.length = 0; process.env.GEMINI_MODEL_QUICK = "gemini-3.8-flash";
+    const one = await lastError(await post({ prompt: "x" }));
+    assert.deepEqual(models, ["gemini-3.8-flash"]);
+    assert.equal(one.fallback, undefined);
   } finally { console.log = log; }
 });
 
@@ -414,4 +419,25 @@ test("limits requests and wrong access codes per client", async () => {
   assert.deepEqual(await plain.json(), { ok: true, provider: "gemini", needsCode: true, codeOk: false });
   assert.equal((await (await get({ "x-access-code": "secret" }, { ip: "9.9.9.9" })).json()).codeOk, true);
   assert.equal((await (await get({ "x-access-code": "secre" }, { ip: "9.9.9.9" })).json()).codeOk, false, "a prefix of the code is wrong");
+});
+
+test("passes the provider's retry time of a quota error on to the page (retryS)", async () => {
+  process.env.GEMINI_API_KEY = "g";
+  const body = { error: { code: 429, message: "You exceeded your current quota, please check your plan and billing details. Please retry in 41.7s.",
+    details: [{ "@type": "type.googleapis.com/google.rpc.RetryInfo", retryDelay: "41s" }] } };
+  const log = console.log; console.log = () => {};
+  try {
+    next = () => new Response(JSON.stringify(body), { status: 429 });
+    const err = await lastError(await post({ prompt: "x" }));
+    assert.equal(err.type, "rate_limited");
+    assert.equal(err.retryS, 42);
+    // only the RetryInfo detail, or a Retry-After header
+    next = () => new Response(JSON.stringify({ error: { code: 429, message: "Quota", details: [{ retryDelay: "7s" }] } }), { status: 429 });
+    assert.equal((await lastError(await post({ prompt: "x" }))).retryS, 7);
+    next = () => new Response('{"error":{"code":503,"message":"overloaded"}}', { status: 503, headers: { "retry-after": "30" } });
+    assert.equal((await lastError(await post({ prompt: "x" }))).retryS, 30);
+    // no time given: no retryS
+    next = () => new Response('{"error":{"code":429,"message":"Quota"}}', { status: 429 });
+    assert.equal((await lastError(await post({ prompt: "x" }))).retryS, undefined);
+  } finally { console.log = log; }
 });

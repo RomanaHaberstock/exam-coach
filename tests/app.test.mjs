@@ -5,7 +5,7 @@
 //
 // Run: npm test   (first time: npm install && npx playwright install chromium)
 
-import { test, before, after } from "node:test";
+import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -147,6 +147,9 @@ async function open(ctx) {
   p.on("console", m => { if (m.type() === "error") problems.push("console: " + m.text()); });
   await p.goto(ORIGIN + "/");
   await p.waitForFunction(() => typeof aiState !== "undefined" && aiState !== "checking");
+  // Most tests check what happens on the way to the AI: no saved answers, no question bank
+  // (the tests of saved answers turn this on again).
+  await p.evaluate(() => { AIC.off = true; });
   return p;
 }
 
@@ -161,6 +164,8 @@ before(async () => {
   page = await open(context);
 });
 after(async () => { await browser?.close(); globalThis.fetch = realFetch; });
+// A failed request marks the AI as unavailable for a while (aiDown); each test starts with it reachable.
+beforeEach(async () => { if (page) await page.evaluate(() => { aiDown = null; }).catch(() => {}); });
 
 // ---- tests ---------------------------------------------------------------------
 test("loads with the AI backend connected", async () => {
@@ -187,6 +192,7 @@ test("builds a plan from the example exams and keeps it after a reload", async (
   await page.evaluate(() => { S.exams[0].mode = "top"; commit({ plan: true }); });
   await page.waitForTimeout(1200); // saving is debounced
   await page.reload();
+  await page.evaluate(() => { AIC.off = true; });
   await page.waitForFunction(() => aiState !== "checking");
   assert.equal(await page.evaluate(() => S.exams.length), 2);
 });
@@ -248,7 +254,8 @@ test("reads an uploaded PDF and turns it into topics", async () => {
   const text = await page.evaluate(() => getMaterial(S.exams[0].materials[0].id));
   assert.match(text, /Type I error/);
   await page.click('[data-act="analyze"]');
-  await page.waitForFunction(() => S.exams[0].topics.some(t => t.name === "Hypothesis tests"));
+  // (the example exam has a "Hypothesis tests" topic too, so wait for the analysis itself)
+  await page.waitForFunction(() => !busy.analyze && S.exams[0].topics.length === 2 && S.exams[0].topics.some(t => t.name === "Hypothesis tests"));
   assert.deepEqual(await page.evaluate(() => S.exams[0].topics.map(t => t.weight)), [5, 3]);
   assert.deepEqual(await page.evaluate(() => S.exams[0].oldTasks.map(x => [x.label, topicById(S.exams[0], x.topicId).name, x.points])),
     [["Task 1", "Hypothesis tests", 30], ["Task 2", "Linear regression", 20]]);
@@ -523,7 +530,7 @@ test("splits long materials into parts, shows progress and merges the topics", a
 test("merges prerequisite links across parts and drops unknown topics and cycles", async () => {
   const id = await examWithMaterials([{ name: "slides.pdf", kind: "slides", text: longMaterial() }, { name: "old.pdf", kind: "oldexam", text: oldExamText() }]);
   upstream.prompts = [];
-  await page.evaluate(id => analyzeMaterials(examById(id)), id);
+  await page.evaluate(id => { aiDown = null; return analyzeMaterials(examById(id)); }, id);
   const parts = upstream.prompts.filter(p => /This is part \d of 3/.test(p));
   assert.ok(parts.every(p => p.includes('"buildsOn"')), "every part asks for prerequisite links");
   assert.match(parts[2], /from this part or the topics found in earlier parts/);
@@ -534,7 +541,7 @@ test("merges prerequisite links across parts and drops unknown topics and cycles
   assert.match(await page.evaluate(() => S.log[0].detail), /found 2 links between topics/);
   // a link the student set by hand survives re-analysis
   await page.evaluate(id => { const e = examById(id), s = e.topics.find(t => t.name === "Sampling"); s.prereqs = [e.topics.find(t => t.name === "Regression models").id]; s.prereqsSet = true; }, id);
-  await page.evaluate(id => analyzeMaterials(examById(id)), id);
+  await page.evaluate(id => { aiDown = null; return analyzeMaterials(examById(id)); }, id);
   const again = await page.evaluate(id => { const e = examById(id); return Object.fromEntries(e.topics.map(t => [t.name, t.prereqs.map(p => topicById(e, p).name)])); }, id);
   assert.deepEqual(again.Sampling, ["Regression models"]);
   assert.deepEqual(again["Hypothesis tests"], [], "the AI's link that would now close a loop is dropped");
@@ -544,7 +551,7 @@ test("collects old-exam tasks from the parts when a long old exam is split", asy
   const bigOld = Array.from({ length: 30 }, (_, i) => `\n=== p. ${i + 1} ===\nTask ${i + 1}: test H0 against H1. ` + "Compute the p-value. ".repeat(140)).join("");
   const id = await examWithMaterials([{ name: "slides.pdf", kind: "slides", text: longMaterial() }, { name: "big-old.pdf", kind: "oldexam", text: bigOld }]);
   upstream.prompts = [];
-  await page.evaluate(id => analyzeMaterials(examById(id)), id);
+  await page.evaluate(id => { aiDown = null; return analyzeMaterials(examById(id)); }, id);
   const parts = upstream.prompts.filter(p => /This is part \d of \d/.test(p));
   assert.ok(parts.length > 2 && !parts.every(p => p.includes("OLD EXAM: big-old.pdf")), "the old exam is split, not put into every part");
   assert.match(parts.find(p => p.includes("OLD EXAM")), /tasks of the most recent old exam that are in this part/);
@@ -557,7 +564,7 @@ test("collects old-exam tasks from the parts when a long old exam is split", asy
 test("tries again with smaller parts when a request is too large", async () => {
   const id = await examWithMaterials([{ name: "slides.pdf", kind: "slides", text: longMaterial() }, { name: "old.pdf", kind: "oldexam", text: oldExamText() }]);
   upstream.prompts = []; upstream.maxPrompt = 50000;
-  await page.evaluate(id => analyzeMaterials(examById(id)), id);
+  await page.evaluate(id => { aiDown = null; return analyzeMaterials(examById(id)); }, id);
   upstream.maxPrompt = 0;
   assert.ok(upstream.prompts[0].length > 50000, "first try used large parts");
   const retried = upstream.prompts.slice(1);
@@ -583,7 +590,7 @@ test("waits and tries a busy part again, and resumes from the failed part later"
   // part 2 stays busy: the parts read so far are kept and Analyse continues from part 2
   await page.evaluate(id => { const e = examById(id); e.topics = []; }, id);
   upstream.prompts = []; upstream.failWhen = p => partOf(p) === 2;
-  await page.evaluate(id => analyzeMaterials(examById(id)), id);
+  await page.evaluate(id => { aiDown = null; return analyzeMaterials(examById(id)); }, id);
   assert.deepEqual([...new Set(upstream.prompts.map(partOf))], [1, 2], "part 3 isn't read after part 2 failed");
   assert.equal(upstream.prompts.filter(p => partOf(p) === 2).length, 15, "3 tries by the page, 5 requests each by the backend");
   const msg = await page.textContent("#toast");
@@ -592,7 +599,7 @@ test("waits and tries a busy part again, and resumes from the failed part later"
   assert.doesNotMatch(msg, /gemini|google|netlify/i);
   assert.equal(await page.evaluate(id => examById(id).topics.length, id), 0);
   upstream.prompts = []; upstream.failWhen = null;
-  await page.evaluate(id => analyzeMaterials(examById(id)), id);
+  await page.evaluate(id => { aiDown = null; return analyzeMaterials(examById(id)); }, id);
   assert.deepEqual(upstream.prompts.map(partOf), [2, 3], "resumes with part 2, part 1 isn't read again");
   assert.match(upstream.prompts[0], /Topics found in earlier parts: Hypothesis tests; Sampling/, "knows the topics of part 1");
   const e = await page.evaluate(id => { const e = examById(id); return e.topics.map(t => [t.name, t.effortH]); }, id);
@@ -600,10 +607,10 @@ test("waits and tries a busy part again, and resumes from the failed part later"
 
   // changed materials: no resume, all parts are read again
   upstream.prompts = []; upstream.failWhen = p => partOf(p) === 2;
-  await page.evaluate(id => analyzeMaterials(examById(id)), id);
+  await page.evaluate(id => { aiDown = null; return analyzeMaterials(examById(id)); }, id);
   upstream.failWhen = null; upstream.prompts = [];
   await page.evaluate(async id => { const e = examById(id), m = e.materials[0]; await putMaterial(m.id, { name: m.name, kind: m.kind, text: (await getMaterial(m.id)) + " more" }); }, id);
-  await page.evaluate(id => analyzeMaterials(examById(id)), id);
+  await page.evaluate(id => { aiDown = null; return analyzeMaterials(examById(id)); }, id);
   assert.deepEqual(upstream.prompts.map(partOf), [1, 2, 3]);
   await page.evaluate(() => { ANALYZE_BUSY.waitS = 20; });
 });
@@ -632,12 +639,12 @@ test("tries a part whose connection broke off again in smaller parts, and resume
   // it keeps breaking off: the parts read so far are kept, and Analyse continues in smaller parts
   await page.evaluate(id => { examById(id).topics = []; }, id);
   upstream.prompts = []; upstream.cutWhen = p => /This is part (2 of 3|[2-9] of 7)/.test(p);
-  await page.evaluate(id => analyzeMaterials(examById(id)), id);
+  await page.evaluate(id => { aiDown = null; return analyzeMaterials(examById(id)); }, id);
   assert.deepEqual(upstream.prompts.map(partOf), ["1/3", "2/3", "2/7", "2/7"], "one try with the big part, two with the smaller one");
   const msg = await page.textContent("#toast");
   assert.match(msg, /^The connection to the AI broke off\. Your work is kept — try again\. The AI already read part 1 of 7\. Press Analyse again to continue with part 2\./);
   upstream.prompts = []; upstream.cutWhen = null;
-  await page.evaluate(id => analyzeMaterials(examById(id)), id);
+  await page.evaluate(id => { aiDown = null; return analyzeMaterials(examById(id)); }, id);
   assert.deepEqual(upstream.prompts.map(partOf), ["2/7", "3/7", "4/7", "5/7", "6/7", "7/7"], "resumes with the smaller parts");
   assert.deepEqual(await page.evaluate(id => examById(id).topics.map(t => t.name), id), ["Hypothesis tests", "Sampling", "Regression models"]);
 
@@ -1482,10 +1489,13 @@ test("shows what went wrong when the AI fails", async () => {
   upstream.fail = 429; upstream.models = [];
   const limit = await page.evaluate(async () => { try { await AI.json("x"); return "no error"; } catch (e) { return aiError(e); } });
   assert.deepEqual(upstream.models, ["gemini-3.8-flash", "gemini-3.5-flash-lite"]);
+  upstream.models = [];
   const quick = await page.evaluate(async () => { try { await AI.json("x", { modelTier: "quick" }); return "no error"; } catch (e) { return aiError(e); } });
   upstream.fail = null;
   assert.match(limit, /^The free AI quota is used up for now \(a quicker backup model was tried too\)\. Your work is kept/);
-  assert.match(quick, /usage limit is reached/, "no backup model for a quick request");
+  assert.deepEqual(upstream.models, ["gemini-3.5-flash-lite", "gemini-3.8-flash"], "a quick request falls back to the default model");
+  assert.match(quick, /backup model was tried too/);
+  await page.evaluate(() => { aiDown = null; });
 
   // the connection breaks off half-way through the answer (reset, or a stream that just stops)
   const broken = await page.evaluate(async () => {
@@ -1509,6 +1519,7 @@ test("shows what went wrong when the AI fails", async () => {
 test("asks for the access code when one is set", async () => {
   process.env.ACCESS_CODE = "study-group";
   await page.reload();
+  await page.evaluate(() => { AIC.off = true; });
   await page.waitForFunction(() => aiState !== "checking");
   assert.equal(await page.evaluate(() => aiState), "code");
   await page.fill("#ai-code", "study-group");
@@ -1520,6 +1531,7 @@ test("asks for the access code when one is set", async () => {
 test("explains when the backend has no API key", async () => {
   delete process.env.GEMINI_API_KEY;
   await page.reload();
+  await page.evaluate(() => { AIC.off = true; });
   await page.waitForFunction(() => aiState !== "checking");
   assert.equal(await page.evaluate(() => aiState), "off");
   process.env.GEMINI_API_KEY = "test-key";
@@ -1691,7 +1703,7 @@ test("works on a 375 px phone screen", async () => {
 
 test("makes no requests to other servers and has no errors", () => {
   assert.ok(upstream.calls >= 4, "the AI backend was called");
-  assert.ok(upstream.answered.every(m => m === "gemini-3.8-flash"), "uses the default Gemini model");
-  assert.ok(upstream.models.every(m => m === "gemini-3.8-flash" || m === "gemini-3.5-flash-lite"), "the quick model only as a fallback when the default is busy");
+  assert.ok(upstream.answered.includes("gemini-3.8-flash"), "uses the default Gemini model");
+  assert.ok(upstream.models.every(m => m === "gemini-3.8-flash" || m === "gemini-3.5-flash-lite"), "only the two configured models");
   assert.deepEqual(problems, []);
 });
