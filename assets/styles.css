@@ -293,3 +293,31 @@ hr.sep{border:0; border-top:1px solid var(--line); margin:6px 0; width:100%}
 .setup li.done{opacity:.7}
 .setup li.next{background:var(--accent-soft); outline:2px solid var(--accent)}
 details.panel > summary{font-family:var(--display)}
+/* Demo experience: link-style buttons, guided tour, "How it works" (assets/demo.js) */
+.linkbtn{border:0; background:none; padding:0; color:var(--accent); text-decoration:underline; cursor:pointer; font:inherit}
+.tour{position:fixed; z-index:20; right:max(16px, env(safe-area-inset-right,0px)); bottom:max(16px, env(safe-area-inset-bottom,0px)); width:min(400px, calc(100vw - 32px));
+  max-height:min(60vh, 440px); overflow:auto; display:grid; gap:10px; padding:16px 18px; background:var(--surface); color:var(--ink);
+  border:2px solid var(--accent); border-radius:var(--r); box-shadow:0 12px 40px rgba(10,16,40,.28)}
+.tour h2{font-size:1.15rem}
+.tour p{font-size:.92rem}
+.tour-dots{list-style:none; margin:0; padding:0; display:flex; gap:6px}
+.tour-dots li{width:8px; height:8px; border-radius:50%; background:var(--line)}
+.tour-dots li.on{background:var(--accent)}
+.tour-on{outline:3px solid var(--mark); outline-offset:4px; border-radius:var(--r); scroll-margin-top:90px}
+@media (max-width:560px){ .tour{left:8px; right:8px; bottom:8px; width:auto; max-height:46vh} .tour-keys{display:none} }
+.how-svg{width:100%; height:auto; max-width:760px; justify-self:center}
+.how-svg .hw-node rect{fill:var(--sunk); stroke:var(--line); stroke-width:1.5}
+.how-svg .hw-node.key rect{fill:var(--accent-soft); stroke:var(--accent)}
+.how-svg .hw-node.profile rect{fill:var(--mark-soft); stroke:var(--mark)}
+.how-svg .hw-t{font:700 16px var(--display); fill:var(--ink); text-anchor:middle}
+.how-svg .hw-s{font:13px var(--body); fill:var(--muted); text-anchor:middle}
+.how-svg .hw-l{font:12px var(--body); fill:var(--muted)}
+.how-svg .hw-a{fill:none; stroke:var(--accent); stroke-width:2}
+.how-svg .hw-a.dashed{stroke:var(--mark-ink); stroke-dasharray:5 4}
+.how-svg .hw-head{fill:var(--accent)}
+.how-list{margin:0; padding-left:18px; display:grid; gap:6px}
+.how-table{min-width:560px}
+.how-table th,.how-table td{text-align:left; vertical-align:top; padding:8px 10px; border-top:1px solid var(--line); font-size:.9rem}
+.how-table thead th{border-top:0; font-size:.75rem; text-transform:uppercase; letter-spacing:.06em; color:var(--muted)}
+.how-table td:last-child{background:var(--good-soft)}
+.how-table tbody th{text-transform:none; letter-spacing:0; font-size:.9rem; color:var(--ink); font-weight:600; min-width:150px}

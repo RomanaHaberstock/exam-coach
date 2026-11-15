@@ -1661,7 +1661,7 @@ test("works on a 375 px phone screen", async () => {
   await p.click('[data-act="example"]');
   // every section is reachable: the tabs get their own row and none is cut off
   const nav = await p.evaluate(() => [...document.querySelectorAll("#nav button")].map(b => { const r = b.getBoundingClientRect(); return [r.left >= 0 && r.right <= innerWidth, r.width > 30]; }));
-  assert.equal(nav.length, 6);
+  assert.equal(nav.length, 7);
   assert.ok(nav.every(([inside, wide]) => inside && wide), JSON.stringify(nav));
   await p.click('#nav [data-view="history"]');
   assert.equal(await p.evaluate(() => view), "history");
@@ -1687,6 +1687,130 @@ test("works on a 375 px phone screen", async () => {
   assert.ok(await p.evaluate(() => document.documentElement.scrollWidth) <= 375);
   assert.ok(await p.locator("#weeks").count() === 1);
   await phone.close();
+});
+
+// ---- demo experience: example data with history, guided tour, How it works ----
+async function freshPage() {
+  const ctx = await browser.newContext();
+  await serve(ctx);
+  const posts = [];
+  ctx.on("request", r => { if (r.url().endsWith("/api/ai") && r.method() === "POST") posts.push(r.url()); });
+  return { ctx, p: await open(ctx), posts };
+}
+test("example exams load instantly with two weeks of history and no AI request", async () => {
+  const { ctx, p, posts } = await freshPage();
+  const t0 = Date.now();
+  await p.click('[data-act="demo"]');
+  await p.waitForSelector("#tour");
+  assert.ok(Date.now() - t0 < 3000, "loads without waiting");
+  const r = await p.evaluate(() => {
+    const st = S.exams[0], t = n => st.topics.find(x => x.name === n), t0 = today();
+    return { exams: S.exams.map(e => e.subject), done: S.blocks.filter(b => b.status === "done" && b.date < t0).length,
+      skipped: S.blocks.filter(b => b.status === "skipped").length, future: S.blocks.some(b => b.status === "planned" && b.date >= t0),
+      quizzed: st.topics.filter(x => x.mastery != null).map(x => x.name), prob: t("Probability basics").mastery,
+      repairToday: S.blocks.some(b => b.status === "planned" && b.label === "Repair review: Probability basics" && b.date <= addDays(t0, 1)),
+      root: S.log.find(l => /Your trouble with Random variables & distributions probably comes from Probability basics/.test(l.detail)),
+      top: S.log[0].title, logPast: S.log.every(l => l.at.slice(0, 10) <= new Date().toISOString().slice(0, 10)),
+      demoFp: S.fp.demo && S.fp.quizLog.every(q => q.demo), banner: (go("dashboard"), !!$("#demo-banner")), streak: streakInfo().current, dates: st.topics.flatMap(x => x.quizzes.map(q => q.date)) };
+  });
+  assert.equal(r.exams.length, 2);
+  assert.ok(r.done >= 20 && r.skipped === 1 && r.future, JSON.stringify(r));
+  assert.deepEqual(r.quizzed, ["Descriptive statistics", "Probability basics", "Random variables & distributions"]);
+  assert.ok(r.prob < 70, "the prerequisite is weak");
+  assert.ok(r.root, "a result below plan with the root-cause message");
+  assert.ok(r.root.changes.some(c => c.name === "Probability basics" && c.delta > 0), "the plan change shows the extra time on the prerequisite");
+  assert.match(r.top, /Random variables & distributions: 52% \(expected 80%\)/, "the newest plan change is on top");
+  assert.ok(r.repairToday, "the repair review is planned for today or tomorrow");
+  assert.ok(r.logPast && r.demoFp && r.banner && r.streak >= 10, JSON.stringify(r));
+  // every page has something to show, without the AI
+  for (const [v, re] of [["plan", /Week by week/], ["history", /probably comes from Probability basics/], ["you", /Explain it back works best for you/], ["exams", /Probability basics/]]) {
+    await p.evaluate(x => go(x), v);
+    assert.match(await p.textContent("main"), re, v);
+  }
+  // a quiz with the built-in example questions, graded on the page; the plan reacts
+  await p.evaluate(() => { const e = S.exams[0]; quiz = { examId: e.id, topicId: e.topics.find(t => t.name === "Probability basics").id, phase: "pick" }; go("quiz"); });
+  await p.click('[data-act="quiz-example"]');
+  const n = await p.locator(".panel.q").count();
+  assert.equal(n, 5);
+  for (let i = 0; i < n; i++) await p.check(`#q${i}-0`);
+  await p.click('[data-act="submit"]');
+  await p.waitForSelector("text=What the coach changed");
+  assert.match(await p.textContent("main"), /Your score · Probability basics/);
+  assert.equal(posts.length, 0, "no AI request at all");
+  // removing the example data leaves an empty start page
+  await p.evaluate(() => go("dashboard"));
+  await p.keyboard.press("Escape");
+  await p.click('[data-act="rm-example"]');
+  await p.click('[data-act="rm-example"]');
+  assert.deepEqual(await p.evaluate(() => [S.exams.length, S.blocks.length, S.fp.demo, S.fp.quizLog.length, S.log.length]), [0, 0, false, 0, 1]);
+  assert.match(await p.textContent("main"), /Try it with example exams/);
+  await ctx.close();
+});
+
+test("the example works when the AI is not available", async () => {
+  delete process.env.GEMINI_API_KEY;
+  try {
+    const { ctx, p } = await freshPage();
+    assert.equal(await p.evaluate(() => aiState), "off");
+    await p.click('[data-act="demo"]');
+    await p.keyboard.press("Escape");
+    await p.evaluate(() => { const e = S.exams[1]; quiz = { examId: e.id, topicId: e.topics[0].id, phase: "pick" }; go("quiz"); });
+    assert.ok(await p.isDisabled('[data-act="gen"]'), "AI quiz is off");
+    await p.click('[data-act="quiz-example"]');
+    for (let i = 0; i < 4; i++) await p.check(`#q${i}-1`);
+    await p.click('[data-act="submit"]');
+    await p.waitForSelector("text=What the coach changed");
+    await ctx.close();
+  } finally { process.env.GEMINI_API_KEY = "test-key"; }
+});
+
+test("guided tour: can be completed with the keyboard and skipped", async () => {
+  const { ctx, p } = await freshPage();
+  await p.click('[data-act="demo"]');
+  const seen = [];
+  for (let i = 0; i < 6; i++) {
+    await p.waitForFunction(k => $("#tour") && $("#tour").dataset.step === String(k), i);
+    const s = await p.evaluate(() => ({ view, title: $("#tour-title").textContent, focus: document.activeElement.dataset.tour, marked: !!$("#main .tour-on"), role: $("#tour").getAttribute("role") }));
+    assert.equal(s.focus, "next", "focus is on Next");
+    assert.ok(s.marked, `step ${i + 1} points at something on the page (${s.view})`);
+    assert.equal(s.role, "dialog");
+    seen.push(s.view);
+    await p.keyboard.press(i % 2 ? "Enter" : "ArrowRight");
+  }
+  assert.deepEqual(seen, ["plan", "dashboard", "quiz", "history", "you", "how"]);
+  assert.equal(await p.locator("#tour").count(), 0, "finished");
+  assert.equal(await p.locator(".tour-on").count(), 0);
+  // back, then skip with Esc and with the button
+  await p.evaluate(() => go("dashboard"));
+  await p.click('#demo-banner [data-act="tour"]');
+  await p.keyboard.press("ArrowRight");
+  await p.keyboard.press("ArrowLeft");
+  assert.equal(await p.evaluate(() => $("#tour").dataset.step), "0");
+  await p.keyboard.press("Escape");
+  assert.equal(await p.locator("#tour").count(), 0);
+  assert.deepEqual(await p.evaluate(() => [view, document.activeElement.dataset.view]), ["plan", "plan"], "focus goes to the current page's tab");
+  await p.evaluate(() => go("dashboard"));
+  await p.click('#demo-banner [data-act="tour"]');
+  await p.click('#tour [data-tour="skip"]');
+  assert.equal(await p.locator("#tour").count(), 0);
+  await ctx.close();
+});
+
+test("How it works explains the loop with a diagram and the chatbot comparison", async () => {
+  const { ctx, p } = await freshPage();
+  await p.click('#nav [data-view="how"]');
+  const r = await p.evaluate(() => ({ text: $("main").textContent, svg: !!$("#how-loop title"), nodes: document.querySelectorAll("#how-loop .hw-node").length, rows: document.querySelectorAll("#how-chatbot tbody tr").length, hash: location.hash }));
+  assert.match(r.text, /The feedback loop/);
+  assert.match(r.text, /The learning profile/);
+  assert.match(r.text, /What a chatbot can't do here/);
+  assert.ok(r.svg && r.nodes === 6 && r.rows >= 4, JSON.stringify(r));
+  assert.equal(r.hash, "#how");
+  await p.reload();
+  await p.waitForFunction(() => aiState !== "checking");
+  assert.equal(await p.evaluate(() => view), "how", "opens from its link");
+  await p.click('main [data-act="demo"]');
+  assert.equal(await p.evaluate(() => S.exams.length), 2);
+  await ctx.close();
 });
 
 test("makes no requests to other servers and has no errors", () => {
