@@ -5,7 +5,7 @@
 //
 // Run: npm test   (first time: npm install && npx playwright install chromium)
 
-import { test, before, after } from "node:test";
+import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -17,7 +17,7 @@ import { handle, RETRY } from "../netlify/edge-functions/ai.js";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ORIGIN = "http://exam-coach.test";
 const CSP = fs.readFileSync(path.join(ROOT, "netlify.toml"), "utf8").match(/Content-Security-Policy = "([^"]+)"/)[1];
-const TYPES = { ".html": "text/html", ".css": "text/css", ".js": "text/javascript", ".svg": "image/svg+xml", ".woff2": "font/woff2", ".json": "application/json" };
+const TYPES = { ".html": "text/html", ".css": "text/css", ".js": "text/javascript", ".svg": "image/svg+xml", ".woff2": "font/woff2", ".json": "application/json", ".webmanifest": "application/manifest+json", ".png": "image/png" };
 
 // ---- fake Anthropic API -------------------------------------------------------
 const realFetch = globalThis.fetch;
@@ -156,6 +156,9 @@ async function open(ctx) {
   p.on("console", m => { if (m.type() === "error") problems.push("console: " + m.text()); });
   await p.goto(ORIGIN + "/");
   await p.waitForFunction(() => typeof aiState !== "undefined" && aiState !== "checking");
+  // Most tests check what happens on the way to the AI: no saved answers, no question bank
+  // (the tests of saved answers turn this on again).
+  await p.evaluate(() => { AIC.off = true; });
   return p;
 }
 
@@ -170,6 +173,8 @@ before(async () => {
   page = await open(context);
 });
 after(async () => { await browser?.close(); globalThis.fetch = realFetch; });
+// A failed request marks the AI as unavailable for a while (aiDown); each test starts with it reachable.
+beforeEach(async () => { if (page) await page.evaluate(() => { aiDown = null; }).catch(() => {}); });
 
 // ---- tests ---------------------------------------------------------------------
 test("loads with the AI backend connected", async () => {
@@ -196,6 +201,7 @@ test("builds a plan from the example exams and keeps it after a reload", async (
   await page.evaluate(() => { S.exams[0].mode = "top"; commit({ plan: true }); });
   await page.waitForTimeout(1200); // saving is debounced
   await page.reload();
+  await page.evaluate(() => { AIC.off = true; });
   await page.waitForFunction(() => aiState !== "checking");
   assert.equal(await page.evaluate(() => S.exams.length), 2);
 });
@@ -257,7 +263,8 @@ test("reads an uploaded PDF and turns it into topics", async () => {
   const text = await page.evaluate(() => getMaterial(S.exams[0].materials[0].id));
   assert.match(text, /Type I error/);
   await page.click('[data-act="analyze"]');
-  await page.waitForFunction(() => S.exams[0].topics.some(t => t.name === "Hypothesis tests"));
+  // (the example exam has a "Hypothesis tests" topic too, so wait for the analysis itself)
+  await page.waitForFunction(() => !busy.analyze && S.exams[0].topics.length === 2 && S.exams[0].topics.some(t => t.name === "Hypothesis tests"));
   assert.deepEqual(await page.evaluate(() => S.exams[0].topics.map(t => t.weight)), [5, 3]);
   assert.deepEqual(await page.evaluate(() => S.exams[0].oldTasks.map(x => [x.label, topicById(S.exams[0], x.topicId).name, x.points])),
     [["Task 1", "Hypothesis tests", 30], ["Task 2", "Linear regression", 20]]);
@@ -532,7 +539,7 @@ test("splits long materials into parts, shows progress and merges the topics", a
 test("merges prerequisite links across parts and drops unknown topics and cycles", async () => {
   const id = await examWithMaterials([{ name: "slides.pdf", kind: "slides", text: longMaterial() }, { name: "old.pdf", kind: "oldexam", text: oldExamText() }]);
   upstream.prompts = [];
-  await page.evaluate(id => analyzeMaterials(examById(id)), id);
+  await page.evaluate(id => { aiDown = null; return analyzeMaterials(examById(id)); }, id);
   const parts = upstream.prompts.filter(p => /This is part \d of 3/.test(p));
   assert.ok(parts.every(p => p.includes('"buildsOn"')), "every part asks for prerequisite links");
   assert.match(parts[2], /from this part or the topics found in earlier parts/);
@@ -543,7 +550,7 @@ test("merges prerequisite links across parts and drops unknown topics and cycles
   assert.match(await page.evaluate(() => S.log[0].detail), /found 2 links between topics/);
   // a link the student set by hand survives re-analysis
   await page.evaluate(id => { const e = examById(id), s = e.topics.find(t => t.name === "Sampling"); s.prereqs = [e.topics.find(t => t.name === "Regression models").id]; s.prereqsSet = true; }, id);
-  await page.evaluate(id => analyzeMaterials(examById(id)), id);
+  await page.evaluate(id => { aiDown = null; return analyzeMaterials(examById(id)); }, id);
   const again = await page.evaluate(id => { const e = examById(id); return Object.fromEntries(e.topics.map(t => [t.name, t.prereqs.map(p => topicById(e, p).name)])); }, id);
   assert.deepEqual(again.Sampling, ["Regression models"]);
   assert.deepEqual(again["Hypothesis tests"], [], "the AI's link that would now close a loop is dropped");
@@ -553,7 +560,7 @@ test("collects old-exam tasks from the parts when a long old exam is split", asy
   const bigOld = Array.from({ length: 30 }, (_, i) => `\n=== p. ${i + 1} ===\nTask ${i + 1}: test H0 against H1. ` + "Compute the p-value. ".repeat(140)).join("");
   const id = await examWithMaterials([{ name: "slides.pdf", kind: "slides", text: longMaterial() }, { name: "big-old.pdf", kind: "oldexam", text: bigOld }]);
   upstream.prompts = [];
-  await page.evaluate(id => analyzeMaterials(examById(id)), id);
+  await page.evaluate(id => { aiDown = null; return analyzeMaterials(examById(id)); }, id);
   const parts = upstream.prompts.filter(p => /This is part \d of \d/.test(p));
   assert.ok(parts.length > 2 && !parts.every(p => p.includes("OLD EXAM: big-old.pdf")), "the old exam is split, not put into every part");
   assert.match(parts.find(p => p.includes("OLD EXAM")), /tasks of the most recent old exam that are in this part/);
@@ -566,7 +573,7 @@ test("collects old-exam tasks from the parts when a long old exam is split", asy
 test("tries again with smaller parts when a request is too large", async () => {
   const id = await examWithMaterials([{ name: "slides.pdf", kind: "slides", text: longMaterial() }, { name: "old.pdf", kind: "oldexam", text: oldExamText() }]);
   upstream.prompts = []; upstream.maxPrompt = 50000;
-  await page.evaluate(id => analyzeMaterials(examById(id)), id);
+  await page.evaluate(id => { aiDown = null; return analyzeMaterials(examById(id)); }, id);
   upstream.maxPrompt = 0;
   assert.ok(upstream.prompts[0].length > 50000, "first try used large parts");
   const retried = upstream.prompts.slice(1);
@@ -592,7 +599,7 @@ test("waits and tries a busy part again, and resumes from the failed part later"
   // part 2 stays busy: the parts read so far are kept and Analyse continues from part 2
   await page.evaluate(id => { const e = examById(id); e.topics = []; }, id);
   upstream.prompts = []; upstream.failWhen = p => partOf(p) === 2;
-  await page.evaluate(id => analyzeMaterials(examById(id)), id);
+  await page.evaluate(id => { aiDown = null; return analyzeMaterials(examById(id)); }, id);
   assert.deepEqual([...new Set(upstream.prompts.map(partOf))], [1, 2], "part 3 isn't read after part 2 failed");
   assert.equal(upstream.prompts.filter(p => partOf(p) === 2).length, 15, "3 tries by the page, 5 requests each by the backend");
   const msg = await page.textContent("#toast");
@@ -601,7 +608,7 @@ test("waits and tries a busy part again, and resumes from the failed part later"
   assert.doesNotMatch(msg, /gemini|google|netlify/i);
   assert.equal(await page.evaluate(id => examById(id).topics.length, id), 0);
   upstream.prompts = []; upstream.failWhen = null;
-  await page.evaluate(id => analyzeMaterials(examById(id)), id);
+  await page.evaluate(id => { aiDown = null; return analyzeMaterials(examById(id)); }, id);
   assert.deepEqual(upstream.prompts.map(partOf), [2, 3], "resumes with part 2, part 1 isn't read again");
   assert.match(upstream.prompts[0], /Topics found in earlier parts: Hypothesis tests; Sampling/, "knows the topics of part 1");
   const e = await page.evaluate(id => { const e = examById(id); return e.topics.map(t => [t.name, t.effortH]); }, id);
@@ -609,10 +616,10 @@ test("waits and tries a busy part again, and resumes from the failed part later"
 
   // changed materials: no resume, all parts are read again
   upstream.prompts = []; upstream.failWhen = p => partOf(p) === 2;
-  await page.evaluate(id => analyzeMaterials(examById(id)), id);
+  await page.evaluate(id => { aiDown = null; return analyzeMaterials(examById(id)); }, id);
   upstream.failWhen = null; upstream.prompts = [];
   await page.evaluate(async id => { const e = examById(id), m = e.materials[0]; await putMaterial(m.id, { name: m.name, kind: m.kind, text: (await getMaterial(m.id)) + " more" }); }, id);
-  await page.evaluate(id => analyzeMaterials(examById(id)), id);
+  await page.evaluate(id => { aiDown = null; return analyzeMaterials(examById(id)); }, id);
   assert.deepEqual(upstream.prompts.map(partOf), [1, 2, 3]);
   await page.evaluate(() => { ANALYZE_BUSY.waitS = 20; });
 });
@@ -641,12 +648,12 @@ test("tries a part whose connection broke off again in smaller parts, and resume
   // it keeps breaking off: the parts read so far are kept, and Analyse continues in smaller parts
   await page.evaluate(id => { examById(id).topics = []; }, id);
   upstream.prompts = []; upstream.cutWhen = p => /This is part (2 of 3|[2-9] of 7)/.test(p);
-  await page.evaluate(id => analyzeMaterials(examById(id)), id);
+  await page.evaluate(id => { aiDown = null; return analyzeMaterials(examById(id)); }, id);
   assert.deepEqual(upstream.prompts.map(partOf), ["1/3", "2/3", "2/7", "2/7"], "one try with the big part, two with the smaller one");
   const msg = await page.textContent("#toast");
   assert.match(msg, /^The connection to the AI broke off\. Your work is kept — try again\. The AI already read part 1 of 7\. Press Analyse again to continue with part 2\./);
   upstream.prompts = []; upstream.cutWhen = null;
-  await page.evaluate(id => analyzeMaterials(examById(id)), id);
+  await page.evaluate(id => { aiDown = null; return analyzeMaterials(examById(id)); }, id);
   assert.deepEqual(upstream.prompts.map(partOf), ["2/7", "3/7", "4/7", "5/7", "6/7", "7/7"], "resumes with the smaller parts");
   assert.deepEqual(await page.evaluate(id => examById(id).topics.map(t => t.name), id), ["Hypothesis tests", "Sampling", "Regression models"]);
 
@@ -1493,10 +1500,13 @@ test("shows what went wrong when the AI fails", async () => {
   upstream.fail = 429; upstream.models = [];
   const limit = await page.evaluate(async () => { try { await AI.json("x"); return "no error"; } catch (e) { return aiError(e); } });
   assert.deepEqual(upstream.models, ["gemini-3.8-flash", "gemini-3.5-flash-lite"]);
+  upstream.models = [];
   const quick = await page.evaluate(async () => { try { await AI.json("x", { modelTier: "quick" }); return "no error"; } catch (e) { return aiError(e); } });
   upstream.fail = null;
   assert.match(limit, /^The free AI quota is used up for now \(a quicker backup model was tried too\)\. Your work is kept/);
-  assert.match(quick, /usage limit is reached/, "no backup model for a quick request");
+  assert.deepEqual(upstream.models, ["gemini-3.5-flash-lite", "gemini-3.8-flash"], "a quick request falls back to the default model");
+  assert.match(quick, /backup model was tried too/);
+  await page.evaluate(() => { aiDown = null; });
 
   // the connection breaks off half-way through the answer (reset, or a stream that just stops)
   const broken = await page.evaluate(async () => {
@@ -1520,6 +1530,7 @@ test("shows what went wrong when the AI fails", async () => {
 test("asks for the access code when one is set", async () => {
   process.env.ACCESS_CODE = "study-group";
   await page.reload();
+  await page.evaluate(() => { AIC.off = true; });
   await page.waitForFunction(() => aiState !== "checking");
   assert.equal(await page.evaluate(() => aiState), "code");
   await page.fill("#ai-code", "study-group");
@@ -1531,6 +1542,7 @@ test("asks for the access code when one is set", async () => {
 test("explains when the backend has no API key", async () => {
   delete process.env.GEMINI_API_KEY;
   await page.reload();
+  await page.evaluate(() => { AIC.off = true; });
   await page.waitForFunction(() => aiState !== "checking");
   assert.equal(await page.evaluate(() => aiState), "off");
   process.env.GEMINI_API_KEY = "test-key";
@@ -1998,7 +2010,15 @@ test("fits a 375 px phone on every view: no sideways scrolling, 44 px tap target
   await p.click('[data-act="gen"]'); await p.waitForFunction(() => quiz.phase === "answer"); await check("quiz questions");
   await p.evaluate(() => { const e = S.exams[0]; addCards(e, e.topics[0], [{ front: "A card question that is a little longer than usual?", back: "Its answer" }], "cards"); e.cards.forEach(c => c.due = today()); go("dashboard"); startDeck(); }); await check("review cards");
   await p.click('[data-act="deck-flip"]'); await check("review card answer");
-  await p.evaluate(() => { DK = null; go("dashboard"); });
+  // the AI unavailable: the banner and the self-rating of written answers fit too, one primary button on the quiz page
+  await p.evaluate(() => { DK = null; aiDown = { code: "rate_limited", until: Date.now() + 60000, n: 1 }; go("dashboard"); }); await check("today, AI unavailable");
+  await p.evaluate(() => { quiz = { examId: S.exams[0].id, topicId: S.exams[0].topics.find(t => t.name === "Hypothesis tests").id, phase: "pick" }; go("quiz"); }); await check("quiz, AI unavailable");
+  assert.ok(await p.locator("main .btn.primary:not([disabled])").count() <= 1, "at most one primary action");
+  await p.evaluate(() => { quiz = { examId: S.exams[0].id, topicId: S.exams[0].topics[0].id, phase: "pick" }; render(); });
+  assert.deepEqual(await p.$$eval("main .btn.primary:not([disabled])", b => b.map(x => x.dataset.act)), ["quiz-example"], "the example questions are the one primary action while the AI is unavailable");
+  await p.evaluate(() => { quiz = { examId: S.exams[0].id, topicId: S.exams[0].topics[0].id, phase: "self", answers: { 0: "x" }, questions: [{ type: "short", question: "Explain the mean.", modelAnswer: "The average of the values.", concept: "Mean" }], results: [{ score: null, self: true }] }; render(); });
+  await check("self-rating, AI unavailable");
+  await p.evaluate(() => { aiDown = null; quiz = null; go("dashboard"); });
   // the topics table is one card per topic: every field fully on screen
   await p.evaluate(() => go("exams"));
   const cells = await p.evaluate(() => [...document.querySelectorAll("#topics-table input, #topics-table select")].every(el => { const r = el.getBoundingClientRect(); return r.left >= 0 && r.right <= innerWidth; }));
@@ -2159,9 +2179,237 @@ test("How it works explains the loop with a diagram and the chatbot comparison",
   await ctx.close();
 });
 
+// ---- saving the shared AI quota ----------------------------------------------------
+const withCache = fn => async () => {
+  // (an earlier test left the page without an API key: connect again)
+  await page.evaluate(async () => { AIC.off = false; aiDown = null; if (aiState !== "ok") await checkAI(); });
+  try { await fn(); } finally { await page.evaluate(() => { AIC.off = true; aiDown = null; }); upstream.events = null; upstream.fail = null; } };
+test("analysing the same files again uses the saved result; removing a file clears it", withCache(async () => {
+  // (other tests analysed longMaterial() too, so this one gets its own text)
+  const id = await examWithMaterials([{ name: "slides.pdf", kind: "slides", text: longMaterial().replace(/Statistics text\. /g, "Cached statistics. ") }, { name: "old.pdf", kind: "oldexam", text: oldExamText() }]);
+  const analyze = (fresh = false) => page.evaluate(([id, fresh]) => analyzeMaterials(examById(id), true, fresh), [id, fresh]);
+  upstream.prompts = [];
+  await analyze();
+  assert.equal(upstream.prompts.length, 3, "first analysis: one request per part");
+  const first = await page.evaluate(id => examById(id).topics.map(t => [t.name, t.effortH, t.goals.length]), id);
+  // the exam date changed, the files didn't: same parts, no request
+  upstream.prompts = [];
+  await page.evaluate(id => { examById(id).date = addDays(today(), 40); go("exams"); selExam = id; render(); }, id);
+  await analyze();
+  assert.equal(upstream.prompts.length, 0, "no AI request for files analysed before");
+  assert.deepEqual(await page.evaluate(id => examById(id).topics.map(t => [t.name, t.effortH, t.goals.length]), id), first, "same topics as the first time");
+  assert.match(await page.evaluate(() => S.log[0].detail), /These files were analysed before, so the saved result was used \(no AI request\)/);
+  assert.match(await page.textContent("#analyze-cached"), /saved result was used/);
+  // "Ask the AI again" skips the saved result
+  await page.click('[data-act="analyze-fresh"]');
+  await page.waitForFunction(() => !busy.analyze);
+  assert.equal(upstream.prompts.length, 3);
+  // a part analysed before is reused when only a later part changed
+  upstream.prompts = [];
+  await page.evaluate(async id => { const e = examById(id), m = e.materials[0]; await putMaterial(m.id, { name: m.name, kind: m.kind, text: (await getMaterial(m.id)) + " BETAWORD more" }); }, id);
+  await analyze();
+  assert.equal(upstream.prompts.length, 1, "parts 1 and 2 are the same, only part 3 is asked for");
+  assert.match(await page.evaluate(() => S.log[0].detail), /2 of 3 parts were analysed before, so only 1 AI request was needed/);
+  // removing a file drops the exam's saved answers
+  const kept = await page.evaluate(async id => { await aicIndex(); return Object.values(AIC.index).filter(m => m.examId === id).length; }, id);
+  assert.ok(kept >= 3);
+  await page.evaluate(async id => { const e = examById(id), m = e.materials[1]; e.materials = e.materials.filter(x => x !== m); await materialsChanged(e); commit({ plan: false }); }, id);
+  assert.equal(await page.evaluate(id => Object.values(AIC.index).filter(m => m.examId === id).length, id), 0);
+  await page.evaluate(id => { S.exams = S.exams.filter(x => x.id !== id); S.blocks = S.blocks.filter(b => b.examId !== id); selExam = null; commit({ plan: true }); }, id);
+}));
+
+// A fake that writes exactly as many questions as asked for (numbered by a counter, so every request gives new ones).
+let qno = 0;
+const quizAnswer = p => { const k = +(p.match(/Write (\d+) questions/) || [])[1] || 2;
+  return gText(JSON.stringify({ questions: Array.from({ length: k }, () => { const j = ++qno; return j % 2 ? { type: "mc", question: `Bank question ${j}?`, options: [`right ${j}`, `wrong a${j}`, `wrong b${j}`, `wrong c${j}`], answer: 0, modelAnswer: `right ${j}`, concept: `Concept ${j}` }
+    : { type: "short", question: `Bank question ${j}?`, modelAnswer: `Answer ${j} with a few words of explanation for the student.`, concept: `Concept ${j}` }; }) })); };
+test("quizzes come from the topic's question bank before the AI is asked, with options shuffled", withCache(async () => {
+  await examWithMaterial();
+  upstream.events = p => p.includes("You write practice questions") ? quizAnswer(p) : null;
+  upstream.prompts = [];
+  const quizOf = (n, fresh) => page.evaluate(async ([n, fresh]) => { const e = examById(selExam); await generateQuiz(e, e.topics[0], n, fresh);
+    return { phase: quiz.phase, bank: quiz.fromBank || false, qs: quiz.questions.map(q => ({ q: q.question, right: q.options ? q.options[q.answer] : null })), banked: e.topics[0].bank.length }; }, [n, fresh]);
+  const asks = () => upstream.prompts.filter(x => x.includes("You write practice questions")).map(x => +x.match(/Write (\d+) questions/)[1]);
+  let r = await quizOf(5);
+  assert.deepEqual(asks(), [8], "5 for the quiz plus 3 for the bank in one request");
+  assert.equal(r.qs.length, 5); assert.equal(r.banked, 8); assert.equal(r.bank, false);
+  // the quiz is left without answering: next time the same unasked questions come from the bank, no request
+  r = await quizOf(5);
+  assert.deepEqual(asks(), [8], "no new request");
+  assert.equal(r.bank, true);
+  assert.equal(r.qs.length, 5);
+  for (const q of r.qs) if (q.right) assert.match(q.right, /^right \d+$/, "the answer index follows the shuffled options");
+  assert.match(await page.evaluate(() => { go("quiz"); return document.querySelector("#quiz-bank").textContent; }), /saved, so no AI request was needed/);
+  // answer them: right ones are retired, wrong ones come back on a later day
+  const res = await page.evaluate(async () => {
+    quiz.questions.forEach((q, i) => { quiz.answers[i] = q.type === "mc" ? (i === 0 ? (q.answer + 1) % 4 : q.answer) : "A Type I error means rejecting a true null hypothesis."; });
+    await gradeQuiz();
+    const t = examById(selExam).topics[0];
+    return { phase: quiz.phase, asked: t.bank.filter(x => x.asked).length, wrong: t.bank.filter(x => x.wrong).length, pool: bankPool(examById(selExam), t).length };
+  });
+  assert.equal(res.phase, "done");
+  assert.equal(res.asked, 5);
+  assert.ok(res.wrong >= 1, "the wrong mc answer and the half-right written ones");
+  assert.equal(res.pool, 3, "only the 3 unasked questions are left today");
+  const tomorrow = await page.evaluate(() => { const e = examById(selExam), t = e.topics[0]; t.bank.forEach(x => { if (x.last) x.last = addDays(today(), -1); }); return bankPool(e, t).length; });
+  assert.equal(tomorrow, 3 + res.wrong, "missed questions come back the next day");
+  // a quiz bigger than the bank: the AI writes new ones; "New questions from the AI" skips the bank
+  upstream.prompts = [];
+  r = await quizOf(12);
+  assert.deepEqual(asks(), [16]);
+  upstream.prompts = [];
+  r = await quizOf(4, true);
+  assert.deepEqual(asks(), [6]);
+  assert.ok(await page.evaluate(() => examById(selExam).topics[0].bank.length <= BANK_MAX));
+  // removing the file drops the questions not asked yet, keeps the missed ones
+  const after = await page.evaluate(async () => { const e = examById(selExam), m = e.materials[0]; e.materials = []; dropMaterial(m.id); await materialsChanged(e); return e.topics[0].bank.every(x => x.asked && x.wrong); });
+  assert.ok(after);
+  await page.evaluate(() => { quiz = null; });
+  await dropStudyExam();
+}));
+
+test("when the AI is unavailable: one banner, no requests, saved questions still work and written answers are self-rated", withCache(async () => {
+  await examWithMaterial();
+  upstream.events = p => p.includes("You write practice questions") ? quizAnswer(p) : null;
+  await page.evaluate(async () => { const e = examById(selExam); await generateQuiz(e, e.topics[0], 4); quiz = null; });
+  // the quota is used up (both models): the provider says when to try again
+  upstream.fail = 429;
+  const msg = await page.evaluate(async () => { const e = examById(selExam); await generateQuiz(e, e.topics[0], 12); return quiz.error; });
+  upstream.fail = null;
+  assert.match(msg, /free AI quota is used up/);
+  await page.evaluate(() => go("quiz"));
+  assert.equal(await page.locator("#ai-down").count(), 1, "one banner");
+  // a labelled region, announced in the live region; disabled AI buttons point at its explanation
+  assert.equal(await page.getAttribute("#ai-down", "role"), "region");
+  assert.equal(await page.textContent("#" + await page.getAttribute("#ai-down", "aria-labelledby")), "The AI is unavailable right now");
+  await page.waitForFunction(() => /The AI is unavailable right now/.test($("#live").textContent));
+  await page.evaluate(() => go("exams"));
+  assert.ok(await page.isDisabled('[data-act="analyze"]'), "Analyse is off while the AI is unavailable");
+  assert.equal(await page.getAttribute('[data-act="analyze"]', "aria-describedby"), "ai-down-msg");
+  await page.evaluate(() => go("quiz"));
+  assert.match(await page.textContent("#ai-down"), /The AI is unavailable right now[\s\S]*free AI quota is used up for now\. It tries again in about \d+ s\.[\s\S]*Everything else keeps working: your plan, the focus timer, saved quiz questions and flashcards, and scoring mock exams by hand/);
+  // nothing is sent while it is down
+  const calls = upstream.calls;
+  const off = await page.evaluate(async () => { try { await askAI("x"); return "sent"; } catch (e) { return aiError(e); } });
+  assert.match(off, /free AI quota is used up/);
+  assert.equal(await page.evaluate(() => document.querySelector('[data-act="m-start"]') ? 1 : 0), 0);
+  // the bank still gives a quiz (fewer questions than asked), MC graded on the page, written answers self-rated
+  const q = await page.evaluate(async () => { const e = examById(selExam), t = e.topics[0]; await generateQuiz(e, t, 8);
+    return { phase: quiz.phase, n: quiz.questions.length, note: quiz.note, types: quiz.questions.map(q => q.type) }; });
+  assert.equal(q.phase, "answer");
+  assert.equal(q.n, 6, "the 6 saved questions");
+  assert.match(q.note, /The AI is unavailable, so this quiz has the 6 saved questions/);
+  await page.evaluate(async () => { quiz.questions.forEach((q, i) => { quiz.answers[i] = q.type === "mc" ? q.answer : "Rejecting a true null hypothesis is a Type I error."; }); await gradeQuiz(); render(); });
+  assert.equal(await page.evaluate(() => quiz.phase), "self");
+  assert.match(await page.textContent("#self-grade"), /The AI can't grade right now/);
+  const before = await page.evaluate(() => S.log.length);
+  const btns = page.locator('[data-act="self-rate"][data-v="1"]');
+  const k = await btns.count();
+  assert.equal(k, q.types.filter(x => x !== "mc").length, "one rating per written answer");
+  // by keyboard: a labelled group per answer; after a rating the focus is on the next answer's first button
+  assert.match(await page.getAttribute('[data-act="self-rate"][data-v="1"] >> nth=0', "aria-label"), /^Question \d+: my answer was right$/);
+  assert.equal(await page.locator('[role="group"][aria-label^="Rate your answer to question"]').count(), k);
+  await page.focus('[data-act="self-rate"][data-v="1"] >> nth=0');
+  for (let i = 0; i < k; i++) {
+    if (i) assert.deepEqual(await page.evaluate(() => [document.activeElement.dataset.act, document.activeElement.dataset.v]), ["self-rate", "1"], "focus moved to the next answer");
+    await page.keyboard.press("Enter");
+  }
+  const done = await page.evaluate(() => ({ phase: quiz.phase, score: quiz.score, fb: quiz.results.filter(r => r.selfRated).map(r => r.feedback) }));
+  assert.equal(done.phase, "done");
+  assert.equal(done.score, 100);
+  assert.ok(done.fb.every(f => /You rated this answer yourself: right/.test(f)));
+  assert.ok(await page.evaluate(n => S.log.length > n && S.log[0].kind === "quiz", before), "the result went into the plan");
+  assert.equal(upstream.calls, calls, "no request while the AI was unavailable");
+  // "Try again now" clears the banner
+  await page.click('[data-act="ai-retry"]');
+  assert.equal(await page.locator("#ai-down").count(), 0);
+  // offline: the same banner
+  await context.setOffline(true);
+  await page.evaluate(() => window.dispatchEvent(new Event("offline")));
+  assert.match(await page.textContent("#ai-down"), /You're offline[\s\S]*when you're back online/);
+  await context.setOffline(false);
+  await page.evaluate(() => { aiDown = null; quiz = null; render(); });
+  await dropStudyExam();
+}));
+
+test("flashcards are saved per topic and goals; short answers are graded by the quick model", withCache(async () => {
+  await examWithMaterial();
+  upstream.prompts = [];
+  const cards = (fresh) => page.evaluate(async fresh => { const e = examById(selExam), b = { id: "fc-cache", examId: e.id, topicId: e.topics[0].id, type: "learn", method: "flashcards", minutes: 60, goals: [] };
+    await genStudy(b, fresh); return { phase: ST[b.id].phase, cached: !!ST[b.id].cached, n: ST[b.id].data.cards.length }; }, fresh);
+  const asked = () => upstream.prompts.filter(x => x.includes("flashcards")).length;
+  assert.deepEqual(await cards(), { phase: "ready", cached: false, n: 2 });
+  const one = asked(); // (the fake writes 2 of 10 cards, so genList asks once more)
+  assert.ok(one >= 1);
+  assert.deepEqual(await cards(), { phase: "ready", cached: true, n: 2 }, "the second time from the saved cards");
+  assert.equal(asked(), one, "no request");
+  await cards(true);
+  assert.equal(asked(), 2 * one, "New ones from the AI");
+  // other goals: new cards
+  await page.evaluate(() => { examById(selExam).topics[0].goals = [{ text: "Define H0", src: "p. 1" }]; });
+  await cards();
+  assert.equal(asked(), 3 * one);
+  // grading: short answers → quick model, a calculation → default model
+  const grade = type => page.evaluate(async type => { const e = examById(selExam), t = e.topics[0];
+    quiz = { examId: e.id, topicId: t.id, phase: "answer", answers: { 0: "Rejecting a true H0 when it holds." }, questions: [{ type, question: "Type I?", modelAnswer: "Rejecting a true H0.", concept: "Type I error" }] };
+    await gradeQuiz(); return quiz.results[0].score; }, type);
+  upstream.models = [];
+  assert.equal(await grade("short"), 0.9);
+  assert.deepEqual(upstream.models, ["gemini-3.5-flash-lite"]);
+  upstream.models = [];
+  await grade("calc");
+  assert.deepEqual(upstream.models, ["gemini-3.8-flash"]);
+  await page.evaluate(() => { quiz = null; });
+  await dropStudyExam();
+}));
+
+test("example questions are the example topics' question bank: answered right never asked again, one review card per question", async () => {
+  const { ctx, p, posts } = await freshPage();
+  await p.click('[data-act="demo"]');
+  await p.keyboard.press("Escape");
+  await p.evaluate(() => { AIC.off = false; });
+  const seeded = await p.evaluate(() => S.exams.flatMap(e => e.topics.filter(t => EXAMPLE_QUIZ[t.name]).map(t => [t.name, t.bank.length === EXAMPLE_QUIZ[t.name].length,
+    t.bank.filter(x => x.wrong).map(x => x.q.concept).sort().join(",")])));
+  assert.equal(seeded.length, 6);
+  assert.ok(seeded.every(x => x[1]), "every built-in question is in its topic's bank");
+  assert.deepEqual(seeded.filter(x => x[2]).map(x => x[0] + ": " + x[2]), ["Descriptive statistics: Box plots", "Probability basics: Bayes' theorem,Conditional probability", "Random variables & distributions: Binomial vs Poisson,Variance of a sum"], "the concepts missed in the example history");
+  // all right: those questions aren't asked again; the review cards of the missed ones move up a box, mastery counts once (the quiz)
+  const before = await p.evaluate(() => { const e = S.exams[0], t = e.topics.find(x => x.name === "Probability basics");
+    quiz = { examId: e.id, topicId: t.id, phase: "pick" }; go("quiz");
+    return { cards: e.cards.length, boxes: e.cards.filter(c => c.topicId === t.id).map(c => c.box), log: S.fp.quizLog.length }; });
+  await p.click('[data-act="quiz-example"]');
+  await p.evaluate(() => { quiz.questions.forEach((q, i) => { quiz.answers[i] = q.answer; }); });
+  await p.click('[data-act="submit"]');
+  await p.waitForSelector("text=What the coach changed");
+  const after = await p.evaluate(() => { const e = S.exams[0], t = e.topics.find(x => x.name === "Probability basics");
+    return { cards: e.cards.length, boxes: e.cards.filter(c => c.topicId === t.id).map(c => c.box), log: S.fp.quizLog.length, right: t.bank.every(x => x.asked && !x.wrong), pool: bankPool(e, t).length }; });
+  assert.equal(after.cards, before.cards, "no new card");
+  assert.deepEqual(after.boxes, before.boxes.map(b => Math.min(5, b + 1)), "known in the quiz: one box up");
+  assert.equal(after.log, before.log + 1, "one quiz result");
+  assert.ok(after.right && after.pool === 0, JSON.stringify(after));
+  await p.evaluate(() => { quiz.phase = "pick"; render(); });
+  assert.equal(await p.locator('[data-act="quiz-example"]').count(), 0);
+  assert.match(await p.textContent("#example-done"), /You answered every example question on this topic right/);
+  // a bank quiz (options in a new order) with everything wrong: the card already in the deck goes back to box 1, no second card
+  const wrong = await p.evaluate(async () => { const e = S.exams[0], t = e.topics.find(x => x.name === "Descriptive statistics"), n0 = e.cards.length;
+    await generateQuiz(e, t, 4);
+    const fromBank = quiz.fromBank;
+    quiz.questions.forEach((q, i) => { quiz.answers[i] = (q.answer + 1) % q.options.length; });
+    await gradeQuiz();
+    const box = e.cards.filter(c => c.topicId === t.id && /box plot/i.test(c.front));
+    return { fromBank, added: e.cards.length - n0, box: box.map(c => c.box), missedNext: bankPool(e, t).length };
+  });
+  assert.ok(wrong.fromBank, "taken from the bank");
+  assert.deepEqual(wrong.box, [1], "one Box plots card, back in box 1");
+  assert.equal(wrong.added, 3, "the other three missed questions became cards");
+  assert.equal(wrong.missedNext, 0, "missed ones come back from tomorrow, not today");
+  assert.equal(posts.length, 0, "no AI request");
+  await ctx.close();
+});
+
 test("makes no requests to other servers and has no errors", () => {
   assert.ok(upstream.calls >= 4, "the AI backend was called");
-  assert.ok(upstream.answered.every(m => m === "gemini-3.8-flash"), "uses the default Gemini model");
-  assert.ok(upstream.models.every(m => m === "gemini-3.8-flash" || m === "gemini-3.5-flash-lite"), "the quick model only as a fallback when the default is busy");
+  assert.ok(upstream.answered.includes("gemini-3.8-flash"), "uses the default Gemini model");
+  assert.ok(upstream.models.every(m => m === "gemini-3.8-flash" || m === "gemini-3.5-flash-lite"), "only the two configured models");
   assert.deepEqual(problems, []);
 });

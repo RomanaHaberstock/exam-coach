@@ -109,6 +109,9 @@ function demoCards(exams, topic, t0) {
     for (const c of missedConcepts) {
       const q = (EXAMPLE_QUIZ[name] || []).find(x => x.concept === c); if (!q) continue;
       cardsFromAnswers(e, [q], [{ score: 0 }], null, () => t, "quiz"); // missed again: the same card, back to box 1
+      // and in the question bank as asked and missed on that day, so it comes back in the next quiz like a real one
+      const x = (t.bank || []).find(x => normName(x.q.question) === normName(q.question));
+      if (x) Object.assign(x, { asked: x.asked + 1, wrong: 1, last: addDays(t0, -ago) });
       const card = (e.cards || []).find(x => x.topicId === t.id && x.front.startsWith(q.question)); if (!card) continue;
       const [box, seen, inDays] = DEMO_CARDS[c] || [1, 0, 0], first = card.seen === 0 && card.last === null && card.added === today();
       Object.assign(card, { box, seen, due: addDays(t0, inDays), last: seen ? addDays(t0, -1 - inDays) : null }, first ? { added: addDays(t0, -ago) } : {});
@@ -178,16 +181,28 @@ const EXAMPLE_QUIZ = {
   ]
 };
 const exampleBank = (e, t) => e && e.example && t ? EXAMPLE_QUIZ[t.name] || null : null;
+// The built-in questions are also the example topics' question bank (seedExampleBank(), called by
+// exampleExams()), so they follow the bank's rules: a question answered right isn't asked again,
+// a missed one comes back. "Use the example questions" asks the ones not answered right yet.
+function seedExampleBank(exams) {
+  for (const e of exams) for (const t of e.topics) if (EXAMPLE_QUIZ[t.name]) bankAdd(e, t, EXAMPLE_QUIZ[t.name]);
+}
+function exampleLeft(e, t) {
+  const list = exampleBank(e, t); if (!list) return null;
+  const by = new Map((t.bank || []).map(x => [normName(x.q.question), x]));
+  return list.filter(q => { const x = by.get(normName(q.question)); return !x || !x.asked || x.wrong; });
+}
 // Button on the quiz page for example topics with built-in questions.
 function exampleQuizButton(e, t) {
-  const bank = exampleBank(e, t);
-  if (!bank || ["loading", "grading"].includes(quiz && quiz.phase)) return "";
-  return `<button class="btn ${sample ? "" : "primary"}" data-act="quiz-example">Use the example questions (no AI needed)</button>`;
+  const left = exampleLeft(e, t);
+  if (!left || ["loading", "grading", "self"].includes(quiz && quiz.phase)) return "";
+  if (!left.length) return `<span class="small muted" id="example-done">You answered every example question on this topic right, so they aren't asked again.</span>`;
+  return `<button class="btn ${aiReady() ? "" : "primary"}" data-act="quiz-example">Use the example questions (no AI needed)</button>`;
 }
 function startExampleQuiz() {
-  const e = examById(quiz && quiz.examId), t = topicById(e, quiz && quiz.topicId), bank = exampleBank(e, t);
-  if (!bank) return;
-  quiz = { examId: e.id, topicId: t.id, phase: "answer", n: bank.length, answers: {}, questions: bank.map(q => ({ ...q, options: [...q.options] })),
+  const e = examById(quiz && quiz.examId), t = topicById(e, quiz && quiz.topicId), left = exampleLeft(e, t);
+  if (!left || !left.length) return;
+  quiz = { examId: e.id, topicId: t.id, phase: "answer", n: left.length, answers: {}, questions: left.map(q => ({ ...q, options: [...q.options] })),
     note: "These are built-in example questions, so no AI is needed. For your own exams, the AI writes the questions from your materials, in the style of your old exams." };
   render();
 }
