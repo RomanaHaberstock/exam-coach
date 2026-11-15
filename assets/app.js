@@ -27,7 +27,7 @@ const hrs = m => { const h = Math.round(m / 6) / 10; return (h % 1 === 0 ? h.toF
 const sum = (a, f = x => x) => a.reduce((s, x) => s + f(x), 0);
 const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej({ code: "timeout" }), ms))]);
 function toast(msg) {
-  const t = $("#toast"); t.textContent = msg; t.hidden = false; clearTimeout(toast.t);
+  const t = $("#toast"); t.textContent = msg; t.hidden = false; clearTimeout(toast.t); announce(msg);
   toast.t = setTimeout(() => t.hidden = true, Math.min(12000, Math.max(3200, msg.length * 55)));
   t.onclick = () => { t.hidden = true; };
 }
@@ -1964,7 +1964,7 @@ function streakPanel() {
     <div class="stack" style="gap:8px; min-width:0">
       <div class="strip">${strip.join("")}</div><div class="strip-days">${labels.join("")}</div>
       <div class="row" style="justify-content:space-between"><span class="small">${msg}</span>
-      ${st.today ? "" : `<button class="btn sm primary" data-act="focus">Start a focus session</button>`}</div>
+      ${st.today ? "" : `<button class="btn sm" data-act="focus">Start a focus session</button>`}</div>
       <span class="small muted mono">Last 7 days: ${hrs(wkFocus)} focused · ${wkPoms} pomodoro${wkPoms === 1 ? "" : "s"}</span>
     </div>
   </section>`;
@@ -2411,7 +2411,7 @@ function confRow(i, done, r) {
 }
 function fpTeaser() {
   const P = S.fp.profile;
-  if (!P) return `<section class="panel fpteaser"><div class="stack" style="gap:4px; min-width:0"><span class="label">Learning fingerprint</span><h3>Find out which study methods actually work for you</h3><p class="small muted">Answer 5 quick questions. The coach then tries different methods on your topics, checks what you remember 2 days later, and adapts your plan.</p></div><div class="row"><button class="btn primary" data-act="fp-setup">Set up (1 min)</button><button class="btn ghost" data-act="fp-demo">See an example</button></div></section>`;
+  if (!P) return `<section class="panel fpteaser"><div class="stack" style="gap:4px; min-width:0"><span class="label">Learning fingerprint</span><h3>Find out which study methods actually work for you</h3><p class="small muted">Answer 5 quick questions. The coach then tries different methods on your topics, checks what you remember 2 days later, and adapts your plan.</p></div><div class="row"><button class="btn" data-act="fp-setup">Set up (1 min)</button><button class="btn ghost" data-act="fp-demo">See an example</button></div></section>`;
   const fp = fingerprint();
   const line = fp.best && !fp.untested.length ? `${METHODS[fp.best.m].name} works best for you so far: ${Math.round(fp.best.mean)}% kept after 2 days.`
     : fp.best ? `Calibrating: ${fp.checksDone} of ${fp.checksNeeded} retention checks done. ${METHODS[fp.best.m].name} leads so far.`
@@ -3003,28 +3003,28 @@ function readiness(e) {
   return { score, quizzed: quizzed.length, total: e.topics.length, learned: need ? Math.round(100 * done / need) : 0 };
 }
 function heatClass(t, target) { if (t.mastery == null) return "h-none"; if (t.mastery >= target) return "h-good"; if (t.mastery >= target - 20) return "h-warn"; return "h-bad"; }
-function blockRow(b, { actions = true, showDate = false, detail = true } = {}) {
+function blockRow(b, { actions = true, showDate = false, detail = true, fold = false } = {}) {
   const e = examById(b.examId), t = topicById(e, b.topicId);
   const TYPES = { learn: "Learn", review: "Review", mock: "Mock", check: "Check" };
   const type = Object.hasOwn(TYPES, b.type) ? b.type : "review", typ = TYPES[type];
   const status = ["planned", "done", "skipped"].includes(b.status) ? b.status : "planned", minutes = Math.round(numOr(b.minutes, 0));
-  const past = b.date < today();
+  const past = b.date < today(), pri = b.date <= today() ? " primary" : ""; // only blocks due now get the strong button
   let acts = "";
   if (actions) {
     if (status === "planned") {
       acts = `<button class="btn sm" data-act="done" data-id="${esc(b.id)}">Done</button><button class="btn sm ghost" data-act="skip" data-id="${esc(b.id)}">${past ? "Missed" : "Skip"}</button>`;
       const studyable = type === "learn" && b.method && Object.hasOwn(METHODS, b.method);
-      if (t) acts = (type === "check" ? `<button class="btn sm primary" data-act="quiz" data-exam="${esc(e.id)}" data-topic="${esc(t.id)}" data-n="4">Take check</button>`
-        : studyable ? `<button class="btn sm primary" data-act="study" data-id="${esc(b.id)}">Study</button><button class="btn sm" data-act="quiz" data-exam="${esc(e.id)}" data-topic="${esc(t.id)}">Quiz</button>`
-        : `<button class="btn sm primary" data-act="quiz" data-exam="${esc(e.id)}" data-topic="${esc(t.id)}">Quiz</button>`) + acts;
-      if (type === "mock") acts = `<button class="btn sm primary" data-act="mock" data-id="${esc(b.id)}">Enter results</button>` + acts;
+      if (t) acts = (type === "check" ? `<button class="btn sm${pri}" data-act="quiz" data-exam="${esc(e.id)}" data-topic="${esc(t.id)}" data-n="4">Take check</button>`
+        : studyable ? `<button class="btn sm${pri}" data-act="study" data-id="${esc(b.id)}">Study</button><button class="btn sm" data-act="quiz" data-exam="${esc(e.id)}" data-topic="${esc(t.id)}">Quiz</button>`
+        : `<button class="btn sm${pri}" data-act="quiz" data-exam="${esc(e.id)}" data-topic="${esc(t.id)}">Quiz</button>`) + acts;
+      if (type === "mock") acts = `<button class="btn sm${pri}" data-act="mock" data-id="${esc(b.id)}">Enter results</button>` + acts;
       if (!past && !studyable) acts = `<button class="btn sm" data-act="focus" data-id="${esc(b.id)}" title="Start a focus session for this block">${TM.blockId === b.id && TM.phase !== "idle" ? "Timer on" : "Focus"}</button>` + acts;
     } else acts = (type === "mock" && status === "done" ? (b.mock ? `<button class="btn sm ghost" data-act="mock" data-id="${esc(b.id)}">${mockScore(b)}</button>` : `<button class="btn sm primary" data-act="mock" data-id="${esc(b.id)}">Enter results</button>`) : "")
       + `<span class="chip ${status === "done" ? "good" : ""}">${status}</span><button class="btn sm ghost" data-act="undo" data-id="${esc(b.id)}" aria-label="Undo">Undo</button>`;
   }
   return `<div class="block ${status}" style="--ec:${e ? examColor(e) : "var(--line)"}">
-    <div class="time">${showDate ? fmtDay(b.date) + "<br>" : ""}${esc(b.start)}<br><span class="small">${minutes} min</span></div>
-    <div class="what"><b>${esc(b.label)}</b><div class="meta"><span class="chip ${type}">${typ}</span>${b.method && Object.hasOwn(METHODS, b.method) ? `<span class="chip method" title="${esc(t && t.methodWhy || "")}">${METHODS[b.method].name}</span>` : ""}${e ? esc(e.subject) : ""}${b.focusMin ? ` · <span class="mono">${Math.round(numOr(b.focusMin, 0))}/${minutes} min focused</span>` : ""}${t && t.sources && !(detail && status === "planned") ? ` · ${esc(t.sources)}` : ""}</div>${detail && status === "planned" ? detailHtml(blockDetail(b)) : ""}</div>
+    <div class="time">${showDate ? `<span>${fmtDay(b.date)}</span><br>` : ""}<span>${esc(b.start)}</span><br><span class="small">${minutes} min</span></div>
+    <div class="what"><b>${esc(b.label)}</b><div class="meta"><span class="chip ${type}">${typ}</span>${b.method && Object.hasOwn(METHODS, b.method) ? `<span class="chip method" title="${esc(t && t.methodWhy || "")}">${METHODS[b.method].name}</span>` : ""}${e ? esc(e.subject) : ""}${b.focusMin ? ` · <span class="mono">${Math.round(numOr(b.focusMin, 0))}/${minutes} min focused</span>` : ""}${t && t.sources && !(detail && status === "planned") ? ` · ${esc(t.sources)}` : ""}</div>${detail && status === "planned" ? foldDetail(detailHtml(blockDetail(b)), fold) : ""}</div>
     <div class="acts">${acts}</div></div>`;
 }
 // What a block is about, concretely: which goals/pages it covers, what to do and what you should
@@ -3112,6 +3112,8 @@ function blockWhat(b) {
   if (k === "spaced") return { covers: [], todo: `From memory, write down what you know about ${names.length ? list3(names) : t.name}. Then check it against the material${where}.`, result: "What you had forgotten, marked, and a short quiz." };
   return { covers: [], todo: `Go over ${names.length ? list3(names) : t.name}${where}${weak.length ? `, mainly ${list3(weak)}` : ""}.`, result: `A quiz at or above your target of ${e.target}%.` };
 }
+// Long lists of blocks (Plan, Today's "Next up") show one line per block; what to do opens on demand.
+function foldDetail(html, fold) { return html && fold ? `<details class="more"><summary>What to do</summary>${html}</details>` : html; }
 function detailHtml(d) {
   if (!d) return "";
   return `<div class="detail">${d.covers.length ? `<div><span class="label">Covers</span><ul>${d.covers.map(g => `<li>${esc(g.text)}${g.src ? ` <span class="muted">· ${esc(g.src)}</span>` : ""}</li>`).join("")}</ul></div>` : ""}
@@ -3161,7 +3163,9 @@ function nowCard() {
   if (!b && !next) return "";
   if (!b) {
     const doneToday = S.blocks.some(x => x.date === t0 && x.status === "done");
-    return `<section class="panel now" id="now"><span class="label">${doneToday ? "Done for today" : "Nothing planned today"}</span><p>Next: <b>${esc(next.label)}</b> on ${fmtDay(next.date)} at ${esc(next.start)}.</p></section>`;
+    const ne = examById(next.examId), early = next.type === "learn" && next.method && Object.hasOwn(METHODS, next.method);
+    return `<section class="panel now" id="now" style="--ec:${examColor(ne)}"><span class="label">${doneToday ? "Done for today" : "Nothing planned today"}</span><p>Next: <b>${esc(next.label)}</b> on ${fmtDay(next.date)} at ${esc(next.start)}.</p>
+      ${foldDetail(detailHtml(blockDetail(next)), true)}${early ? `<div class="row"><button class="btn" data-act="study" data-id="${esc(next.id)}">Start it early</button></div>` : ""}</section>`;
   }
   const e = examById(b.examId), t = topicById(e, b.topicId);
   const studyable = b.type === "learn" && b.method && Object.hasOwn(METHODS, b.method);
@@ -3231,12 +3235,12 @@ function vDashboard() {
   ${nowCard()}
   ${deckPanel()}
   ${noPlan.map(e => `<section class="alert mark" id="noplan"><b>${esc(e.subject)} has no study plan yet</b><span class="small">${e.materials.length ? "Your materials are uploaded. Next: let the AI find the topics, and the plan is built right away." : "Next: upload your scripts, slides and old exams, so the AI can find the topics and build the plan."}</span><div><button class="btn primary" data-act="edit" data-exam="${esc(e.id)}">${e.materials.length ? "Analyze materials" : "Upload materials"}</button></div></section>`).join("")}
-  ${streakPanel()}
-  ${S.exams.length ? fpTeaser() : ""}
   <section class="section">
     <div class="section-head"><h2>${fmtLong(t0)}</h2><span class="muted small">${todays.length ? hrs(sum(todays, b => b.minutes)) + " planned today" : ""}</span></div>
-    ${todays.length ? `<div class="blocks">${todays.map(b => blockRow(b)).join("")}</div>` : `<div class="panel muted">Nothing planned today.${next.length ? " Next up:" : ""}</div>${next.length ? `<div class="blocks">${next.map(b => blockRow(b, { showDate: true, actions: false })).join("")}</div>` : ""}`}
+    ${todays.length ? `<div class="blocks">${todays.map(b => blockRow(b, { fold: true })).join("")}</div>` : `<div class="panel muted">Nothing planned today.${next.length ? " Next up:" : ""}</div>${next.length ? `<div class="blocks">${next.map(b => blockRow(b, { showDate: true, actions: false, fold: true })).join("")}</div>` : ""}`}
   </section>
+  ${streakPanel()}
+  ${S.exams.length ? fpTeaser() : ""}
   <section class="section">
     <div class="section-head"><h2>Exams</h2><button class="btn sm" data-act="new-exam">Add exam</button></div>
     <div class="exams">${upcoming.map(examCard).join("") || `<div class="panel muted">No upcoming exams.</div>`}</div>
@@ -3245,18 +3249,18 @@ function vDashboard() {
   ${S.log.length ? `<section class="section"><div class="section-head"><h2>Latest plan changes</h2><button class="btn sm ghost" data-view="history">See all</button></div><div class="panel log">${S.log.slice(0, 3).map(logItem).join("")}</div></section>` : ""}`;
 }
 // Today: the review deck's due cards (local spaced repetition, no AI).
-function deckPanel() {
+function deckPanel({ main = false } = {}) {
   const D = deckStats();
   if (!D.total) return "";
   const n = Math.min(DECK_DAY, D.due);
   if (!n) return `<p class="small muted" id="deck">Review cards: none due today.${D.next ? ` Next: ${D.nextN} on ${fmtDay(D.next)}.` : ""} ${D.total} card${D.total > 1 ? "s" : ""} in your deck.</p>`;
   return `<section class="panel stack" id="deck"><div class="section-head"><h3>Review cards</h3><span class="small muted">${D.due} due · about ${Math.max(1, Math.round(n / 3))} min</span></div>
     <p class="small" style="max-width:70ch">Questions you missed and your flashcards, mixed across topics. Each card comes back just before you would forget it: tomorrow if you missed it, later each time you knew it. No AI needed.</p>
-    <div class="row"><button class="btn primary" data-act="deck-start">Review ${n} card${n > 1 ? "s" : ""}</button></div></section>`;
+    <div class="row"><button class="btn${main ? " primary" : ""}" data-act="deck-start">Review ${n} card${n > 1 ? "s" : ""}</button></div></section>`;
 }
 function vCards() {
   const back = `<button class="btn sm ghost" data-act="deck-stop">${DK && DK.phase === "run" ? "Stop" : "Back to Today"}</button>`;
-  if (!DK) return `<section class="panel stack" id="cards"><div class="section-head"><h2>Review cards</h2>${back}</div>${deckPanel() || `<p class="muted">Your deck is empty. Missed quiz questions and flashcards from the Study page go here.</p>`}</section>`;
+  if (!DK) return `<section class="panel stack" id="cards"><div class="section-head"><h2>Review cards</h2>${back}</div>${deckPanel({ main: true }) || `<p class="muted">Your deck is empty. Missed quiz questions and flashcards from the Study page go here.</p>`}</section>`;
   if (DK.phase === "done") {
     const x = DK.summary, D = deckStats();
     return `<section class="panel stack" id="cards"><div class="section-head"><h2>Review cards</h2>${back}</div>
@@ -3271,7 +3275,7 @@ function vCards() {
     <div class="row" style="justify-content:space-between"><span class="small muted">${esc(x.e.subject)} · ${esc(x.t ? x.t.name : "")}${again ? " · once more" : ""}</span><span class="small muted mono">${DK.pos + 1} / ${DK.q.length}</span></div>
     <div class="flash ${DK.flipped ? "back" : ""}"><span class="label">${DK.flipped ? "Answer" : "Question"}</span><div style="white-space:pre-wrap">${esc(DK.flipped ? x.c.back : x.c.front)}</div></div>
     ${DK.flipped ? "" : `<span class="small muted">Answer in your head (or out loud) before you look.</span>`}
-    <div class="row">${DK.flipped ? `<button class="btn primary" data-act="deck-knew">Knew it</button><button class="btn" data-act="deck-miss">Missed it</button>` : `<button class="btn primary" data-act="deck-flip">Show answer</button>`}</div></section>`;
+    <div class="row">${DK.flipped ? `<button class="btn primary" data-act="deck-knew" data-autofocus>Knew it</button><button class="btn" data-act="deck-miss">Missed it</button>` : `<button class="btn primary" data-act="deck-flip" data-autofocus>Show answer</button>`}</div></section>`;
 }
 function examCard(e) {
   const r = readiness(e), left = diffDays(today(), e.date);
@@ -3311,7 +3315,7 @@ function vPlan() {
   const dayList = days.length ? days.map(d => `<div class="stack" style="gap:6px">
       <div class="row" style="justify-content:space-between"><h3>${d === t0 ? "Today · " : ""}${fmtLong(d)}</h3><span class="small muted mono">${byDay[d] ? hrs(sum(byDay[d], b => b.minutes)) : ""}</span></div>
       ${(examsOn[d] || []).map(e => `<div class="alert info" style="--ec:${examColor(e)}"><b>Exam: ${esc(e.subject)}</b></div>`).join("")}
-      <div class="blocks">${(byDay[d] || []).map(b => blockRow(b)).join("")}</div></div>`).join("")
+      <div class="blocks">${(byDay[d] || []).map(b => blockRow(b, { fold: true })).join("")}</div></div>`).join("")
     : `<div class="panel stack muted" id="plan-empty">No study blocks yet. The plan is built as soon as an exam has topics.${noTopics ? `<div><button class="btn primary" data-act="edit" data-exam="${esc(noTopics.id)}">Set up ${esc(noTopics.subject)}</button></div>` : ""}</div>`;
   return `
   ${rateCard()}
@@ -3403,18 +3407,18 @@ function vExams() {
     </section>
     <section class="panel stack">
       <div class="section-head"><h2>Topics</h2><span class="small muted mono">${T.length} topics · ${sum(T, t => +t.effortH || 0)} h estimated</span></div>
-      ${T.length ? `<div class="tablewrap"><table>
-        <thead><tr><th>Topic</th><th>Weight</th><th>Effort (h)</th><th>Mastery</th><th>Method</th><th>Builds on</th><th>Where</th><th></th></tr></thead>
+      ${T.length ? `<div class="tablewrap"><table id="topics-table">
+        <thead><tr><th>Topic</th><th>Weight</th><th>Effort (h)</th><th>Mastery</th><th>Method</th><th>Builds on</th><th>Where</th><th><span class="sr-only">Remove</span></th></tr></thead>
         <tbody>${T.map(t => `<tr>
-          <td><input type="text" id="t-name-${t.id}" data-topic="${t.id}" data-tf="name" value="${esc(t.name)}" aria-label="Topic name" style="min-width:170px">${cleanGoals(t.goals).length ? `<div class="small muted" title="${esc(cleanGoals(t.goals).map(g => g.text).join("\n"))}">${cleanGoals(t.goals).length} subtopics${cleanTerms(t.terms).length ? ` · ${cleanTerms(t.terms).length} key terms` : ""}</div>` : ""}${t.extraMin > 0 ? `<div class="small" style="color:var(--warn)">+${hrs(t.extraMin)} added after quizzes</div>` : ""}</td>
-          <td><select id="t-w-${t.id}" data-topic="${t.id}" data-tf="weight" aria-label="Weight">${[1, 2, 3, 4, 5].map(w => `<option ${t.weight == w ? "selected" : ""}>${w}</option>`).join("")}</select>${t.oldExamHits ? `<div class="small muted">${t.oldExamHits}× in old exams</div>` : ""}</td>
-          <td><input type="number" id="t-e-${t.id}" min="0.5" max="20" step="0.5" data-topic="${t.id}" data-tf="effortH" value="${t.effortH}" aria-label="Effort in hours"></td>
-          <td class="mono">${t.mastery == null ? `<span class="muted">—</span>` : `<span class="chip ${t.mastery >= e.target ? "good" : t.mastery >= e.target - 20 ? "warn" : "bad"}">${t.mastery}%</span>`}</td>
-          <td><select id="t-m-${t.id}" data-topic="${t.id}" data-tf="method" aria-label="Study method"><option value="auto" ${!t.methodLock ? "selected" : ""}>Auto${!t.methodLock && t.method && METHODS[t.method] ? ` · ${METHODS[t.method].name}` : ""}</option>${MKEYS.map(m => `<option value="${m}" ${t.methodLock && t.method === m ? "selected" : ""}>${METHODS[m].name}</option>`).join("")}</select></td>
-          <td>${buildsOnSelect(e, t)}</td>
-          <td class="small muted" style="max-width:220px">${esc(t.sources || "")}</td>
-          <td><button class="btn sm ghost" data-act="rm-topic" data-id="${t.id}">${confirmKey === "t" + t.id ? "Click to remove" : "Remove"}</button></td></tr>`).join("")}</tbody></table></div>` : `<p class="muted">No topics yet. Analyze your materials, or add topics by hand.</p>`}
-      <div class="row"><input type="text" id="new-topic" placeholder="New topic name" style="flex:1; min-width:180px"><button class="btn" data-act="add-topic">Add topic</button></div>
+          <td class="tt-wide" data-label="Topic"><input type="text" id="t-name-${t.id}" data-topic="${t.id}" data-tf="name" value="${esc(t.name)}" aria-label="Topic name" style="min-width:170px">${cleanGoals(t.goals).length ? `<div class="small muted" title="${esc(cleanGoals(t.goals).map(g => g.text).join("\n"))}">${cleanGoals(t.goals).length} subtopics${cleanTerms(t.terms).length ? ` · ${cleanTerms(t.terms).length} key terms` : ""}</div>` : ""}${t.extraMin > 0 ? `<div class="small" style="color:var(--warn)">+${hrs(t.extraMin)} added after quizzes</div>` : ""}</td>
+          <td data-label="Weight"><select id="t-w-${t.id}" data-topic="${t.id}" data-tf="weight" aria-label="Weight">${[1, 2, 3, 4, 5].map(w => `<option ${t.weight == w ? "selected" : ""}>${w}</option>`).join("")}</select>${t.oldExamHits ? `<div class="small muted">${t.oldExamHits}× in old exams</div>` : ""}</td>
+          <td data-label="Effort (h)"><input type="number" id="t-e-${t.id}" min="0.5" max="20" step="0.5" data-topic="${t.id}" data-tf="effortH" value="${t.effortH}" aria-label="Effort in hours"></td>
+          <td class="mono" data-label="Mastery">${t.mastery == null ? `<span class="muted">—</span>` : `<span class="chip ${t.mastery >= e.target ? "good" : t.mastery >= e.target - 20 ? "warn" : "bad"}">${t.mastery}%</span>`}</td>
+          <td data-label="Method"><select id="t-m-${t.id}" data-topic="${t.id}" data-tf="method" aria-label="Study method"><option value="auto" ${!t.methodLock ? "selected" : ""}>Auto${!t.methodLock && t.method && METHODS[t.method] ? ` · ${METHODS[t.method].name}` : ""}</option>${MKEYS.map(m => `<option value="${m}" ${t.methodLock && t.method === m ? "selected" : ""}>${METHODS[m].name}</option>`).join("")}</select></td>
+          <td class="tt-wide" data-label="Builds on">${buildsOnSelect(e, t)}</td>
+          <td class="small muted tt-wide" style="max-width:220px"${t.sources ? ` data-label="Where"` : ""}>${esc(t.sources || "")}</td>
+          <td class="tt-wide"><button class="btn sm ghost" data-act="rm-topic" data-id="${t.id}" aria-label="${confirmKey === "t" + t.id ? `Click to remove ${esc(t.name)}` : `Remove ${esc(t.name)}`}">${confirmKey === "t" + t.id ? "Click to remove" : "Remove"}</button></td></tr>`).join("")}</tbody></table></div>` : `<p class="muted">No topics yet. Analyze your materials, or add topics by hand.</p>`}
+      <div class="row"><input type="text" id="new-topic" placeholder="New topic name" aria-label="New topic name" style="flex:1; min-width:180px"><button class="btn" data-act="add-topic">Add topic</button></div>
       <p class="small muted">Weight: how important the topic is for the exam (5 = comes up in almost every old exam). Effort: hours you need to learn it the first time. Builds on: topics you need to understand first, so the plan puts them earlier (Ctrl or Cmd + click to pick more than one).</p>
     </section>
     ${T.length ? `<section class="panel row" id="px-entry"><div class="stack" style="gap:4px; flex:1; min-width:220px"><b>Practice exam (all topics)</b><span class="small muted">The AI writes a full exam across all ${T.length} topics, weighted like the real one. Your points per topic go into the plan.</span></div><button class="btn" data-act="px" data-exam="${esc(e.id)}">Start a practice exam</button></section>` : ""}
@@ -3423,6 +3427,12 @@ function vExams() {
   </div></div>`;
 }
 // Multi-select of the topics this one builds on. Topics that build on this one are left out (no loops).
+// After grading, the right option and a wrong pick say so in words too (not only by colour).
+function optTag(done, j, answer, picked) {
+  if (!done) return "";
+  if (j === answer) return `<span class="tag">${picked === j ? "Your answer · correct" : "Correct answer"}</span>`;
+  return picked === j ? `<span class="tag">Your answer · wrong</span>` : "";
+}
 function buildsOnSelect(e, t) {
   const opts = e.topics.filter(x => x.id !== t.id && !prereqsOf(e, x.id).has(t.id));
   if (!opts.length) return `<span class="muted">—</span>`;
@@ -3460,9 +3470,9 @@ function vQuiz() {
         const r = done ? quiz.results[i] : null;
         return `<div class="panel q">
         <div class="row" style="justify-content:space-between"><span class="label">Question ${i + 1} · ${q.type === "mc" ? "multiple choice" : q.type === "calc" ? "calculation" : "short answer"}</span>${r ? `<span class="chip ${r.score >= .8 ? "good" : r.score >= .4 ? "warn" : "bad"}">${Math.round(r.score * 100)}%</span>` : ""}</div>
-        <div class="qtext">${esc(q.question)}</div>
-        ${q.type === "mc" ? `<div class="opts">${q.options.map((o, j) => `<label class="opt ${done && j === q.answer ? "right" : ""} ${done && quiz.answers[i] === j && j !== q.answer ? "wrong" : ""}"><input type="radio" name="q${i}" id="q${i}-${j}" data-ans="${i}" value="${j}" ${quiz.answers[i] === j ? "checked" : ""} ${done || quiz.phase === "grading" ? "disabled" : ""}><span>${esc(o)}</span></label>`).join("")}</div>`
-          : `<textarea id="qa-${i}" data-ans="${i}" placeholder="Your answer" ${done || quiz.phase === "grading" ? "disabled" : ""}>${esc(quiz.answers[i] || "")}</textarea>`}
+        <div class="qtext" id="qt-${i}">${esc(q.question)}</div>
+        ${q.type === "mc" ? `<div class="opts" role="radiogroup" aria-labelledby="qt-${i}">${q.options.map((o, j) => `<label class="opt ${done && j === q.answer ? "right" : ""} ${done && quiz.answers[i] === j && j !== q.answer ? "wrong" : ""}"><input type="radio" name="q${i}" id="q${i}-${j}" data-ans="${i}" value="${j}" ${quiz.answers[i] === j ? "checked" : ""} ${done || quiz.phase === "grading" ? "disabled" : ""}><span>${esc(o)}</span>${optTag(done, j, q.answer, quiz.answers[i])}</label>`).join("")}</div>`
+          : `<textarea id="qa-${i}" data-ans="${i}" aria-labelledby="qt-${i}" placeholder="Your answer" ${done || quiz.phase === "grading" ? "disabled" : ""}>${esc(quiz.answers[i] || "")}</textarea>`}
         ${confRow(i, done, r)}
         ${done ? `<div class="fb">${r.feedback ? `<span>${esc(r.feedback)}</span>` : ""}<span><b>Model answer:</b> ${esc(q.modelAnswer)}</span><span class="small muted">Concept: ${esc(q.concept)}${q.source ? ` · Source: ${esc(q.source)}` : ""}</span></div>` : ""}
       </div>`;
@@ -3705,9 +3715,9 @@ function vPractice() {
     const r = done ? R[i] : null;
     return `<div class="panel q">
       <div class="row" style="justify-content:space-between"><span class="label">Question ${i + 1} · ${esc(topicName(q.topicId))} · ${q.type === "mc" ? "multiple choice" : q.type === "calc" ? "calculation" : "short answer"} · ${fmtPts(q.points)} points</span>${r ? `<span class="chip ${r.score >= .8 ? "good" : r.score >= .4 ? "warn" : "bad"}">${Math.round(r.score * 100)}%</span>` : ""}</div>
-      <div class="qtext">${esc(q.question)}</div>
-      ${q.type === "mc" ? `<div class="opts">${q.options.map((o, j) => `<label class="opt ${done && j === q.answer ? "right" : ""} ${done && PX.answers[i] === j && j !== q.answer ? "wrong" : ""}"><input type="radio" name="px${i}" id="px${i}-${j}" data-pans="${i}" value="${j}" ${PX.answers[i] === j ? "checked" : ""} ${lock ? "disabled" : ""}><span>${esc(o)}</span></label>`).join("")}</div>`
-        : `<textarea id="px-a-${i}" data-pans="${i}" placeholder="Your answer" ${lock ? "disabled" : ""}>${esc(PX.answers[i] || "")}</textarea>`}
+      <div class="qtext" id="pxt-${i}">${esc(q.question)}</div>
+      ${q.type === "mc" ? `<div class="opts" role="radiogroup" aria-labelledby="pxt-${i}">${q.options.map((o, j) => `<label class="opt ${done && j === q.answer ? "right" : ""} ${done && PX.answers[i] === j && j !== q.answer ? "wrong" : ""}"><input type="radio" name="px${i}" id="px${i}-${j}" data-pans="${i}" value="${j}" ${PX.answers[i] === j ? "checked" : ""} ${lock ? "disabled" : ""}><span>${esc(o)}</span>${optTag(done, j, q.answer, PX.answers[i])}</label>`).join("")}</div>`
+        : `<textarea id="px-a-${i}" data-pans="${i}" aria-labelledby="pxt-${i}" placeholder="Your answer" ${lock ? "disabled" : ""}>${esc(PX.answers[i] || "")}</textarea>`}
       ${done ? `<div class="fb">${r.feedback ? `<span>${esc(r.feedback)}</span>` : ""}<span><b>Model answer:</b> ${esc(q.modelAnswer)}</span><span class="small muted">Concept: ${esc(q.concept)}${q.source ? ` · Source: ${esc(q.source)}` : ""}</span></div>` : ""}
     </div>`; }).join("")}
     ${PX.phase === "answer" ? `<div class="row"><button class="btn primary" data-act="px-submit">Hand in</button><span class="small muted" id="px-count">${Object.keys(PX.answers).length} of ${qs.length} answered</span></div>` : ""}
@@ -3719,17 +3729,59 @@ function vHistory() {
   return `<section class="section"><div class="section-head"><h2>Plan changes</h2><span class="small muted">Every time the coach changed your plan, and why</span></div>
   <div class="panel log">${S.log.length ? S.log.map(logItem).join("") : `<p class="muted">No changes yet. They appear here after quizzes, skipped blocks and edits.</p>`}</div></section>`;
 }
+// Keyboard and screen reader support for the re-rendering views: the whole of #main is rebuilt on
+// every change, so the focused control is found again by its id or data-* attributes and refocused,
+// a view change moves focus to the view's heading, and progress texts (spinners) and toasts are read
+// out through the one polite live region #live (live regions inside #main would be replaced).
+function focusKey(el) {
+  const main = $("#main");
+  if (!el || el === main || !main.contains(el)) return null;
+  if (el.id) return "#" + CSS.escape(el.id);
+  const sel = ["data-act", "data-id", "data-exam", "data-topic", "data-view", "data-v", "data-k", "data-i", "data-date", "data-tf"]
+    .filter(a => el.hasAttribute(a)).map(a => `[${a}="${CSS.escape(el.getAttribute(a))}"]`).join("");
+  return sel ? el.tagName.toLowerCase() + sel : "";
+}
+function announce(msg) {
+  const live = $("#live"); if (!live || !msg) return;
+  live.textContent = "";
+  setTimeout(() => { live.textContent = msg; }, 60);
+}
+let lastBusyText = "", changedEl = null, lastTab = { at: 0, back: false };
+document.addEventListener("keydown", ev => { if (ev.key === "Tab") lastTab = { at: Date.now(), back: ev.shiftKey }; }, true);
 function render() {
   document.querySelectorAll("#nav button").forEach(b => b.setAttribute("aria-current", b.dataset.view === view ? "page" : "false"));
   const v = { dashboard: vDashboard, plan: vPlan, exams: vExams, quiz: vQuiz, you: vYou, study: vStudy, mock: vMock, practice: vPractice, history: vHistory, cards: vCards }[view] || vDashboard;
+  // a change event (fired while Tab moves on from a field) re-renders before the focus lands: keep the field as the anchor
+  let key = focusKey(document.activeElement), moveOn = 0;
+  if (key == null && changedEl) { key = focusKey(changedEl); moveOn = Date.now() - lastTab.at < 500 ? (lastTab.back ? -1 : 1) : 0; }
   $("#main").innerHTML = aiBanner() + v();
+  if (key != null) {
+    let back = key && $("#main").querySelector(key);
+    if (back && moveOn) {
+      const all = [...$("#main").querySelectorAll("a[href], button, input, select, textarea, summary, [tabindex]")]
+        .filter(el => el.tabIndex >= 0 && !el.disabled && el.getClientRects().length && !el.closest("details:not([open]) > :not(summary)"));
+      back = all[all.indexOf(back) + moveOn] || back;
+    }
+    // the focused control is gone (e.g. "Show answer" on a review card): the view's next step, if it marks one
+    if (!back || back.disabled) back = $("#main").querySelector("[data-autofocus]:not([disabled])");
+    if (back) back.focus({ preventScroll: true });
+    else $("#main").focus({ preventScroll: true });
+  }
+  const busyText = [...$("#main").querySelectorAll(".spinner")].map(x => x.parentElement.textContent.replace(/\s+/g, " ").replace(/\b(Stop|Cancel)\b/g, "").trim()).filter(Boolean).join(" ");
+  if (busyText && busyText !== lastBusyText) announce(busyText);
+  lastBusyText = busyText;
   const st = streakInfo(), chip = $("#streakchip");
   chip.hidden = !S.exams.length && !st.current;
   chip.className = "streakchip" + (st.current ? "" : " off");
   chip.textContent = st.current ? `${st.current}-day streak${st.today ? "" : " · keep it today"}` : "No streak yet";
   renderTimer();
 }
-function go(v) { if (v !== "study") micStop(); view = v; confirmKey = null; try { history.replaceState(null, "", "#" + v); } catch (e) { location.hash = v; } render(); window.scrollTo(0, 0); }
+function focusHeading() {
+  const h = $("#main").querySelector("h1, h2");
+  if (!h) return $("#main").focus({ preventScroll: true });
+  h.setAttribute("tabindex", "-1"); h.focus({ preventScroll: true });
+}
+function go(v) { if (v !== "study") micStop(); view = v; confirmKey = null; try { history.replaceState(null, "", "#" + v); } catch (e) { location.hash = v; } render(); window.scrollTo(0, 0); focusHeading(); }
 
 /* ---------- events ---------- */
 $("#nav").addEventListener("click", ev => { const b = ev.target.closest("button[data-view]"); if (b) go(b.dataset.view); });
@@ -3748,7 +3800,7 @@ $("#main").addEventListener("click", async ev => {
     case "ai-code": { const v = ($("#ai-code") || {}).value || ""; try { localStorage.setItem("examcoach-code", v.trim()); } catch (e) {} checkAI(); break; }
     case "study": studyId = el.dataset.id; go("study"); break;
     case "deck-start": startDeck(); break;
-    case "deck-flip": if (DK) { DK.flipped = true; render(); } break;
+    case "deck-flip": if (DK) { DK.flipped = true; render(); const x = deckCard(DK.pos); if (x) announce("Answer: " + x.c.back); } break;
     case "deck-knew": deckRate(true); break;
     case "deck-miss": deckRate(false); break;
     case "deck-stop": if (DK && DK.phase === "run" && Object.keys(DK.res).length) { finishDeck(); render(); } else { DK = null; go("dashboard"); } break;
@@ -3865,6 +3917,7 @@ $("#main").addEventListener("click", async ev => {
     case "submit": gradeQuiz(); break;
   }
 });
+$("#main").addEventListener("change", ev => { changedEl = ev.target; setTimeout(() => { changedEl = null; }); }, true);
 $("#main").addEventListener("change", ev => {
   const el = ev.target;
   const e = examById(selExam);

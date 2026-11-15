@@ -1863,6 +1863,143 @@ test("works on a 375 px phone screen", async () => {
   await phone.close();
 });
 
+// ---- accessibility and mobile ---------------------------------------------------
+// WCAG contrast of the colour tokens, read from the page in both themes (text ≥ 4.5:1, field borders ≥ 3:1).
+test("colour tokens meet WCAG contrast in the light and the dark theme", async () => {
+  const ctx = await browser.newContext(); await serve(ctx); const p = await open(ctx);
+  const TEXT = [["ink", "bg"], ["ink", "surface"], ["ink", "sunk"], ["muted", "bg"], ["muted", "surface"], ["muted", "sunk"], ["muted", "accent-soft"],
+    ["accent", "surface"], ["accent", "bg"], ["accent", "accent-soft"], ["accent-ink", "accent"], ["good", "surface"], ["good", "good-soft"],
+    ["warn", "surface"], ["warn", "warn-soft"], ["bad", "surface"], ["bad", "bad-soft"], ["mark-ink", "mark-soft"], ["ink", "mark-soft"],
+    ["ink", "hl"], ["on-strong", "bad"], ["on-strong", "good"], ["bg", "ink"]];
+  const UI = [["field", "surface"], ["field", "bg"]];
+  for (const scheme of ["light", "dark"]) {
+    await p.emulateMedia({ colorScheme: scheme });
+    const bad = await p.evaluate(([TEXT, UI]) => {
+      const cs = getComputedStyle(document.documentElement), hex = n => { const v = cs.getPropertyValue("--" + n).trim(); return v.startsWith("var(") ? cs.getPropertyValue(v.slice(4, -1)).trim() : v; };
+      const lum = h => { const c = [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16) / 255).map(x => x <= 0.03928 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4); return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]; };
+      const ratio = (a, b) => { const x = lum(hex(a)), y = lum(hex(b)); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); };
+      return [...TEXT.map(([a, b]) => [a, b, ratio(a, b), 4.5]), ...UI.map(([a, b]) => [a, b, ratio(a, b), 3])].filter(x => !(x[2] >= x[3])).map(x => `${x[0]} on ${x[1]}: ${x[2].toFixed(2)}`);
+    }, [TEXT, UI]);
+    assert.deepEqual(bad, [], scheme);
+  }
+  await ctx.close();
+});
+
+test("works with the keyboard: every action is a reachable button, focus is visible and kept after re-rendering", async () => {
+  const ctx = await browser.newContext(); await serve(ctx); const p = await open(ctx);
+  // skip link first, then the sections
+  await p.keyboard.press("Tab");
+  assert.equal(await p.evaluate(() => document.activeElement.className), "skip");
+  await p.keyboard.press("Enter");
+  // Tab from the start of the page reaches the example button; Enter activates it
+  let found = false;
+  for (let i = 0; i < 25 && !found; i++) { await p.keyboard.press("Tab"); found = await p.evaluate(() => document.activeElement.dataset.act === "example"); }
+  assert.ok(found, "the example button is reachable with Tab");
+  const ring = await p.evaluate(() => { const s = getComputedStyle(document.activeElement); return s.outlineStyle !== "none" && parseFloat(s.outlineWidth) >= 2; });
+  assert.ok(ring, "the focused button shows a focus ring");
+  await p.keyboard.press("Enter");
+  await p.waitForFunction(() => S.exams.length === 2);
+  for (const v of ["dashboard", "plan", "exams", "quiz", "you", "history"]) {
+    await p.evaluate(v => go(v), v);
+    // a view change moves focus to the view's heading
+    assert.match(await p.evaluate(() => document.activeElement.tagName), /^H[12]$/, v);
+    const r = await p.evaluate(() => {
+      const vis = el => el.getClientRects().length && getComputedStyle(el).visibility !== "hidden";
+      const acts = [...document.querySelectorAll("[data-act], [data-view], [data-t]")].filter(vis);
+      const nameOf = el => (el.getAttribute("aria-label") || (el.labels && [...el.labels].map(l => l.textContent).join(" ")) || (el.getAttribute("aria-labelledby") || "").split(" ").map(id => (document.getElementById(id) || {}).textContent || "").join(" ")).trim();
+      return {
+        notButtons: acts.filter(el => el.tagName !== "BUTTON").map(el => el.outerHTML.slice(0, 60)),
+        unfocusable: acts.filter(el => el.tabIndex < 0 && !el.disabled).map(el => el.outerHTML.slice(0, 60)),
+        unnamed: acts.filter(el => !el.textContent.trim() && !el.getAttribute("aria-label")).length,
+        unlabelled: [...document.querySelectorAll("main input:not([type=hidden]):not([type=radio]):not([type=checkbox]), main select, main textarea")].filter(vis).filter(el => !nameOf(el)).map(el => el.outerHTML.slice(0, 60))
+      };
+    });
+    assert.deepEqual(r, { notButtons: [], unfocusable: [], unnamed: 0, unlabelled: [] }, v);
+  }
+  // pressing a button that re-renders the page keeps the keyboard in place (not back at the top of the page)
+  await p.evaluate(() => go("plan"));
+  await p.focus('[data-act="plan-all"]');
+  await p.keyboard.press("Enter");
+  assert.equal(await p.evaluate(() => busy.planAll), true);
+  assert.ok(await p.evaluate(() => document.getElementById("main").contains(document.activeElement)), "focus stays in the page");
+  // editing a field and pressing Tab moves on to the next field, even though the change re-renders the page
+  await p.evaluate(() => { busy.openSettings = true; render(); });
+  await p.focus("#day-1"); await p.keyboard.press("Control+A"); await p.keyboard.type("3"); await p.keyboard.press("Tab");
+  assert.equal(await p.evaluate(() => S.settings.dayMinutes[1]), 180);
+  assert.equal(await p.evaluate(() => document.activeElement.id), "day-2");
+  // folded block content opens with the keyboard
+  const sum = p.locator("#days details.more > summary").first();
+  await sum.focus(); await p.keyboard.press("Enter");
+  assert.equal(await p.evaluate(() => document.querySelector("#days details.more").open), true);
+  // quiz answers are labelled by their question, and graded answers say right/wrong in words
+  await p.evaluate(() => { const e = S.exams[0]; quiz = { examId: e.id, topicId: e.topics[0].id, phase: "pick" }; go("quiz"); });
+  await p.click('[data-act="gen"]');
+  await p.waitForFunction(() => quiz.phase === "answer");
+  assert.equal(await p.getAttribute(".opts", "role"), "radiogroup");
+  assert.equal(await p.getAttribute("#qa-1", "aria-labelledby"), "qt-1");
+  // a review-card session works with the keyboard alone: after each button the next one has the focus
+  await p.evaluate(() => { const e = S.exams[0]; addCards(e, e.topics[0], [{ front: "Card one?", back: "Answer one" }, { front: "Card two?", back: "Answer two" }], "cards"); e.cards.forEach(c => c.due = today()); commit({ plan: false }); go("dashboard"); });
+  await p.focus('[data-act="deck-start"]'); await p.keyboard.press("Enter");
+  assert.equal(await p.evaluate(() => document.activeElement.tagName), "H2", "the session opens at its heading");
+  await p.focus('[data-act="deck-flip"]'); await p.keyboard.press("Enter");
+  assert.equal(await p.evaluate(() => document.activeElement.dataset.act), "deck-knew", "after Show answer the focus is on Knew it");
+  await p.waitForFunction(() => /^Answer: Answer (one|two)$/.test(document.getElementById("live").textContent));
+  await p.keyboard.press("Tab");
+  assert.equal(await p.evaluate(() => document.activeElement.textContent), "Missed it");
+  await p.keyboard.press("Enter");
+  assert.equal(await p.evaluate(() => document.activeElement.dataset.act), "deck-flip", "the next card's Show answer has the focus");
+  await p.evaluate(() => { DK = null; S.exams[0].cards = []; commit({ plan: false }); });
+  // toasts and progress are read out through the live region
+  await p.evaluate(() => toast("Plan rebuilt."));
+  await p.waitForFunction(() => document.getElementById("live").textContent === "Plan rebuilt.");
+  assert.equal(await p.getAttribute("#live", "role"), "status");
+  assert.equal(await p.getAttribute("#timer", "aria-live"), null, "the ticking timer is not a live region");
+  await ctx.close();
+});
+
+test("fits a 375 px phone on every view: no sideways scrolling, 44 px tap targets, a tab bar at the bottom", async () => {
+  const ctx = await browser.newContext({ viewport: { width: 375, height: 740 }, hasTouch: true, reducedMotion: "reduce" }); await serve(ctx); const p = await open(ctx);
+  const check = async name => {
+    const r = await p.evaluate(() => {
+      const vis = el => { const b = el.getBoundingClientRect(); return b.width && b.height && getComputedStyle(el).visibility !== "hidden" && !el.closest("details:not([open]) > :not(summary)"); };
+      return {
+        over: document.documentElement.scrollWidth - innerWidth,
+        small: [...document.querySelectorAll("main .btn, #nav button, #timer button")].filter(vis).filter(el => el.getBoundingClientRect().height < 44).map(el => el.textContent.trim().slice(0, 30) + " " + Math.round(el.getBoundingClientRect().height))
+      };
+    });
+    assert.ok(r.over <= 0, `${name}: page is ${r.over}px wider than the screen`);
+    assert.deepEqual(r.small, [], `${name}: buttons under 44 px`);
+  };
+  await check("first visit");
+  await p.click('[data-act="example"]');
+  for (const v of ["dashboard", "plan", "exams", "quiz", "you", "history"]) { await p.evaluate(v => go(v), v); await check(v); }
+  await p.evaluate(() => { busy.openSettings = true; go("plan"); }); await check("plan with settings");
+  await p.evaluate(() => { studyId = S.blocks.find(b => b.type === "learn" && b.status === "planned").id; go("study"); }); await check("study");
+  await p.evaluate(() => openMock(S.blocks.find(b => b.type === "mock"))); await check("mock");
+  await p.evaluate(() => openPractice(S.exams[0])); await check("practice exam");
+  await p.evaluate(() => { const e = S.exams[0]; quiz = { examId: e.id, topicId: e.topics[0].id, phase: "pick" }; go("quiz"); });
+  await p.click('[data-act="gen"]'); await p.waitForFunction(() => quiz.phase === "answer"); await check("quiz questions");
+  await p.evaluate(() => { const e = S.exams[0]; addCards(e, e.topics[0], [{ front: "A card question that is a little longer than usual?", back: "Its answer" }], "cards"); e.cards.forEach(c => c.due = today()); go("dashboard"); startDeck(); }); await check("review cards");
+  await p.click('[data-act="deck-flip"]'); await check("review card answer");
+  await p.evaluate(() => { DK = null; go("dashboard"); });
+  // the topics table is one card per topic: every field fully on screen
+  await p.evaluate(() => go("exams"));
+  const cells = await p.evaluate(() => [...document.querySelectorAll("#topics-table input, #topics-table select")].every(el => { const r = el.getBoundingClientRect(); return r.left >= 0 && r.right <= innerWidth; }));
+  assert.ok(cells, "topic fields fit the screen");
+  // sections are a tab bar fixed at the bottom; the timer and the end of the page stay above it
+  const bar = await p.evaluate(() => { const n = document.getElementById("nav").getBoundingClientRect(), t = document.getElementById("timer").getBoundingClientRect();
+    return { bottom: Math.round(n.bottom), h: n.height, pos: getComputedStyle(document.getElementById("nav")).position, timerAbove: t.bottom <= n.top + 1, pad: parseFloat(getComputedStyle(document.getElementById("main")).paddingBottom) }; });
+  assert.equal(bar.pos, "fixed"); assert.equal(bar.bottom, 740); assert.ok(bar.timerAbove, "the timer pill sits above the tab bar");
+  assert.ok(bar.pad >= bar.h, "the page ends above the tab bar");
+  assert.equal(await p.innerText('#nav [data-view="exams"]'), "Exams", "short labels on a phone");
+  await p.tap('#nav [data-view="history"]');
+  assert.equal(await p.evaluate(() => view), "history");
+  // reduced motion: the spinner doesn't spin
+  await p.evaluate(() => { document.getElementById("main").insertAdjacentHTML("beforeend", '<span class="spinner" id="spin-test"></span>'); });
+  assert.ok(parseFloat(await p.evaluate(() => getComputedStyle(document.getElementById("spin-test")).animationDuration)) < 0.01);
+  await ctx.close();
+});
+
 test("makes no requests to other servers and has no errors", () => {
   assert.ok(upstream.calls >= 4, "the AI backend was called");
   assert.ok(upstream.answered.every(m => m === "gemini-3.8-flash"), "uses the default Gemini model");
