@@ -162,6 +162,9 @@ function normalize() {
     if (b.mock) b.mock.tasks = b.mock.tasks.filter(x => x && typeof x === "object").map(x => ({ ...x, label: String(x.label ?? ""), got: Math.max(0, +x.got || 0), max: Math.max(0, +x.max || 0) }));
     if (b.mock && b.mock.fx != null && (typeof b.mock.fx !== "object" || Array.isArray(b.mock.fx))) delete b.mock.fx;
     if (b.practice != null) b.practice = b.practice === true && b.type === "mock";
+    // other topics of a mixed review / exam practice block (b.topicId is the first one)
+    if (b.mix != null) b.mix = Array.isArray(b.mix) ? [...new Set(b.mix.map(String))].filter(id => id !== b.topicId).slice(0, 4) : [];
+    if (b.since != null) b.since = Array.isArray(b.since) ? b.since.map(Number).filter(Number.isFinite).map(Math.round).slice(0, 5) : [];
     if (b.goals != null) b.goals = Array.isArray(b.goals) ? b.goals.map(Number).filter(n => Number.isInteger(n) && n >= 0 && n < 8) : [];
   }
   if (!Array.isArray(S.archive)) S.archive = [];
@@ -187,7 +190,11 @@ function normExam(e) {
     if (typeof t.summary === "string") t.summary = mathText(t.summary);
     t.goals = cleanGoals(t.goals).map(g => ({ ...g, text: mathText(g.text) }));
     t.terms = cleanTerms(t.terms).map(mathText);
+    // extra check after confident mistakes (see calibrate()): { due, set, concepts }
+    if (t.calCheck && (typeof t.calCheck !== "object" || !/^\d{4}-\d{2}-\d{2}$/.test(String(t.calCheck.due)))) delete t.calCheck;
+    if (t.calCheck) t.calCheck = { due: t.calCheck.due, set: /^\d{4}-\d{2}-\d{2}$/.test(String(t.calCheck.set)) ? t.calCheck.set : t.calCheck.due, concepts: strs(t.calCheck.concepts).slice(0, 4).map(x => x.slice(0, 80)) };
   }
+  cleanCards(e);
   if (typeof e.style === "string") e.style = mathText(e.style);
   return cleanPrereqs(e);
 }
@@ -424,7 +431,11 @@ function replan() {
   S.shortfall = {};
   if (!active.length) { S.blocks = keep; return; }
   assignMethods(active);
-  const GAPS = spacingGaps();
+  const FP0 = fingerprint(), GAPS = [2, FP0.forget.gap2], FORGET = FP0.forget.factor;
+  // Expanding spacing after the first spaced review: the next review waits about as long as the
+  // topic has been known (learned 6 days ago → in 6 days, then 12, 24…), at least the second gap,
+  // scaled by how fast this student forgets (learning profile).
+  const nextGap = (L, d) => Math.max(GAPS[1], Math.round(diffDays(L, d) * FORGET));
   const lastDay = addDays(active[active.length - 1].date, -1);
   const days = []; for (let d = t0; d <= lastDay; d = addDays(d, 1)) days.push(d);
   const cap = {}, cur = {};
@@ -461,7 +472,14 @@ function replan() {
     }
     out.push({ id: uid(), date: d, start: fromMin(cur[d]), minutes, status: "planned", ...props }); cur[d] += minutes + 10; cap[d] -= minutes;
   };
-  const learnEnd = {}, queue = {}, reviews = {};
+  const learnEnd = {}, queue = {}, reviews = {}, later = {};
+  // later[exam]: spaced reviews after the first two, one entry per topic { topicId, L: learned on, due };
+  // placed as mixed reviews (several topics in one block) in step 4
+  const pushLater = (e, topicId, L, base) => {
+    const due = addDays(base, nextGap(L, base)), list = later[e.id], i = list.findIndex(x => x.topicId === topicId);
+    if (i >= 0) list.splice(i, 1);
+    if (due < addDays(e.date, -1)) list.push({ topicId, L, due: due < t0 ? t0 : due });
+  };
   // 1) backwards: final review on the eve, mock exam a few days before
   for (const e of active) {
     const eve = addDays(e.date, -1);
@@ -485,15 +503,29 @@ function replan() {
       while (r > 0) { const m = Math.max(15, Math.min(set.blockMin, r)); r -= m; queue[e.id].push({ topicId: t.id, minutes: m, last: r <= 0, from }); from += m; }
     }
     // 3) reviews already due
-    reviews[e.id] = [];
+    reviews[e.id] = []; later[e.id] = [];
     for (const t of e.topics) {
+      const L = t.learnedOn && ISO.test(t.learnedOn) ? t.learnedOn : null;
       if (t.checkPending && t.checkDue) {
-        reviews[e.id].push({ topicId: t.id, due: t.checkDue < t0 ? t0 : t.checkDue, label: `Retention check: ${t.name}`, type: "check", minutes: 15 });
-        const r2 = addDays(t.learnedOn || t0, GAPS[1]);
-        if (r2 > t.checkDue && r2 < addDays(e.date, -1)) reviews[e.id].push({ topicId: t.id, due: r2 < t0 ? t0 : r2, label: `Spaced review: ${t.name}` });
+        const c = t.checkDue < t0 ? t0 : t.checkDue;
+        reviews[e.id].push({ topicId: t.id, due: c, label: `Retention check: ${t.name}`, type: "check", minutes: 15 });
+        const r2 = addDays(L || t0, GAPS[1]), sp = r2 > t.checkDue && r2 < addDays(e.date, -1);
+        if (sp) reviews[e.id].push({ topicId: t.id, due: r2 < t0 ? t0 : r2, label: `Spaced review: ${t.name}` });
+        if (L) pushLater(e, t.id, L, sp && r2 > t0 ? r2 : c);
       }
-      else if (t.reviewDue && t.reviewDue >= addDays(t0, -30)) reviews[e.id].push({ topicId: t.id, due: t.reviewDue < t0 ? t0 : t.reviewDue, label: `Repair review: ${t.name}` });
-      else if (remainingLearn(t) === 0 && (t.mastery == null || t.mastery < e.target)) reviews[e.id].push({ topicId: t.id, due: t0, label: `Review + quiz: ${t.name}` });
+      else if (t.reviewDue && t.reviewDue >= addDays(t0, -30)) {
+        const due = t.reviewDue < t0 ? t0 : t.reviewDue;
+        reviews[e.id].push({ topicId: t.id, due, label: `Repair review: ${t.name}` });
+        if (L && remainingLearn(t) === 0) pushLater(e, t.id, L, due);
+      }
+      else if (remainingLearn(t) === 0 && (t.mastery == null || t.mastery < e.target)) {
+        reviews[e.id].push({ topicId: t.id, due: t0, label: `Review + quiz: ${t.name}` });
+        if (L) pushLater(e, t.id, L, t0);
+      }
+      else if (L && remainingLearn(t) === 0) pushLater(e, t.id, L, lastSeen(e, t));
+      // a confident mistake gets a short extra check (calibrate()); dropped a week after it was due
+      if (t.calCheck && t.calCheck.due >= addDays(t0, -7))
+        reviews[e.id].push({ topicId: t.id, due: t.calCheck.due < t0 ? t0 : t.calCheck.due, label: `Extra check: ${t.name}`, minutes: 15 });
     }
   }
   // 4) day by day: due reviews, then learning by urgency
@@ -506,6 +538,21 @@ function replan() {
         const i = reviews[e.id].findIndex(r => r.due <= d); if (i < 0) break;
         const r = reviews[e.id].splice(i, 1)[0];
         place(d, r.minutes || 30, { examId: e.id, topicId: r.topicId, type: r.type || "review", label: r.label }); n++;
+      }
+      // one mixed review per exam and day: the topics whose next spaced review is due (most overdue
+      // first), topped up with ones due in the next 2 days, so a block mixes 2–3 topics (interleaving)
+      const Lx = later[e.id];
+      if (cap[d] >= 30 && d < addDays(e.date, -1) && Lx.some(x => x.due <= d)) {
+        const byDue = (a, b) => a.due < b.due ? -1 : a.due > b.due ? 1 : 0, pick = [];
+        for (const x of [...Lx.filter(x => x.due <= d).sort(byDue), ...Lx.filter(x => x.due > d && x.due <= addDays(d, 2)).sort(byDue)])
+          if (pick.length < 3 && !reviews[e.id].some(r => r.topicId === x.topicId && r.due <= d)) pick.push(x);
+        const ts = pick.map(x => topicById(e, x.topicId)).filter(Boolean);
+        if (ts.length) {
+          for (const x of pick) Lx.splice(Lx.indexOf(x), 1);
+          place(d, Math.min(cap[d], ts.length > 1 ? 45 : 30), { examId: e.id, topicId: ts[0].id, mix: ts.slice(1).map(t => t.id), type: "review",
+            label: ts.length > 1 ? `Mixed review: ${ts.map(t => t.name).join(", ")}` : `Spaced review: ${ts[0].name}`, since: pick.map(x => diffDays(x.L, d)) });
+          for (const x of pick) pushLater(e, x.topicId, x.L, d);
+        }
       }
     }
     while (cap[d] >= 15) {
@@ -530,13 +577,15 @@ function replan() {
           const c2 = addDays(d, 2), r2 = addDays(d, GAPS[1]), lim = addDays(best.date, -1);
           if (c2 < lim) reviews[best.id].push({ topicId: t.id, due: c2, label: `Retention check: ${t.name}`, type: "check", minutes: 15 });
           if (r2 < lim && r2 > c2) reviews[best.id].push({ topicId: t.id, due: r2, label: `Spaced review: ${t.name}` });
+          pushLater(best, t.id, d, r2 < lim && r2 > c2 ? r2 : c2);
         }
       }
     }
   }
   for (const e of active) { const left = sum(queue[e.id], c => c.minutes); if (left > 0) S.shortfall[e.id] = left; }
   // 5) once all learning of an exam is placed, free days before its mock become exam practice:
-  // a block every other day, topics in turn by exam points (old-exam tasks first), so the last weeks aren't empty
+  // a block every other day, topics in turn by exam points (old-exam tasks first), so the last weeks aren't empty;
+  // each block mixes two topics (interleaved practice, as in the exam), and the pairs change every round
   for (const e of active) {
     if (queue[e.id].length) continue;
     const mine = out.filter(b => b.examId === e.id && b.type === "learn").map(b => b.date).sort();
@@ -546,8 +595,9 @@ function replan() {
     for (const d of days) {
       if (d < from || d > learnEnd[e.id] || d >= addDays(e.date, -1) || cap[d] < 45 || !turn.length || (lastP && diffDays(lastP, d) < 2)) continue;
       if (out.some(b => b.date === d && b.examId === e.id && b.type === "mock")) continue;
-      const t = turn[k++ % turn.length];
-      place(d, Math.min(60, cap[d]), { examId: e.id, topicId: t.id, type: "review", practice: true, label: `Exam practice: ${t.name}` }); lastP = d;
+      const n = turn.length, t = turn[k % n], u = n > 1 ? turn[(k + 1) % n] : null;
+      k += u ? 2 : 1; if (u && n % 2 === 0 && k % n === 0) k++;
+      place(d, Math.min(60, cap[d]), { examId: e.id, topicId: t.id, mix: u ? [u.id] : [], type: "review", practice: true, label: `Exam practice: ${t.name}${u ? " + " + u.name : ""}` }); lastP = d;
     }
   }
   S.blocks = keep.concat(out).sort((a, b) => (a.date + a.start) < (b.date + b.start) ? -1 : 1);
@@ -568,15 +618,28 @@ function goalSpan(t, a, b) {
   if (!out.length) out.push(Math.min(G - 1, Math.max(0, Math.floor((a + b) / 2 * G / need))));
   return out;
 }
+// Last day the student retrieved this topic: learned, a done review/check (also as part of a mixed
+// block), or a quiz on it. The next spaced review is counted from here.
+function lastSeen(e, t) {
+  let d = t.learnedOn || today();
+  for (const b of S.blocks) if (b.status === "done" && b.examId === e.id && (b.type === "review" || b.type === "check") && (b.topicId === t.id || (b.mix || []).includes(t.id)) && b.date > d) d = b.date;
+  for (const q of t.quizzes || []) if (ISO.test(q.date) && q.date > d) d = q.date;
+  return d;
+}
 function eveRank(e, t) {
   if (t.mastery == null) return 0;
   const gap = t.mastery - Math.round(e.target * learnProgress(t));
   if (gap < -10) return gap;
   return t.mastery >= e.target + 10 && learnProgress(t) >= 1 ? 1 : 0;
 }
+// Planned minutes per topic; a block with several topics (mixed review, exam practice) is shared out evenly.
 function futureByTopic() {
   const m = {}, t0 = today();
-  for (const b of S.blocks) if (b.status === "planned" && b.date >= t0 && b.topicId) m[b.examId + "|" + b.topicId] = (m[b.examId + "|" + b.topicId] || 0) + b.minutes;
+  for (const b of S.blocks) if (b.status === "planned" && b.date >= t0 && b.topicId) {
+    const ids = [b.topicId, ...(b.mix || [])];
+    for (const id of ids) m[b.examId + "|" + id] = (m[b.examId + "|" + id] || 0) + b.minutes / ids.length;
+  }
+  for (const k in m) m[k] = Math.round(m[k]);
   return m;
 }
 function diffTopics(a, b) {
@@ -606,9 +669,28 @@ function commit({ plan = true, log = null } = {}) {
 // src: undefined for a normal quiz, "teach" (Teach the AI) or "oral" (oral exam practice);
 // those count like a quiz and are marked in the topic's quiz list and the log title.
 const VIA = { teach: "Teach the AI", oral: "oral exam practice" };
-function applyQuizResult(e, t, score, missed, src) {
+// opts.sureWrong: concepts of answers marked "sure" that were wrong (quizzes only), see calibrate().
+function applyQuizResult(e, t, score, missed, src, opts = {}) {
   const r = quizEffect(e, t, score, missed, null, src);
-  return commit({ log: { examId: e.id, kind: "quiz", title: r.title + (VIA[src] ? ` · ${VIA[src]}` : ""), detail: ch => r.detail + (r.verdict === "below" || r.verdict === "above" ? "" : keepText(ch)), score, expected: r.expected, ...(VIA[src] ? { via: src } : {}) } });
+  const cal = calibrate(e, t, opts.sureWrong || [], r.verdict);
+  return commit({ log: { examId: e.id, kind: "quiz", title: r.title + (VIA[src] ? ` · ${VIA[src]}` : ""), detail: ch => r.detail + cal.text + (r.verdict === "below" || r.verdict === "above" || cal.check ? "" : keepText(ch)), score, expected: r.expected, ...(VIA[src] ? { via: src } : {}) } });
+}
+// Confidence calibration made actionable: answers marked "sure" that were wrong are the ones a
+// student skips when revising ("I know this"). Two in one quiz, or one when the topic's recent
+// "sure" answers (4 or more) were right less than 70 % of the time, give a 15-min extra check in
+// 2 days (t.calCheck, placed by replan). A below-plan result gets a repair review tomorrow anyway.
+// The next quiz on the topic on a later day counts as that check.
+const CAL_ACC = 0.7;
+function calibrate(e, t, sureWrong, verdict) {
+  if (t.calCheck && t.calCheck.set < today()) delete t.calCheck;
+  const sw = [...new Set(sureWrong.filter(Boolean))];
+  if (!sw.length) return { text: "" };
+  const C = S.fp.conf.filter(x => x.topicId === t.id && x.c === "sure").slice(-10), acc = C.length ? C.filter(x => x.right).length / C.length : 1;
+  if (!(sw.length >= 2 || (C.length >= 4 && acc < CAL_ACC))) return { text: "" };
+  const what = `You were sure about ${sw.length === 1 ? "an answer that was" : `${sw.length} answers that were`} wrong (${list3(sw, 3)}).`;
+  if (verdict === "below") return { text: ` ${what} The repair review covers ${sw.length === 1 ? "it" : "them"}.` };
+  t.calCheck = { due: addDays(today(), 2), set: today(), concepts: sw.slice(0, 4) };
+  return { check: true, text: ` ${what} Feeling sure can make you skip a topic when revising, so a 15-min extra check of ${t.name} comes in 2 days.` };
 }
 // Root-cause check: the weakest topic this one builds on that is below the target (quizzed),
 // or not quizzed yet and not fully learned (so there's no sign the student knows it).
@@ -735,6 +817,135 @@ function reverseMock(e, b) {
 }
 const canEditMock = b => !!(b && b.mock && b.mock.fx);
 const fmtPts = n => String(Math.round(n * 10) / 10);
+
+/* ---------- review deck (spaced repetition) ---------- */
+// Per exam `e.cards`: quiz and practice-exam questions the student missed (or only guessed right),
+// and the flashcards made on the Study page. Leitner boxes 1–5: a card you knew moves up one box and
+// comes back after LEITNER[box] days (1, 3, 7, 14, 30), a missed card goes back to box 1 (tomorrow)
+// and is shown once more at the end of the session. Never later than the exam's eve. Reviewed on the
+// page without any AI call. Cards are self-rated, so a session only nudges mastery (DECK_WEIGHT) of
+// topics that already have a quiz score and had DECK_MIN_TOPIC+ cards; it is not a quiz (no fp.quizLog entry).
+const LEITNER = [0, 1, 3, 7, 14, 30], DECK_MAX = 400, DECK_DAY = 20, DECK_WEIGHT = 0.15, DECK_MIN_TOPIC = 3;
+const ISO = /^\d{4}-\d{2}-\d{2}$/;
+const cardKey = s => String(s || "").toLowerCase().replace(/\s+/g, " ").trim().slice(0, 200);
+function cardDue(e, box) {
+  const d = addDays(today(), LEITNER[box] || 1), eve = addDays(e.date, -1);
+  return d <= eve ? d : eve > today() ? eve : addDays(today(), 1);
+}
+function cleanCards(e) {
+  const ids = new Set(e.topics.map(t => t.id)), seen = new Set();
+  e.cards = (Array.isArray(e.cards) ? e.cards : []).filter(c => c && typeof c === "object" && ids.has(c.topicId) && strOf(c.front) && strOf(c.back))
+    .map(c => ({ id: strOf(c.id).slice(0, 20) || uid(), topicId: c.topicId, front: strOf(c.front).slice(0, 600), back: strOf(c.back).slice(0, 800), src: ["quiz", "cards", "exam"].includes(c.src) ? c.src : "cards",
+      box: Math.min(5, Math.max(1, Math.round(+c.box) || 1)), due: ISO.test(c.due) ? c.due : today(), added: ISO.test(c.added) ? c.added : today(),
+      seen: Math.max(0, Math.round(+c.seen) || 0), lapses: Math.max(0, Math.round(+c.lapses) || 0), last: ISO.test(c.last) ? c.last : null }))
+    .filter(c => { const k = cardKey(c.front); if (seen.has(k) || seen.has("#" + c.id)) return false; seen.add(k); seen.add("#" + c.id); return true; }).slice(-DECK_MAX);
+}
+// Adds cards for topic t; a card that is already in the deck is sent back to box 1 when `lapse` (missed again).
+function addCards(e, t, list, src) {
+  if (!e || !t) return 0;
+  if (!Array.isArray(e.cards)) e.cards = [];
+  const have = new Map(e.cards.map(c => [cardKey(c.front), c]));
+  let n = 0;
+  for (const x of list) {
+    const front = strOf(x.front).slice(0, 600), back = strOf(x.back).slice(0, 800);
+    if (!front || !back) continue;
+    const old = have.get(cardKey(front));
+    if (old) { if (x.lapse && old.box > 1) { old.box = 1; old.due = cardDue(e, 1); old.lapses++; } continue; }
+    const c = { id: uid(), topicId: t.id, front, back, src, box: 1, due: cardDue(e, 1), added: today(), seen: 0, lapses: 0, last: null };
+    e.cards.push(c); have.set(cardKey(front), c); n++;
+  }
+  // a full deck drops the best-known oldest cards first
+  if (e.cards.length > DECK_MAX) {
+    const drop = new Set([...e.cards].sort((a, b) => b.box - a.box || (a.added < b.added ? -1 : 1)).slice(0, e.cards.length - DECK_MAX));
+    e.cards = e.cards.filter(c => !drop.has(c));
+  }
+  return n;
+}
+// Questions that become cards: missed ones (under 70 % of the points) and ones answered right by a guess.
+// `topicOf(q)` gives the question's topic (quiz: one topic; practice exam: per question).
+function cardsFromAnswers(e, questions, results, conf, topicOf, src) {
+  const L = "ABCDEF";
+  let n = 0;
+  questions.forEach((q, i) => {
+    const r = results[i], t = topicOf(q); if (!r || !t || !q.question) return;
+    const missed = r.score < 0.7, guessed = !missed && conf && conf[i] === "guess";
+    if (!missed && !guessed) return;
+    const mc = q.type === "mc" && Array.isArray(q.options) && q.options[q.answer] != null;
+    const front = q.question + (mc ? "\n" + q.options.map((o, k) => `${L[k]}) ${o}`).join("\n") : "");
+    const back = (mc ? `${L[q.answer]}) ${q.options[q.answer]}. ` : "") + strOf(q.modelAnswer);
+    n += addCards(e, t, [{ front, back, lapse: missed }], src);
+  });
+  return n;
+}
+// Due cards of upcoming exams, oldest first and interleaved: one card per topic in turn, so a
+// session mixes topics instead of drilling one (interleaving).
+function dueCards(at = today()) {
+  const out = [];
+  for (const e of S.exams) if (e.date > at) for (const c of e.cards || []) if (c.due <= at && topicById(e, c.topicId)) out.push({ e, c });
+  out.sort((a, b) => a.c.due < b.c.due ? -1 : a.c.due > b.c.due ? 1 : a.c.box - b.c.box);
+  const lanes = new Map();
+  for (const x of out) { const k = x.e.id + "|" + x.c.topicId; if (!lanes.has(k)) lanes.set(k, []); lanes.get(k).push(x); }
+  const L = [...lanes.values()], mixed = [];
+  while (mixed.length < out.length) for (const l of L) if (l.length) mixed.push(l.shift());
+  return mixed;
+}
+function deckStats() {
+  const t0 = today(), up = S.exams.filter(e => e.date > t0), all = up.flatMap(e => e.cards || []);
+  const due = dueCards().length, later = all.filter(c => c.due > t0).sort((a, b) => a.due < b.due ? -1 : 1);
+  const next = later[0] ? later[0].due : null;
+  return { total: all.length, due, next, nextN: next ? later.filter(c => c.due === next).length : 0 };
+}
+// Review session in memory: DK.q = [examId, cardId] in order; the first rating of a card counts.
+let DK = null;
+function startDeck() {
+  const q = dueCards().slice(0, DECK_DAY).map(x => [x.e.id, x.c.id]);
+  if (!q.length) return toast("No cards are due today.");
+  DK = { q, pos: 0, flipped: false, res: {}, phase: "run" };
+  go("cards");
+}
+function deckCard(k) { const [eid, cid] = DK.q[k] || [], e = examById(eid), c = e && (e.cards || []).find(x => x.id === cid); return c ? { e, c, t: topicById(e, c.topicId) } : null; }
+function deckRate(knew) {
+  if (!DK || DK.phase !== "run") return;
+  const x = deckCard(DK.pos);
+  if (x && !(x.c.id in DK.res)) {
+    DK.res[x.c.id] = { examId: x.e.id, topicId: x.c.topicId, knew };
+    x.c.seen++; x.c.last = today();
+    if (knew) x.c.box = Math.min(5, x.c.box + 1); else { x.c.box = 1; x.c.lapses++; DK.q.push(DK.q[DK.pos]); }
+    x.c.due = cardDue(x.e, x.c.box);
+  }
+  DK.pos++; DK.flipped = false;
+  while (DK.pos < DK.q.length && !deckCard(DK.pos)) DK.pos++; // a card whose exam or topic was removed meanwhile
+  if (DK.pos >= DK.q.length) finishDeck(); else { save(); render(); }
+}
+// Ends the session: mastery of topics with a quiz score moves a little towards the share of cards
+// known at the first try; logged as a plan change.
+function finishDeck() {
+  if (!DK) return;
+  const R = Object.values(DK.res);
+  if (!R.length) { DK = null; go("dashboard"); return; }
+  const per = new Map();
+  for (const r of R) { const k = r.examId + "|" + r.topicId, p = per.get(k) || { e: examById(r.examId), n: 0, k: 0 }; p.t = topicById(p.e, r.topicId); p.n++; p.k += r.knew ? 1 : 0; per.set(k, p); }
+  const moved = [];
+  for (const p of per.values()) {
+    if (!p.t || p.n < DECK_MIN_TOPIC || p.t.mastery == null) continue;
+    const m0 = p.t.mastery, m1 = Math.round((1 - DECK_WEIGHT) * m0 + DECK_WEIGHT * 100 * p.k / p.n);
+    if (m1 !== m0) { p.t.mastery = m1; moved.push(`${p.t.name} ${m0}% → ${m1}%`); }
+  }
+  const known = R.filter(r => r.knew).length;
+  bumpActivity("cards", R.length);
+  DK.phase = "done"; DK.summary = { n: R.length, known, moved };
+  const exams = [...new Set(R.map(r => r.examId))];
+  commit({ log: { examId: exams.length === 1 ? exams[0] : null, kind: "cards", title: `Review cards: ${known} of ${R.length} known`,
+    detail: (moved.length ? `Cards count only a little for mastery, because you rate them yourself: ${moved.join(", ")}. ` : `Cards you rate yourself don't change a topic's mastery until it has a quiz score and ${DECK_MIN_TOPIC} or more cards in one session. `)
+      + `Missed cards come back tomorrow; known ones later each time (${LEITNER.slice(2).join(", ")} days).` } });
+}
+
+// A flashcard known at the first try on the Study page starts in box 2 of the deck (back in 3 days).
+function deckFirstTry(b, card) {
+  const e = b && examById(b.examId), c = e && card && (e.cards || []).find(x => cardKey(x.front) === cardKey(card.front));
+  if (!c || c.seen) return;
+  c.seen = 1; c.last = today(); c.box = 2; c.due = cardDue(e, 2); save();
+}
 
 /* ---------- material extraction ---------- */
 // PDFs are read page by page. A page that fails (or hangs) is counted and skipped, the other
@@ -1644,7 +1855,9 @@ async function gradeQuiz() {
   });
   S.fp.conf = S.fp.conf.slice(-400);
   quiz.kind = quizKind(t); logQuiz(e, t, quiz.score, quiz.kind);
-  quiz.change = applyQuizResult(e, t, quiz.score, [...sureWrong, ...results.map(r => r.missed)]);
+  // missed and guessed questions go into the review deck, so they come back spaced out without the AI
+  quiz.deckAdded = cardsFromAnswers(e, quiz.questions, results, conf, () => t, "quiz");
+  quiz.change = applyQuizResult(e, t, quiz.score, [...sureWrong, ...results.map(r => r.missed)], undefined, { sureWrong });
   render(); // commit() rendered before quiz.change was set
 }
 
@@ -1724,7 +1937,7 @@ function newExam() {
 function bumpActivity(k, n) { const d = today(); const a = S.activity[d] = Object.assign({ focus: 0, poms: 0, quiz: 0 }, S.activity[d] || {}); a[k] = (a[k] || 0) + n; save(); }
 function activeDays() {
   const A = new Set();
-  for (const [d, a] of Object.entries(S.activity)) if ((a.quiz || 0) > 0 || (a.focus || 0) >= 15) A.add(d);
+  for (const [d, a] of Object.entries(S.activity)) if ((a.quiz || 0) > 0 || (a.focus || 0) >= 15 || (a.cards || 0) >= 10) A.add(d);
   for (const b of S.blocks) if (b.status === "done") A.add(b.date);
   return A;
 }
@@ -2024,6 +2237,7 @@ function markDone(b) {
   b.status = "done";
   const e = examById(b.examId), t = topicById(e, b.topicId);
   if (b.type === "review" && t) t.reviewDue = null;
+  if (b.type === "review" && t && /^Extra check/.test(b.label || "")) delete t.calCheck;
   let msg = "Nice. Take a quick quiz to check how well it stuck.";
   if (b.type === "learn" && t && !t.learnedOn && remainingLearn(t) === 0) {
     t.learnedOn = today(); t.checkPending = true; t.checkDue = addDays(today(), 2);
@@ -2362,7 +2576,10 @@ async function genStudy(b) {
       const r = await genList(k => ({ prompt: base + spec[m](k), clean: items.clean, maxTokens: genTokens(k, items.per) }), items.n, { key: items.key, signal: aiCtl.signal });
       d = { [items.key]: r.items };
     }
-    ST[b.id] = { phase: "ready", m, data: d, step: 0, pos: 0, order: m === "flashcards" ? d.cards.map((_, i) => i) : [], flipped: false, known: 0, missedOnce: {} };
+    // flashcards also go into the review deck, so they come back spaced out (see review deck)
+    const added = m === "flashcards" ? addCards(e, t, d.cards, "cards") : 0;
+    ST[b.id] = { phase: "ready", m, data: d, step: 0, pos: 0, order: m === "flashcards" ? d.cards.map((_, i) => i) : [], flipped: false, known: 0, missedOnce: {}, added };
+    if (added) save();
   } catch (err) { ST[b.id] = { phase: err.code === "cancelled" ? "idle" : "error", m, error: aiError(err) }; }
   render();
 }
@@ -2401,11 +2618,12 @@ function studyContent(m, st) {
     <ol class="wsteps">${d.example.steps.slice(0, st.step).map(s => `<li>${esc(s)}</li>`).join("")}</ol>
     ${st.step < d.example.steps.length ? `<div class="row"><button class="btn primary" data-act="s-step">${st.step ? "Next step" : "Show the first step"}</button><span class="small muted">Try to predict each step before you reveal it.</span></div>` : `<div class="fb"><b>Answer</b><span>${esc(d.example.answer)}</span></div>
     <hr class="sep"><h3>Now you</h3><div class="qtext">${esc(d.tryIt.problem)}</div><details><summary>Show solution</summary><div class="fb" style="margin-top:8px; white-space:pre-wrap">${esc(d.tryIt.solution)}</div></details>`}`;
-  if (st.pos >= st.order.length) return `<h3>Round finished</h3><p class="big">You knew ${st.known} of ${d.cards.length} cards the first time.</p><div class="row"><button class="btn" data-act="s-restart">Go through them again</button></div>`;
+  const inDeck = st.added ? `<p class="small muted">These cards are in your review deck now: they come back on the Today page, spaced out further each time you know them.</p>` : "";
+  if (st.pos >= st.order.length) return `<h3>Round finished</h3><p class="big">You knew ${st.known} of ${d.cards.length} cards the first time.</p>${inDeck}<div class="row"><button class="btn" data-act="s-restart">Go through them again</button></div>`;
   const c = d.cards[st.order[st.pos]];
   return `<div class="row" style="justify-content:space-between"><h3>Flashcards</h3><span class="small muted mono">${st.pos + 1} / ${st.order.length}</span></div>
     <div class="flash ${st.flipped ? "back" : ""}"><span class="label">${st.flipped ? "Answer" : "Question"}</span><div>${esc(st.flipped ? c.back : c.front)}</div></div>
-    <div class="row">${st.flipped ? `<button class="btn primary" data-act="s-knew">Knew it</button><button class="btn" data-act="s-miss">Missed it</button>` : `<button class="btn primary" data-act="s-flip">Show answer</button>`}</div>`;
+    <div class="row">${st.flipped ? `<button class="btn primary" data-act="s-knew">Knew it</button><button class="btn" data-act="s-miss">Missed it</button>` : `<button class="btn primary" data-act="s-flip">Show answer</button>`}</div>${inDeck}`;
 }
 /* study modes: "Teach the AI" (Feynman method) and oral exam practice, both on the Study page.
    One session per topic in SM (memory only; studyTopic = topic of the open Study page). Each AI call sends the whole transcript, so a failed
@@ -2822,12 +3040,37 @@ const DO = {
 const list3 = (a, n = 3) => a.slice(0, n).join(", ") + (a.length > n ? " …" : "");
 function reviewKind(b) {
   if (b.practice) return "practice";
-  const m = /^(Final review|Retention check|Spaced review|Repair review|Review \+ quiz|Exam practice)/.exec(String(b.label || ""));
-  return m ? { "Final review": "final", "Retention check": "check", "Spaced review": "spaced", "Repair review": "repair", "Review + quiz": "quiz", "Exam practice": "practice" }[m[1]] : b.type;
+  const m = /^(Final review|Retention check|Spaced review|Repair review|Review \+ quiz|Exam practice|Mixed review|Extra check)/.exec(String(b.label || ""));
+  return m ? { "Final review": "final", "Retention check": "check", "Spaced review": "spaced", "Repair review": "repair", "Review + quiz": "quiz", "Exam practice": "practice", "Mixed review": "mixed", "Extra check": "calib" }[m[1]] : b.type;
 }
 function oldTasksOf(e, t) { return e && t ? e.oldTasks.filter(x => x.topicId === t.id) : []; }
 const taskList = tasks => tasks.map(x => `${x.label} (${fmtPts(+x.points || +x.max || 0)} points)`);
+// Every block also says why it is there (`why`), in plain words, with the learning principle behind it.
 function blockDetail(b) {
+  const d = blockWhat(b);
+  if (d) d.why = blockWhy(b);
+  return d;
+}
+function blockWhy(b) {
+  const e = examById(b.examId), t = topicById(e, b.topicId), k = b.type === "review" ? reviewKind(b) : b.type;
+  const mixed = mixTopics(b), ago = Array.isArray(b.since) && b.since.length ? Math.max(...b.since.map(x => numOr(x, 0))) : null;
+  if (b.type === "mock") return b.practice ? "One exam across all topics shows where you stand on everything at once, as in the real exam." : "A full exam under exam conditions a few days before shows what is still missing, with time left to fix it.";
+  if (!t) return "";
+  if (b.type === "learn") return `${t.extraMin > 0 ? "Includes extra time because a result was below plan. " : ""}${t.methodWhy ? `Method: ${t.methodWhy}.` : ""}`.trim();
+  return {
+    check: "Two days after you finish a topic, a short quiz from memory shows what stuck, and which study method works for you.",
+    spaced: `Reviewing just as you start to forget makes it last much longer than reviewing right away (spacing)${ago ? `; you learned it ${ago} days before this` : ""}. Each review can wait longer than the one before.`,
+    mixed: `These topics are due for a spaced review${ago ? ` (up to ${ago} days since you learned them)` : ""}. Mixing them in one block makes you work out which idea fits each question, as in the exam (interleaving).`,
+    repair: "Your last result on this topic was below where the plan expected you to be.",
+    quiz: `Your mastery of ${t.name} is below your target of ${e.target}%, or it hasn't been quizzed since you learned it.`,
+    final: "The day before the exam: the topics where you are furthest behind, no new material.",
+    practice: mixed.length > 1 ? "Your topics are learned. Exam questions from two topics, mixed, keep them fresh and train you to recognise which method a question needs (interleaving)." : "Your topics are learned. Exam questions keep them fresh until the exam.",
+    calib: `You were sure about answers on ${t.name} that were wrong${t.calCheck && t.calCheck.concepts.length ? ` (${list3(t.calCheck.concepts, 3)})` : ""}. Feeling sure can make you skip a topic, so this checks it again.`
+  }[k] || "";
+}
+// All topics of a block: its topic first, then the mixed-in ones (mixed review, exam practice).
+function mixTopics(b) { const e = examById(b.examId); return [b.topicId, ...(Array.isArray(b.mix) ? b.mix : [])].map(id => topicById(e, id)).filter(Boolean); }
+function blockWhat(b) {
   const e = examById(b.examId), t = topicById(e, b.topicId);
   if (b.type === "mock") {
     if (b.practice) return { covers: [], todo: "A practice exam on all topics, written by the AI.", result: "Your points per topic; the plan reacts to them." };
@@ -2855,6 +3098,16 @@ function blockDetail(b) {
   if (k === "check") return { covers: [], todo: "No notes: answer a short quiz from memory.", result: `Your retention score after 2 days; it shows the coach how well ${t.method && METHODS[t.method] ? METHODS[t.method].name.toLowerCase() : "your study method"} works for you.` };
   if (k === "repair") return { covers: [], todo: weak.length ? `Go back to what you got wrong: ${list3(weak, 4)}. Re-read those parts${where}.` : `Re-read the parts you found hard${where}.`, result: "Redo the questions you missed, then a quiz to see if it's fixed." };
   if (k === "final") return { covers: [], todo: `Go over your summary or cards for ${t.name}${weak.length ? `, mainly ${list3(weak)}` : names.length ? `: ${list3(names)}` : ""}. No new material.`, result: tasks.length ? `Redo old-exam ${list3(tasks.map(x => x.label), 2)} once more.` : "A short list of what you still mix up, to read once more before the exam." };
+  if (k === "mixed") {
+    const ts = mixTopics(b);
+    return { covers: [], todo: `Without notes, write down what you remember of ${ts.map(x => x.name).join(", ")}, switching between the topics. Then check against the material${ts.some(x => x.sources) ? ` (${ts.map(x => x.sources).filter(Boolean).join("; ")})` : ""} and do your due review cards.`,
+      result: "What you had forgotten, marked in your notes; quiz the topic you knew least." };
+  }
+  if (k === "calib") return { covers: [], todo: `No notes: answer a short quiz on ${t.name}${t.calCheck && t.calCheck.concepts.length ? `, mainly ${list3(t.calCheck.concepts, 3)}` : ""}. Before each answer, say how sure you are.`, result: "Whether you really know what you felt sure about." };
+  if (k === "practice" && mixTopics(b).length > 1) {
+    const ts = mixTopics(b), all = ts.flatMap(x => oldTasksOf(e, x));
+    return { covers: [], todo: all.length ? `Solve old-exam ${list3(taskList(all), 3)} with a timer, in mixed order, then check against the material.` : `Answer exam-style questions on ${ts.map(x => x.name).join(" and ")} with a timer, mixed: take a quiz on each, then redo what you got wrong.`, result: "Your solutions checked; anything you got wrong goes on your list for the final review." };
+  }
   if (k === "practice") return { covers: [], todo: tasks.length ? `Solve old-exam ${list3(taskList(tasks), 3)} with a timer, then check against the material${where}.` : `Answer exam-style questions on ${names.length ? list3(names) : t.name} with a timer: take a quiz, then redo what you got wrong.`, result: "Your solutions checked; anything you got wrong goes on your list for the final review." };
   if (k === "spaced") return { covers: [], todo: `From memory, write down what you know about ${names.length ? list3(names) : t.name}. Then check it against the material${where}.`, result: "What you had forgotten, marked, and a short quiz." };
   return { covers: [], todo: `Go over ${names.length ? list3(names) : t.name}${where}${weak.length ? `, mainly ${list3(weak)}` : ""}.`, result: `A quiz at or above your target of ${e.target}%.` };
@@ -2862,9 +3115,9 @@ function blockDetail(b) {
 function detailHtml(d) {
   if (!d) return "";
   return `<div class="detail">${d.covers.length ? `<div><span class="label">Covers</span><ul>${d.covers.map(g => `<li>${esc(g.text)}${g.src ? ` <span class="muted">· ${esc(g.src)}</span>` : ""}</li>`).join("")}</ul></div>` : ""}
-    <div><span class="label">Do</span> ${esc(d.todo)}</div>${d.terms && d.terms.length ? `<div><span class="label">Key terms</span> ${esc(list3(d.terms, 8))}</div>` : ""}<div><span class="label">Result</span> ${esc(d.result)}</div></div>`;
+    <div><span class="label">Do</span> ${esc(d.todo)}</div>${d.terms && d.terms.length ? `<div><span class="label">Key terms</span> ${esc(list3(d.terms, 8))}</div>` : ""}<div><span class="label">Result</span> ${esc(d.result)}</div>${d.why ? `<div class="small muted"><span class="label">Why this block</span> ${esc(d.why)}</div>` : ""}</div>`;
 }
-const detailText = d => d ? [d.covers.length ? "Covers: " + d.covers.map(g => g.text + (g.src ? ` (${g.src})` : "")).join("; ") : "", "Do: " + d.todo, "Result: " + d.result].filter(Boolean).join("\n") : "";
+const detailText = d => d ? [d.covers.length ? "Covers: " + d.covers.map(g => g.text + (g.src ? ` (${g.src})` : "")).join("; ") : "", "Do: " + d.todo, "Result: " + d.result, d.why ? "Why: " + d.why : ""].filter(Boolean).join("\n") : "";
 // Short note on what this does that a one-off chatbot plan doesn't (empty state and Plan page).
 function chatbotNote() {
   return `<details class="small" id="why"><summary>Why not just ask a chatbot for a plan?</summary>
@@ -2938,7 +3191,7 @@ function weekPlan() {
         return t ? t.name + (before && after ? " (continued)" : after ? " (starts)" : before ? " (finished)" : "") : null;
       }).filter(Boolean);
       if (learn.length) items.push(`${pre}learn ${learn.join(", ")}`);
-      const prac = [...new Set(mine.filter(b => b.practice && b.type !== "mock").map(b => (topicById(e, b.topicId) || {}).name).filter(Boolean))];
+      const prac = [...new Set(mine.filter(b => b.practice && b.type !== "mock").flatMap(b => mixTopics(b).map(x => x.name)))];
       if (prac.length) items.push(`${pre}exam practice on ${prac.join(", ")}`);
       const rv = mine.filter(b => (b.type === "review" && !b.practice) || b.type === "check");
       const checks = rv.filter(b => b.type === "check").length, revs = rv.length - checks;
@@ -2976,6 +3229,7 @@ function vDashboard() {
   ${reviewPrompts()}
   ${rateCard()}
   ${nowCard()}
+  ${deckPanel()}
   ${noPlan.map(e => `<section class="alert mark" id="noplan"><b>${esc(e.subject)} has no study plan yet</b><span class="small">${e.materials.length ? "Your materials are uploaded. Next: let the AI find the topics, and the plan is built right away." : "Next: upload your scripts, slides and old exams, so the AI can find the topics and build the plan."}</span><div><button class="btn primary" data-act="edit" data-exam="${esc(e.id)}">${e.materials.length ? "Analyze materials" : "Upload materials"}</button></div></section>`).join("")}
   ${streakPanel()}
   ${S.exams.length ? fpTeaser() : ""}
@@ -2989,6 +3243,35 @@ function vDashboard() {
     ${pastSection()}
   </section>
   ${S.log.length ? `<section class="section"><div class="section-head"><h2>Latest plan changes</h2><button class="btn sm ghost" data-view="history">See all</button></div><div class="panel log">${S.log.slice(0, 3).map(logItem).join("")}</div></section>` : ""}`;
+}
+// Today: the review deck's due cards (local spaced repetition, no AI).
+function deckPanel() {
+  const D = deckStats();
+  if (!D.total) return "";
+  const n = Math.min(DECK_DAY, D.due);
+  if (!n) return `<p class="small muted" id="deck">Review cards: none due today.${D.next ? ` Next: ${D.nextN} on ${fmtDay(D.next)}.` : ""} ${D.total} card${D.total > 1 ? "s" : ""} in your deck.</p>`;
+  return `<section class="panel stack" id="deck"><div class="section-head"><h3>Review cards</h3><span class="small muted">${D.due} due · about ${Math.max(1, Math.round(n / 3))} min</span></div>
+    <p class="small" style="max-width:70ch">Questions you missed and your flashcards, mixed across topics. Each card comes back just before you would forget it: tomorrow if you missed it, later each time you knew it. No AI needed.</p>
+    <div class="row"><button class="btn primary" data-act="deck-start">Review ${n} card${n > 1 ? "s" : ""}</button></div></section>`;
+}
+function vCards() {
+  const back = `<button class="btn sm ghost" data-act="deck-stop">${DK && DK.phase === "run" ? "Stop" : "Back to Today"}</button>`;
+  if (!DK) return `<section class="panel stack" id="cards"><div class="section-head"><h2>Review cards</h2>${back}</div>${deckPanel() || `<p class="muted">Your deck is empty. Missed quiz questions and flashcards from the Study page go here.</p>`}</section>`;
+  if (DK.phase === "done") {
+    const x = DK.summary, D = deckStats();
+    return `<section class="panel stack" id="cards"><div class="section-head"><h2>Review cards</h2>${back}</div>
+      <p class="big">You knew ${x.known} of ${x.n} card${x.n > 1 ? "s" : ""} at the first try.</p>
+      <p class="small">${x.moved.length ? `Mastery moved a little (cards are self-rated, so they count less than a quiz): ${esc(x.moved.join(", "))}.` : "Cards are self-rated, so they only move a topic's mastery a little, once it has a quiz score."} Missed cards come back tomorrow, the others in ${LEITNER.slice(2).join(", ")} days as you keep knowing them.</p>
+      ${D.due ? `<div class="row"><button class="btn" data-act="deck-start">Review ${Math.min(DECK_DAY, D.due)} more</button></div>` : ""}</section>`;
+  }
+  const x = deckCard(DK.pos);
+  if (!x) return `<section class="panel stack" id="cards"><div class="section-head"><h2>Review cards</h2>${back}</div><p class="muted">These cards are no longer in your deck.</p></section>`;
+  const again = x.c.id in DK.res;
+  return `<section class="panel stack" id="cards" style="border-top:4px solid ${examColor(x.e)}"><div class="section-head"><h2>Review cards</h2>${back}</div>
+    <div class="row" style="justify-content:space-between"><span class="small muted">${esc(x.e.subject)} · ${esc(x.t ? x.t.name : "")}${again ? " · once more" : ""}</span><span class="small muted mono">${DK.pos + 1} / ${DK.q.length}</span></div>
+    <div class="flash ${DK.flipped ? "back" : ""}"><span class="label">${DK.flipped ? "Answer" : "Question"}</span><div style="white-space:pre-wrap">${esc(DK.flipped ? x.c.back : x.c.front)}</div></div>
+    ${DK.flipped ? "" : `<span class="small muted">Answer in your head (or out loud) before you look.</span>`}
+    <div class="row">${DK.flipped ? `<button class="btn primary" data-act="deck-knew">Knew it</button><button class="btn" data-act="deck-miss">Missed it</button>` : `<button class="btn primary" data-act="deck-flip">Show answer</button>`}</div></section>`;
 }
 function examCard(e) {
   const r = readiness(e), left = diffDays(today(), e.date);
@@ -3201,8 +3484,11 @@ function quizSummary(e, t) {
     ${c ? `<div class="fb"><b>What the coach changed</b><span>${esc(c.detail)}</span>
       ${c.changes && c.changes.length ? c.changes.slice(0, 6).map(x => `<div class="change"><span>${esc(x.name)} <span class="muted">· ${esc(x.exam)}</span></span><span class="${x.delta > 0 ? "plus" : "minus"}">${x.delta > 0 ? "+" : "−"}${hrs(Math.abs(x.delta))}</span></div>`).join("") : ""}
     </div><div class="row"><button class="btn sm" data-view="plan">See updated plan</button>${c.changes && c.changes.length ? `<button class="btn sm ghost" data-act="ics">Export calendar again</button>` : ""}</div>` : ""}
+    ${deckNote(quiz.deckAdded)}
   </section>`;
 }
+const deckNote = n => n ? `<p class="small" id="deck-note">${n} question${n > 1 ? "s" : ""} you missed or guessed went into your review deck. ${n > 1 ? "They come" : "It comes"} back on the Today page tomorrow, then less often each time you know ${n > 1 ? "them" : "it"}.</p>` : "";
+
 function pphPanel(e) {
   const P = pointsTable(e), pass = e.mode === "pass", f1 = n => (Math.round(n * 10) / 10).toFixed(1);
   const pill = (v, label) => `<label class="cpill"><input type="radio" name="mode-${e.id}" id="mode-${v}" data-mode="1" value="${v}" ${e.mode === v ? "checked" : ""}>${label}</label>`;
@@ -3371,6 +3657,7 @@ async function submitPractice() {
     const miss = PX.questions.map((q, i) => q.topicId === t.id && results[i].score < 0.7 ? (results[i].missed || q.concept) : "").filter(Boolean);
     if (miss.length) t.weakConcepts = [...new Set([...miss, ...(t.weakConcepts || [])])].filter(Boolean).slice(0, 6);
   }
+  PX.deckAdded = cardsFromAnswers(e, PX.questions, results, PX.conf || {}, q => topicById(e, q.topicId), "exam");
   const st = new Date(PX.startedAt), used = Math.round((Date.now() - PX.startedAt) / 60000);
   const b = { id: uid(), examId: e.id, date: today(), start: fromMin(st.getHours() * 60 + st.getMinutes()), minutes: Math.max(5, Math.min(PX.minutes, used)), status: "done", type: "mock", practice: true, label: "Practice exam (all topics)" };
   S.blocks.push(b);
@@ -3408,6 +3695,7 @@ function vPractice() {
       <div class="tablewrap"><table id="px-topics"><thead><tr><th>Topic</th><th>Questions</th><th>Points</th><th>Score</th></tr></thead><tbody>${per.map(x => { const pct = Math.round(100 * x.g / (x.m || 1)); return `<tr><td>${esc(x.t.name)}</td><td class="mono">${x.n}</td><td class="mono">${fmtPts(x.g)}/${fmtPts(x.m)}</td><td><span class="chip ${pct >= e.target ? "good" : pct >= e.target - 20 ? "warn" : "bad"}">${pct}%</span></td></tr>`; }).join("")}</tbody></table></div>
       ${c ? `<div class="fb"><b>What the coach changed</b><span>${esc(c.detail)}</span>
         ${c.changes.slice(0, 6).map(x => `<div class="change"><span>${esc(x.name)} <span class="muted">· ${esc(x.exam)}</span></span><span class="${x.delta > 0 ? "plus" : "minus"}">${x.delta > 0 ? "+" : "−"}${hrs(Math.abs(x.delta))}</span></div>`).join("")}</div>` : ""}
+      ${deckNote(PX.deckAdded)}
       <div class="row"><button class="btn sm primary" data-view="plan">See updated plan</button><button class="btn sm" data-act="px" data-exam="${esc(e.id)}">New practice exam</button></div></section>`;
   } else top = `<section class="panel stack" id="px" style="border-top:4px solid ${examColor(e)}">${head}
       <p><b>Suggested time: ${PX.minutes} min</b> · ${qs.length} questions · ${fmtPts(total)} points · <span class="mono" id="px-clock">${pxClock()}</span></p>
@@ -3433,7 +3721,7 @@ function vHistory() {
 }
 function render() {
   document.querySelectorAll("#nav button").forEach(b => b.setAttribute("aria-current", b.dataset.view === view ? "page" : "false"));
-  const v = { dashboard: vDashboard, plan: vPlan, exams: vExams, quiz: vQuiz, you: vYou, study: vStudy, mock: vMock, practice: vPractice, history: vHistory }[view] || vDashboard;
+  const v = { dashboard: vDashboard, plan: vPlan, exams: vExams, quiz: vQuiz, you: vYou, study: vStudy, mock: vMock, practice: vPractice, history: vHistory, cards: vCards }[view] || vDashboard;
   $("#main").innerHTML = aiBanner() + v();
   const st = streakInfo(), chip = $("#streakchip");
   chip.hidden = !S.exams.length && !st.current;
@@ -3459,13 +3747,18 @@ $("#main").addEventListener("click", async ev => {
     case "restore-no": busy.restore = null; render(); break;
     case "ai-code": { const v = ($("#ai-code") || {}).value || ""; try { localStorage.setItem("examcoach-code", v.trim()); } catch (e) {} checkAI(); break; }
     case "study": studyId = el.dataset.id; go("study"); break;
+    case "deck-start": startDeck(); break;
+    case "deck-flip": if (DK) { DK.flipped = true; render(); } break;
+    case "deck-knew": deckRate(true); break;
+    case "deck-miss": deckRate(false); break;
+    case "deck-stop": if (DK && DK.phase === "run" && Object.keys(DK.res).length) { finishDeck(); render(); } else { DK = null; go("dashboard"); } break;
     case "s-gen": genStudy(S.blocks.find(x => x.id === studyId)); break;
     case "s-step": { const st = ST[studyId]; if (st) { st.step++; render(); } break; }
     case "s-flip": { const st = ST[studyId]; if (st) { st.flipped = true; render(); } break; }
     case "s-knew": case "s-miss": {
       const st = ST[studyId]; if (!st) break;
       const ci = st.order[st.pos];
-      if (a === "s-knew") { if (!st.missedOnce[ci]) st.known++; }
+      if (a === "s-knew") { if (!st.missedOnce[ci]) { st.known++; deckFirstTry(blk(studyId), st.data.cards[ci]); } }
       else if ((st.missedOnce[ci] || 0) < 2) { st.missedOnce[ci] = (st.missedOnce[ci] || 0) + 1; st.order.push(ci); }
       st.pos++; st.flipped = false; render(); break;
     }
