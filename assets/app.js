@@ -163,7 +163,7 @@ function normalize() {
     if (b.mock && b.mock.fx != null && (typeof b.mock.fx !== "object" || Array.isArray(b.mock.fx))) delete b.mock.fx;
     if (b.practice != null) b.practice = b.practice === true && b.type === "mock";
     // other topics of a mixed review / exam practice block (b.topicId is the first one)
-    if (b.mix != null) b.mix = Array.isArray(b.mix) ? [...new Set(b.mix.map(String))].filter(id => id !== b.topicId).slice(0, 4) : [];
+    if (b.mix != null) { const ex = examById(b.examId); b.mix = Array.isArray(b.mix) ? [...new Set(b.mix.map(String))].filter(id => id !== b.topicId && topicById(ex, id)).slice(0, 4) : []; }
     if (b.since != null) b.since = Array.isArray(b.since) ? b.since.map(Number).filter(Number.isFinite).map(Math.round).slice(0, 5) : [];
     if (b.goals != null) b.goals = Array.isArray(b.goals) ? b.goals.map(Number).filter(n => Number.isInteger(n) && n >= 0 && n < 8) : [];
   }

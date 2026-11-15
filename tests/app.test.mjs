@@ -1656,6 +1656,178 @@ test("practice exam on all topics: weighted questions, local and AI grading, per
   await fresh.close();
 });
 
+test("review deck: missed questions and flashcards come back spaced out and mixed, with no AI calls", async () => {
+  await page.reload(); // the tests above turned the AI off
+  await page.waitForFunction(() => aiState === "ok");
+  const r1 = await page.evaluate(async () => {
+    window.__deckSaved = JSON.stringify(S);
+    const e = normExam({ id: uid(), subject: "Deck exam", date: addDays(today(), 30), format: "written", target: 80, materials: [], style: "",
+      topics: [Object.assign(mkTopic("Hypothesis tests", 3, 2), { mastery: 60 }), mkTopic("Regression", 3, 2)] });
+    S.exams = [e]; S.blocks = []; commit();
+    const [t1, t2] = e.topics;
+    // quiz: mc answered wrong, the written answer gets half marks (missed); both marked "sure"
+    await generateQuiz(e, t1, 2);
+    quiz.answers = { 0: 0, 1: "Keeping H0 although it is false" }; quiz.conf = { 0: "sure", 1: "sure" };
+    await gradeQuiz(); go("quiz");
+    const out = { added: quiz.deckAdded, cards: e.cards.map(c => [c.topicId === t1.id, c.box, c.due, c.src]), front: e.cards[0].front, back: e.cards[0].back,
+      log: S.log[0].detail, note: document.querySelector("#deck-note") ? 1 : 0 };
+    // the same questions again: not added twice
+    await generateQuiz(e, t1, 2); quiz.answers = { 0: 0, 1: "Keeping H0 although it is false" }; await gradeQuiz();
+    out.again = [quiz.deckAdded, e.cards.length];
+    // a confident mistake: a 15-min extra check in 2 days, which says why
+    const xc = S.blocks.find(b => b.label === "Extra check: Hypothesis tests");
+    out.extra = xc && [xc.date, xc.minutes, blockDetail(xc).why];
+    // flashcards made on the Study page go into the deck too; one known at the first try starts in box 2
+    const lb = S.blocks.find(b => b.type === "learn" && b.topicId === t2.id && b.status === "planned");
+    lb.method = "flashcards"; studyId = lb.id; await genStudy(lb);
+    out.flash = [ST[lb.id].added, e.cards.filter(c => c.src === "cards").length];
+    deckFirstTry(lb, ST[lb.id].data.cards[0]);
+    out.firstTry = e.cards.find(c => c.src === "cards").box;
+    // one more card for topic 1, then pretend it is tomorrow: everything is due today
+    addCards(e, t1, [{ front: "What is alpha?", back: "The significance level." }], "cards");
+    for (const c of e.cards) { c.box = 1; c.seen = 0; c.due = today(); }
+    out.order = dueCards().map(x => x.c.topicId === t1.id ? 1 : 2);
+    out.m0 = t1.mastery; out.qlog = S.fp.quizLog.length;
+    go("dashboard");
+    return out;
+  });
+  assert.equal(r1.added, 2, "both missed questions became cards");
+  const tom = await page.evaluate(() => addDays(today(), 1));
+  assert.deepEqual(r1.cards, [[true, 1, tom, "quiz"], [true, 1, tom, "quiz"]], "new cards start in box 1, due tomorrow");
+  assert.match(r1.front, /What is a Type I error\?\nA\) Keeping H0\nB\) Rejecting a true H0/, "mc cards show the options");
+  assert.match(r1.back, /^B\) Rejecting a true H0\. Rejecting a true H0\./);
+  assert.equal(r1.note, 1, "the quiz result says the questions went into the deck");
+  assert.deepEqual(r1.again, [0, 2], "the same question isn't added twice");
+  assert.match(r1.log, /You were sure about 2 answers that were wrong \(Type I error, Type II error\)\. .*15-min extra check of Hypothesis tests comes in 2 days\./);
+  assert.ok(r1.extra, "an extra check is planned");
+  assert.equal(r1.extra[0], await page.evaluate(() => addDays(today(), 2)));
+  assert.equal(r1.extra[1], 15);
+  assert.match(r1.extra[2], /You were sure about answers on Hypothesis tests that were wrong \(Type I error, Type II error\)/);
+  assert.deepEqual(r1.flash, [2, 2]);
+  assert.equal(r1.firstTry, 2);
+  assert.deepEqual(r1.order.slice(0, 4), [1, 2, 1, 2], "due cards are interleaved across topics");
+
+  // the session on the Today page: no AI request at all
+  const calls0 = upstream.calls;
+  assert.match(await page.textContent("#deck"), /Review cards[\s\S]*5 due/);
+  await page.click('[data-act="deck-start"]');
+  assert.equal(await page.evaluate(() => view), "cards");
+  await page.click('[data-act="deck-flip"]'); await page.click('[data-act="deck-miss"]');
+  for (let i = 0; i < 5; i++) {
+    if (await page.locator('[data-act="deck-flip"]').count() === 0) break;
+    await page.click('[data-act="deck-flip"]'); await page.click('[data-act="deck-knew"]');
+  }
+  assert.match(await page.textContent("#cards"), /You knew 4 of 5 cards at the first try/);
+  assert.equal(upstream.calls, calls0, "reviewing cards needs no AI");
+  const r2 = await page.evaluate(m0 => {
+    const e = S.exams[0], t1 = e.topics[0], first = DK.q[0][1];
+    const c = id => e.cards.find(x => x.id === id);
+    return { shownTwice: DK.q.filter(x => x[1] === first).length, missed: [c(first).box, c(first).due, c(first).lapses],
+      known: e.cards.filter(x => x.id !== first).map(x => [x.box, x.due]), m1: t1.mastery, expect: Math.round(0.85 * m0 + 0.15 * 100 * 2 / 3),
+      t2: e.topics[1].mastery, log: [S.log[0].kind, S.log[0].title, S.log[0].detail], qlog: S.fp.quizLog.length, due: dueCards().length, act: S.activity[today()].cards };
+  }, r1.m0);
+  const d3 = await page.evaluate(() => addDays(today(), 3));
+  assert.equal(r2.shownTwice, 2, "a missed card comes back once more at the end of the session");
+  assert.deepEqual(r2.missed, [1, tom, 1], "a missed card stays in box 1 and comes back tomorrow");
+  assert.ok(r2.known.every(([box, due]) => box === 2 && due === d3), "known cards move up a box and come back in 3 days");
+  assert.equal(r2.m1, r2.expect, "mastery moves a little (15 %) towards the share known");
+  assert.equal(r2.t2, null, "a topic without a quiz score gets no mastery from self-rated cards");
+  assert.equal(r2.log[0], "cards");
+  assert.equal(r2.log[1], "Review cards: 4 of 5 known");
+  assert.match(r2.log[2], /Hypothesis tests \d+% → \d+%/);
+  assert.equal(r2.qlog, r1.qlog, "cards are not logged as quizzes (the method comparison stays on real quizzes)");
+  assert.equal(r2.due, 0);
+  assert.equal(r2.act, 5);
+
+  // backup round trip and crafted cards
+  const r3 = await page.evaluate(() => {
+    const e = S.exams[0], before = JSON.stringify(e.cards);
+    const copy = JSON.parse(JSON.stringify(S)); const keep = S; S = copy; normalize();
+    const same = JSON.stringify(S.exams[0].cards) === before;
+    S.exams[0].cards.push(null, 5, { front: "no back", topicId: e.topics[0].id }, { front: "Unknown topic", back: "x", topicId: "nope" },
+      { front: "  what is ALPHA? ", back: "dup", topicId: e.topics[0].id }, { front: "<img id=pwnc>", back: "<b>x</b>", topicId: e.topics[0].id, box: 99, due: "soon", seen: "x" });
+    S.exams[0].topics[0].calCheck = "bad"; S.exams[0].topics[1].calCheck = { due: "2026-01-01", concepts: ["a", 5, null] };
+    S.blocks.push({ id: "mx", examId: e.id, topicId: e.topics[0].id, type: "review", status: "planned", date: addDays(today(), 1), start: "09:00", minutes: 30, label: "Mixed review: <b>", mix: [e.topics[0].id, e.topics[1].id, 7], since: ["x", 4] });
+    normalize();
+    const E = S.exams[0], last = E.cards[E.cards.length - 1], mb = S.blocks.find(b => b.id === "mx");
+    const out = { same, n: E.cards.length, last: [last.front, last.box, last.due === today(), last.seen], cal: ["calCheck" in E.topics[0], E.topics[1].calCheck],
+      mix: mb.mix, since: mb.since, html: blockRow(mb) };
+    S = keep; normalize();
+    return out;
+  });
+  assert.ok(r3.same, "a backup keeps the deck as it was");
+  assert.equal(r3.n, 6, "broken, orphaned and duplicate cards are dropped");
+  assert.deepEqual(r3.last, ["<img id=pwnc>", 5, true, 0]);
+  assert.deepEqual(r3.cal, [false, { due: "2026-01-01", set: "2026-01-01", concepts: ["a", "5"] }]);
+  assert.deepEqual(r3.since, [4]);
+  assert.equal(r3.mix.length, 1);
+  assert.match(r3.html, /Mixed review: &lt;b&gt;[\s\S]*Why this block[\s\S]*up to 4 days/, "a crafted mixed block is escaped and still says why");
+  assert.doesNotMatch(r3.html, /NaN|undefined/);
+  // the deck is shown escaped
+  await page.evaluate(() => { const e = S.exams[0]; addCards(e, e.topics[0], [{ front: "<img id=pwnd>", back: "<i>b</i>" }], "cards"); e.cards.at(-1).due = today(); startDeck(); });
+  assert.equal(await page.locator("#cards img, #cards i").count(), 0);
+  assert.match(await page.textContent("#cards"), /<img id=pwnd>|Question/);
+  await page.evaluate(() => { DK = null; Object.assign(S, JSON.parse(window.__deckSaved)); normalize(); commit(); go("dashboard"); });
+});
+
+test("spaced reviews keep expanding until the exam as mixed reviews, practice mixes topics, every block says why", async () => {
+  const r = await page.evaluate(() => {
+    const saved = JSON.stringify(S);
+    S.settings.dayMinutes = { 0: 120, 1: 120, 2: 120, 3: 120, 4: 120, 5: 120, 6: 120 }; S.settings.blackout = []; S.settings.blockMin = 60; S.settings.startTime = "06:00";
+    const e = normExam({ id: uid(), subject: "Spacing", date: addDays(today(), 50), format: "written", target: 80, materials: [], style: "", topics: ["A", "B", "C", "D", "E", "F"].map(n => mkTopic(n, 3, 3)) });
+    S.exams = [e]; S.blocks = []; replan();
+    const pl = S.blocks.filter(b => b.status === "planned");
+    const covers = (b, t) => b.topicId === t.id || (b.mix || []).includes(t.id);
+    const out = {};
+    out.reviews = e.topics.map(t => {
+      const learned = pl.filter(b => b.type === "learn" && b.topicId === t.id).map(b => b.date).sort().pop();
+      const ds = pl.filter(b => (b.type === "review" || b.type === "check") && !b.practice && !/^Final/.test(b.label) && covers(b, t)).map(b => b.date).sort();
+      return [learned, ...ds].map((d, i, a) => i ? diffDays(a[i - 1], d) : 0).slice(1);
+    });
+    out.mixed = pl.filter(b => /^Mixed review/.test(b.label)).map(b => [b.mix.length, b.minutes]);
+    out.practice = pl.filter(b => b.practice && b.type === "review").map(b => [b.label, b.mix.length]);
+    out.why = pl.filter(b => !(blockDetail(b) || {}).why).map(b => b.label);
+    out.whyMixed = blockDetail(pl.find(b => /^Mixed review/.test(b.label))).why;
+    out.todoMixed = blockDetail(pl.find(b => /^Mixed review/.test(b.label))).todo;
+    const fb = futureByTopic();
+    out.minutes = [Math.round(sum(Object.values(fb))), sum(pl.filter(b => b.topicId && b.date >= today()), b => b.minutes)];
+    const sig = () => S.blocks.map(b => `${b.date} ${b.start} ${b.minutes} ${b.label}`).join("|");
+    const s1 = sig(); replan(); out.stable = s1 === sig();
+    // topics learned 10 days ago, quizzed above target: they still get spaced reviews (not just practice)
+    for (const t of e.topics) {
+      t.learnedOn = addDays(today(), -10); t.checkPending = false; t.mastery = 90; t.quizzes = [{ date: addDays(today(), -8), score: 90 }];
+      S.blocks.push({ id: uid(), examId: e.id, topicId: t.id, type: "learn", status: "done", date: addDays(today(), -10), start: "06:00", minutes: 180, label: "Learn: " + t.name });
+    }
+    replan();
+    const first = S.blocks.filter(b => b.status === "planned" && b.type === "review" && !b.practice && /^(Mixed|Spaced) review/.test(b.label));
+    out.learnedFirst = first.length ? [diffDays(today(), first[0].date), [first[0].topicId, ...first[0].mix].length] : null;
+    out.learnedAll = e.topics.every(t => first.some(b => covers(b, t)));
+    commit({ plan: false }); go("plan"); out.page = document.querySelector("main").textContent;
+    Object.assign(S, JSON.parse(saved)); normalize(); commit(); go("dashboard");
+    return out;
+  });
+  for (const gaps of r.reviews) {
+    assert.ok(gaps.length >= 4, `at least 4 reviews/checks after learning before the eve: ${gaps}`);
+    assert.ok(gaps.slice(1).every((g, i) => g >= gaps[i] - 1), `gaps between reviews grow: ${gaps}`);
+    assert.ok(gaps.at(-1) >= 10, `the last gaps are long: ${gaps}`);
+  }
+  assert.ok(r.mixed.length >= 3, "later spaced reviews are mixed reviews");
+  assert.ok(r.mixed.every(([n, m]) => n >= 1 && m === 45), "a mixed review has 2–3 topics in 45 min");
+  assert.ok(r.practice.length >= 5);
+  assert.ok(r.practice.every(([l, n]) => / \+ /.test(l) && n === 1), "exam practice mixes two topics");
+  assert.ok(new Set(r.practice.map(x => x[0])).size > 3, "the pairs change");
+  assert.deepEqual(r.why, [], "every planned block says why");
+  assert.match(r.whyMixed, /interleaving/);
+  assert.match(r.todoMixed, /Without notes.*switching between the topics/);
+  assert.ok(Math.abs(r.minutes[0] - r.minutes[1]) <= 6, "planned minutes are shared out over the topics of mixed blocks");
+  assert.ok(r.stable, "same plan when re-planned");
+  assert.ok(r.learnedFirst, "learned topics get a spaced review");
+  assert.ok(r.learnedFirst[0] <= 1, "topics last seen 8 days ago are due now");
+  assert.ok(r.learnedFirst[1] >= 2, "and are reviewed together");
+  assert.ok(r.learnedAll, "every learned topic is reviewed again before the exam");
+  assert.match(r.page, /Why this block/);
+});
+
 test("works on a 375 px phone screen", async () => {
   const phone = await browser.newContext({ viewport: { width: 375, height: 740 } });
   await serve(phone);
