@@ -151,7 +151,7 @@ textarea{width:100%; resize:vertical; min-height:70px}
 .steps{padding:0; margin:0}
 
 /* tables */
-.tablewrap{overflow-x:auto}
+.tablewrap{overflow-x:auto; position:relative}
 table{border-collapse:collapse; width:100%; min-width:780px}
 th{text-align:left; font-size:.72rem; text-transform:uppercase; letter-spacing:.07em; color:var(--muted); font-weight:600; padding:6px 8px; border-bottom:1px solid var(--line)}
 td{padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:middle}
@@ -353,4 +353,9 @@ details.more[open] > summary{color:var(--muted)}
   .toast{bottom:calc(76px + env(safe-area-inset-bottom,0px))}
   /* room for the tab bar, and for the open timer card above it */
   main{padding-bottom:max(88px, calc(var(--timer-h, 0px) + 76px))}
+}
+@media (max-width:560px){
+  /* date, time and length on one line above the block title */
+  .block .time{display:flex; flex-wrap:wrap; gap:0 10px}
+  .block .time br{display:none}
 }

@@ -2805,7 +2805,7 @@ function blockRow(b, { actions = true, showDate = false, detail = true, fold = f
       + `<span class="chip ${status === "done" ? "good" : ""}">${status}</span><button class="btn sm ghost" data-act="undo" data-id="${esc(b.id)}" aria-label="Undo">Undo</button>`;
   }
   return `<div class="block ${status}" style="--ec:${e ? examColor(e) : "var(--line)"}">
-    <div class="time">${showDate ? fmtDay(b.date) + "<br>" : ""}${esc(b.start)}<br><span class="small">${minutes} min</span></div>
+    <div class="time">${showDate ? `<span>${fmtDay(b.date)}</span><br>` : ""}<span>${esc(b.start)}</span><br><span class="small">${minutes} min</span></div>
     <div class="what"><b>${esc(b.label)}</b><div class="meta"><span class="chip ${type}">${typ}</span>${b.method && Object.hasOwn(METHODS, b.method) ? `<span class="chip method" title="${esc(t && t.methodWhy || "")}">${METHODS[b.method].name}</span>` : ""}${e ? esc(e.subject) : ""}${b.focusMin ? ` · <span class="mono">${Math.round(numOr(b.focusMin, 0))}/${minutes} min focused</span>` : ""}${t && t.sources && !(detail && status === "planned") ? ` · ${esc(t.sources)}` : ""}</div>${detail && status === "planned" ? foldDetail(detailHtml(blockDetail(b)), fold) : ""}</div>
     <div class="acts">${acts}</div></div>`;
 }
@@ -3458,14 +3458,22 @@ function announce(msg) {
   live.textContent = "";
   setTimeout(() => { live.textContent = msg; }, 60);
 }
-let lastBusyText = "";
+let lastBusyText = "", changedEl = null, lastTab = { at: 0, back: false };
+document.addEventListener("keydown", ev => { if (ev.key === "Tab") lastTab = { at: Date.now(), back: ev.shiftKey }; }, true);
 function render() {
   document.querySelectorAll("#nav button").forEach(b => b.setAttribute("aria-current", b.dataset.view === view ? "page" : "false"));
   const v = { dashboard: vDashboard, plan: vPlan, exams: vExams, quiz: vQuiz, you: vYou, study: vStudy, mock: vMock, practice: vPractice, history: vHistory }[view] || vDashboard;
-  const key = focusKey(document.activeElement);
+  // a change event (fired while Tab moves on from a field) re-renders before the focus lands: keep the field as the anchor
+  let key = focusKey(document.activeElement), moveOn = 0;
+  if (key == null && changedEl) { key = focusKey(changedEl); moveOn = Date.now() - lastTab.at < 500 ? (lastTab.back ? -1 : 1) : 0; }
   $("#main").innerHTML = aiBanner() + v();
   if (key != null) {
-    const back = key && $("#main").querySelector(key);
+    let back = key && $("#main").querySelector(key);
+    if (back && moveOn) {
+      const all = [...$("#main").querySelectorAll("a[href], button, input, select, textarea, summary, [tabindex]")]
+        .filter(el => el.tabIndex >= 0 && !el.disabled && el.getClientRects().length && !el.closest("details:not([open]) > :not(summary)"));
+      back = all[all.indexOf(back) + moveOn] || back;
+    }
     if (back && !back.disabled) back.focus({ preventScroll: true });
     else $("#main").focus({ preventScroll: true });
   }
@@ -3614,6 +3622,7 @@ $("#main").addEventListener("click", async ev => {
     case "submit": gradeQuiz(); break;
   }
 });
+$("#main").addEventListener("change", ev => { changedEl = ev.target; setTimeout(() => { changedEl = null; }); }, true);
 $("#main").addEventListener("change", ev => {
   const el = ev.target;
   const e = examById(selExam);
