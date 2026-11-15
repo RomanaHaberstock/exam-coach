@@ -6,7 +6,8 @@ body{margin:0} img{max-width:100%} [hidden]{display:none!important}
   --bg:#F2F4F8; --surface:#FFFFFF; --sunk:#E8ECF3; --ink:#131A2C; --muted:#5A6378; --line:#D8DEE9;
   --accent:#2F4BD8; --accent-ink:#FFFFFF; --accent-soft:#E3E8FC;
   --mark:#F3C431; --mark-soft:#FCF0C6; --mark-ink:#3B2E00;
-  --good:#1E8657; --good-soft:#DDF2E7; --warn:#B8710A; --warn-soft:#FBEBD2; --bad:#C23B35; --bad-soft:#F8E0DE;
+  --good:#17724A; --good-soft:#DDF2E7; --warn:#8F5606; --warn-soft:#FBEBD2; --bad:#B0302B; --bad-soft:#F8E0DE;
+  --field:#7A8397; --hl:var(--mark); --on-strong:#FFFFFF;
   --e0:#2F4BD8; --e1:#C2410C; --e2:#0F8A7A; --e3:#9333EA; --e4:#B4245E;
   --display:"Bricolage Grotesque", "Avenir Next", "Segoe UI", system-ui, sans-serif;
   --body:"IBM Plex Sans", "Segoe UI", system-ui, -apple-system, sans-serif;
@@ -18,6 +19,7 @@ body{margin:0} img{max-width:100%} [hidden]{display:none!important}
   --accent:#8297FF; --accent-ink:#0E1220; --accent-soft:#232B4F;
   --mark:#E9BA22; --mark-soft:#3A321A; --mark-ink:#FFF4CC;
   --good:#4CC38A; --good-soft:#16332A; --warn:#E5A43C; --warn-soft:#3A2C16; --bad:#F2766E; --bad-soft:#3B1E1E;
+  --field:#6B7593; --hl:#6E560C; --on-strong:#0E1220;
   --e0:#8297FF; --e1:#FB8B4E; --e2:#3CCBB5; --e3:#C08BFF; --e4:#F27BAA;
   color-scheme:dark; } }
 :root[data-theme="dark"]{
@@ -25,6 +27,7 @@ body{margin:0} img{max-width:100%} [hidden]{display:none!important}
   --accent:#8297FF; --accent-ink:#0E1220; --accent-soft:#232B4F;
   --mark:#E9BA22; --mark-soft:#3A321A; --mark-ink:#FFF4CC;
   --good:#4CC38A; --good-soft:#16332A; --warn:#E5A43C; --warn-soft:#3A2C16; --bad:#F2766E; --bad-soft:#3B1E1E;
+  --field:#6B7593; --hl:#6E560C; --on-strong:#0E1220;
   --e0:#8297FF; --e1:#FB8B4E; --e2:#3CCBB5; --e3:#C08BFF; --e4:#F27BAA;
   color-scheme:dark; }
 
@@ -46,18 +49,27 @@ button,input,select,textarea{font:inherit; color:inherit}
 .top-in{max-width:1100px; margin:0 auto; display:flex; align-items:center; gap:20px; flex-wrap:wrap;
   padding-block:10px; padding-left:max(16px, env(safe-area-inset-left,0px)); padding-right:max(16px, env(safe-area-inset-right,0px))}
 .brand{font-family:var(--display); font-weight:700; font-size:1.25rem; letter-spacing:-.02em; white-space:nowrap}
-.brand span{background:linear-gradient(transparent 58%, var(--mark) 58%, var(--mark) 92%, transparent 92%); padding:0 2px}
+.brand span{background:linear-gradient(transparent 58%, var(--hl) 58%, var(--hl) 92%, transparent 92%); padding:0 2px}
 nav{display:flex; gap:4px; overflow-x:auto; flex:1; min-width:0}
 nav button{border:0; background:none; padding:8px 12px; border-radius:8px; cursor:pointer; color:var(--muted); font-weight:500; white-space:nowrap}
 nav button:hover{background:var(--sunk); color:var(--ink)}
 nav button[aria-current="page"]{background:var(--accent-soft); color:var(--accent); font-weight:600}
 .savestate{font-size:.78rem; color:var(--muted); white-space:nowrap}
-/* narrow screens: the tabs get their own row under the brand and wrap, so every section stays reachable */
+nav .ico, nav .short{display:none}
+/* narrow screens: the sections become a tab bar fixed at the bottom (thumb reach, 56 px tall targets,
+   always reachable on long pages); the header shrinks to the brand and the save state */
 @media (max-width:560px){
   .top-in{gap:6px 12px; padding-block:8px}
   .brand{flex:1}
-  nav{order:5; flex:1 1 100%; flex-wrap:wrap; overflow:visible; gap:2px; margin-inline:-6px}
-  nav button{padding:6px 9px; font-size:.9rem}
+  nav{position:fixed; z-index:16; left:0; right:0; bottom:0; display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:0;
+    overflow:visible; background:var(--surface); border-top:1px solid var(--line); padding:0 env(safe-area-inset-right,0px) env(safe-area-inset-bottom,0px) env(safe-area-inset-left,0px)}
+  nav button{display:grid; justify-items:center; align-content:center; gap:2px; min-height:56px; padding:6px 0; font-size:.7rem; border-radius:0; white-space:nowrap; min-width:0}
+  nav button[aria-current="page"]{background:none; box-shadow:inset 0 3px 0 var(--accent)}
+  nav .ico{display:block}
+  nav .long{display:none}
+  nav .short{display:inline}
+  .savestate{display:none}
+  .streakchip{min-height:32px}
 }
 
 main{max-width:1100px; margin:0 auto; padding-block:24px max(64px, calc(var(--timer-h, 0px) + 24px)); padding-left:max(16px, env(safe-area-inset-left,0px)); padding-right:max(16px, env(safe-area-inset-right,0px)); display:grid; gap:24px}
@@ -76,13 +88,13 @@ main{max-width:1100px; margin:0 auto; padding-block:24px max(64px, calc(var(--ti
 .btn.primary:hover{filter:brightness(1.08)}
 .btn.ghost{border-color:transparent; background:none; color:var(--muted)}
 .btn.ghost:hover{background:var(--sunk); color:var(--ink)}
-.btn.danger{color:var(--bad); border-color:var(--bad-soft)}
+.btn.danger{color:var(--bad); border-color:var(--bad)}
 .btn.sm{padding:4px 10px; font-size:.85rem}
 .btn:disabled{opacity:.5; cursor:not-allowed}
 .btn[aria-disabled="true"]{opacity:.5; cursor:not-allowed; pointer-events:none}
 :focus-visible{outline:2px solid var(--accent); outline-offset:2px}
 input[type=text],input[type=number],input[type=date],input[type=time],select,textarea{
-  background:var(--surface); border:1px solid var(--line); border-radius:8px; padding:7px 10px; min-width:0}
+  background:var(--surface); border:1px solid var(--field); border-radius:8px; padding:7px 10px; min-width:0}
 textarea{width:100%; resize:vertical; min-height:70px}
 .field{display:grid; gap:4px}
 .field > span{font-size:.8rem; color:var(--muted); font-weight:500}
@@ -132,7 +144,7 @@ textarea{width:100%; resize:vertical; min-height:70px}
 /* empty */
 .hero{padding:32px 24px; display:grid; gap:18px}
 .hero h1{font-size:clamp(1.8rem,4vw,2.6rem); letter-spacing:-.02em; max-width:22ch}
-.hero h1 mark{background:linear-gradient(transparent 55%, var(--mark) 55%, var(--mark) 90%, transparent 90%); color:inherit}
+.hero h1 mark{background:linear-gradient(transparent 55%, var(--hl) 55%, var(--hl) 90%, transparent 90%); color:inherit}
 .steps{display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:14px; counter-reset:s}
 .steps li{list-style:none; counter-increment:s; display:grid; gap:4px; padding:14px; background:var(--sunk); border-radius:8px}
 .steps li::before{content:counter(s); font-family:var(--display); font-weight:700; font-size:1.4rem; color:var(--accent)}
@@ -204,7 +216,7 @@ details summary{cursor:pointer; font-weight:600}
 @media (max-width:620px){ .streak{grid-template-columns:1fr; gap:14px} }
 .streak-n{display:grid; gap:2px}
 .streak-n .n{font-family:var(--display); font-size:3.2rem; font-weight:700; line-height:1; letter-spacing:-.03em}
-.streak-n .n span{background:linear-gradient(transparent 58%, var(--mark) 58%, var(--mark) 92%, transparent 92%); padding:0 4px}
+.streak-n .n span{background:linear-gradient(transparent 58%, var(--hl) 58%, var(--hl) 92%, transparent 92%); padding:0 4px}
 .strip{display:grid; grid-template-columns:repeat(14,minmax(0,1fr)); gap:4px}
 .strip span{height:26px; border-radius:5px; background:var(--sunk)}
 .strip span.on{background:var(--mark)}
@@ -216,8 +228,8 @@ details summary{cursor:pointer; font-weight:600}
 /* focus timer */
 .timer{position:fixed; z-index:15; right:calc(16px + env(safe-area-inset-right,0px)); bottom:calc(16px + env(safe-area-inset-bottom,0px))}
 .timer-pill{border:1px solid var(--line); background:var(--surface); color:var(--ink); border-radius:99px; padding:10px 16px; font-weight:600; cursor:pointer; display:flex; gap:8px; align-items:center; box-shadow:0 6px 20px rgba(10,15,30,.18)}
-.timer-pill.run{background:var(--bad); color:#fff; border-color:var(--bad)}
-.timer-pill.brk{background:var(--good); color:#fff; border-color:var(--good)}
+.timer-pill.run{background:var(--bad); color:var(--on-strong); border-color:var(--bad)}
+.timer-pill.brk{background:var(--good); color:var(--on-strong); border-color:var(--good)}
 .timer-pill.paused{background:var(--surface); color:var(--ink)}
 .timer-card{width:min(330px, calc(100vw - 32px)); background:var(--surface); border:1px solid var(--line); border-radius:14px; padding:16px; display:grid; gap:12px; box-shadow:0 12px 32px rgba(10,15,30,.22); border-top:5px solid var(--line)}
 .timer-card.focus{border-top-color:var(--bad)}
@@ -293,3 +305,52 @@ hr.sep{border:0; border-top:1px solid var(--line); margin:6px 0; width:100%}
 .setup li.done{opacity:.7}
 .setup li.next{background:var(--accent-soft); outline:2px solid var(--accent)}
 details.panel > summary{font-family:var(--display)}
+
+/* ---------- accessibility ---------- */
+.sr-only{position:absolute!important; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; border:0}
+.skip{position:absolute; left:12px; top:-60px; z-index:30; background:var(--accent); color:var(--accent-ink); padding:10px 14px; border-radius:8px; font-weight:600; text-decoration:none}
+.skip:focus{top:calc(8px + env(safe-area-inset-top,0px))}
+main:focus{outline:none}
+h1[tabindex="-1"]:focus, h2[tabindex="-1"]:focus{outline:none}
+/* every focusable control shows where the keyboard is, also inside coloured alerts */
+:focus-visible{outline:3px solid var(--accent); outline-offset:2px; border-radius:6px}
+.btn.primary:focus-visible{outline-color:var(--ink)}
+.opt:has(input:focus-visible), .cpill:has(input:focus-visible){outline:3px solid var(--accent); outline-offset:2px}
+/* a quiz answer marked right or wrong says so in words too, not only in colour */
+.opt .tag{margin-left:auto; font-size:.72rem; font-weight:700; text-transform:uppercase; letter-spacing:.05em; white-space:nowrap}
+.opt.right .tag{color:var(--good)} .opt.wrong .tag{color:var(--bad)}
+/* folded block content: one line per block, the details on demand */
+details.more{margin-top:4px}
+details.more > summary{font-size:.82rem; font-weight:600; color:var(--accent); width:max-content; max-width:100%; padding:2px 0; list-style-position:inside}
+details.more[open] > summary{color:var(--muted)}
+@media (prefers-reduced-motion:reduce){
+  *, *::before, *::after{animation-duration:.01ms!important; animation-iteration-count:1!important; transition-duration:.01ms!important; scroll-behavior:auto!important}
+}
+/* touch screens: controls at least 44 px tall (WCAG 2.5.5), small chips stay tappable */
+@media (pointer:coarse), (max-width:560px){
+  .btn, .btn.sm{min-height:44px}
+  .btn.sm{padding-inline:12px}
+  .opt{min-height:44px; align-items:center; padding-block:10px}
+  .opt input{margin-top:0}
+  .cpill, .conf .cpill{min-height:44px; padding:8px 14px}
+  input[type=text],input[type=number],input[type=date],input[type=time],select{min-height:44px}
+  details > summary{padding-block:11px}
+}
+/* the topics table becomes one card per topic on a phone */
+@media (max-width:560px){
+  #topics-table{min-width:0}
+  #topics-table thead{display:none}
+  #topics-table, #topics-table tbody{display:block}
+  #topics-table tr{display:grid; grid-template-columns:1fr 1fr; gap:8px 10px; padding:12px 0; border-bottom:1px solid var(--line)}
+  #topics-table td{display:grid; gap:3px; padding:0; border:0; min-width:0; max-width:none!important}
+  #topics-table td[data-label]::before{content:attr(data-label); font-size:.72rem; text-transform:uppercase; letter-spacing:.07em; color:var(--muted); font-weight:600}
+  #topics-table td.tt-wide{grid-column:1/-1}
+  #topics-table td input, #topics-table td select{width:100%; min-width:0!important}
+  #topics-table td:empty{display:none}
+}
+@media (max-width:560px){
+  .timer{bottom:calc(68px + env(safe-area-inset-bottom,0px))}
+  .toast{bottom:calc(76px + env(safe-area-inset-bottom,0px))}
+  /* room for the tab bar, and for the open timer card above it */
+  main{padding-bottom:max(88px, calc(var(--timer-h, 0px) + 76px))}
+}
