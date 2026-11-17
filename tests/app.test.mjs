@@ -105,7 +105,10 @@ globalThis.fetch = async (url, init) => {
   const body = JSON.parse(init.body), prompt = body.contents[0].parts[0].text;
   upstream.prompts.push(prompt);
   upstream.configs.push(body.generationConfig);
-  if (upstream.failWhen && upstream.failWhen(prompt)) return new Response(JSON.stringify({ error: { code: 503, message: "The model is overloaded." } }), { status: 503 });
+  // `failWhen(prompt, model)`: true = 503 overloaded, 429 = quota used up (for that model)
+  const fw = upstream.failWhen && upstream.failWhen(prompt, upstream.models.at(-1));
+  if (fw === 429) return new Response(JSON.stringify({ error: { code: 429, message: "You exceeded your current quota, please check your plan and billing details.", status: "RESOURCE_EXHAUSTED" } }), { status: 429 });
+  if (fw) return new Response(JSON.stringify({ error: { code: 503, message: "The model is overloaded." } }), { status: 503 });
   upstream.answered.push(upstream.models.at(-1));
   if (upstream.delay) await new Promise(r => setTimeout(r, upstream.delay));
   if (upstream.maxPrompt && prompt.length > upstream.maxPrompt) return new Response(JSON.stringify({ error: { code: 400, message: "The input token count exceeds the maximum number of tokens allowed" } }), { status: 400 });
@@ -665,6 +668,170 @@ test("tries a part whose connection broke off again in smaller parts, and resume
   assert.deepEqual(upstream.prompts.map(partOf), ["1/1", "1/3", "2/3", "3/3"]);
   assert.ok(await page.evaluate(id => examById(id).topics.length > 0, id2));
   await page.evaluate(() => { ANALYZE_BUSY.waitS = 20; });
+});
+
+// ---- analysis robustness (cut-off, unreadable, drifted answers, failing parts, page errors) ----
+const anTopic = k => ({ name: `Topic ${k}`, summary: `About topic ${k}.`, weight: 3, oldExamHits: 0, effortH: 2, sources: `Script p. ${k}`, buildsOn: k > 1 ? [`Topic ${k - 1}`] : [],
+  goals: [1, 2, 3].map(g => ({ text: `Goal ${k}.${g}`, pages: `Script p. ${k}` })), terms: [`term ${k}a`, `term ${k}b`, `term ${k}c`] });
+const anJSON = n => JSON.stringify({ topics: Array.from({ length: n }, (_, i) => anTopic(i + 1)), style: "Calculations.", tasks: [{ label: "Task 1", topic: "Topic 1", points: 20 }] });
+// cut off (MAX_TOKENS) in the middle of topic k+1: topics 1…k are complete
+const cutAfter = (n, k) => { const t = anJSON(n); return [{ candidates: [{ content: { parts: [{ text: t.slice(0, t.indexOf(`"Topic ${k + 1}"`) + 4) }] }, finishReason: "MAX_TOKENS" }] }]; };
+const isAnalysis = p => p.includes("study topics in a sensible learning order");
+const isBrief = p => p.includes("Keep the answer short");
+const anMaterial = word => Array.from({ length: 6 }, (_, i) => `\n=== p. ${i + 1} ===\n${word} ` + "Course text about the topics. ".repeat(40)).join("");
+async function analyzeExam(id, { stay = true } = {}) {
+  await page.evaluate(async ([id, stay]) => { aiDown = null; await analyzeMaterials(examById(id), true); if (stay) { selExam = id; go("exams"); } }, [id, stay]);
+  return page.evaluate(id => { const e = examById(id); return { names: e.topics.map(t => t.name), warn: busy.anWarn ? busy.anWarn.msg : "", err: busy.anErr ? busy.anErr.msg : "", toast: $("#toast").textContent, log: S.log[0] && S.log[0].examId === id ? S.log[0].detail : "" }; }, id);
+}
+
+test("analysis: a cut-off or unreadable answer is asked for once more, shorter; complete topics are kept", async () => {
+  const id = await examWithMaterials([{ name: "script.pdf", kind: "script", text: anMaterial("CUTWORD") }]);
+  try {
+    // 1. cut off after 2 of 5 topics, the short try after 3: the better answer's 3 complete topics are kept
+    upstream.prompts = []; upstream.configs = [];
+    upstream.events = p => isAnalysis(p) ? (isBrief(p) ? cutAfter(5, 3) : cutAfter(5, 2)) : null;
+    let r = await analyzeExam(id);
+    assert.equal(upstream.prompts.length, 2, "one more, shorter request");
+    assert.ok(!isBrief(upstream.prompts[0]) && isBrief(upstream.prompts[1]));
+    assert.match(upstream.prompts[1], /"goals" \(2–4 subtopics/);
+    assert.deepEqual(upstream.configs.map(c => [c.maxOutputTokens, c.thinkingConfig && c.thinkingConfig.thinkingLevel]), [[16384, "low"], [12288, "low"]], "low thinking and an output limit sized for the analysis");
+    assert.deepEqual(r.names, ["Topic 1", "Topic 2", "Topic 3"]);
+    assert.match(r.warn, /The AI's answer was cut off, so only its complete topics were kept\. Press Analyse again/);
+    assert.match(r.log, /was cut off, so only its complete topics were kept/);
+    assert.equal(await page.locator("#analyze-partial").count(), 1);
+    assert.deepEqual(await page.evaluate(id => { const e = examById(id); return e.topics.map(t => [t.goals.length, t.prereqs.map(p => topicById(e, p).name)]); }, id), [[3, []], [3, ["Topic 1"]], [3, ["Topic 2"]]]);
+
+    // 2. unreadable text, then a good short answer: all topics, no warning
+    upstream.prompts = [];
+    upstream.events = p => isAnalysis(p) ? (isBrief(p) ? gText(anJSON(4)) : gText("Sorry, here are the topics: Topic 1, Topic 2 …")) : null;
+    r = await analyzeExam(id);
+    assert.equal(upstream.prompts.length, 2);
+    assert.deepEqual(r.names, ["Topic 1", "Topic 2", "Topic 3", "Topic 4"]);
+    assert.equal(r.warn, "");
+    assert.equal(await page.locator("#analyze-partial").count(), 0);
+
+    // 3. all of the answer went into thinking (MAX_TOKENS without text): the short try works
+    upstream.prompts = [];
+    upstream.events = p => isAnalysis(p) ? (isBrief(p) ? gText(anJSON(2)) : [{ candidates: [{ content: { parts: [{ text: "Planning…", thought: true }] }, finishReason: "MAX_TOKENS" }] }]) : null;
+    r = await analyzeExam(id);
+    assert.equal(upstream.prompts.length, 2);
+    assert.deepEqual(r.names, ["Topic 1", "Topic 2"]);
+
+    // 4. unreadable twice: a clear message with a code; the topics from before stay
+    upstream.prompts = [];
+    upstream.events = p => isAnalysis(p) ? gText("no json here") : null;
+    r = await analyzeExam(id);
+    assert.equal(upstream.prompts.length, 2);
+    assert.deepEqual(r.names, ["Topic 1", "Topic 2"], "the exam keeps its topics");
+    assert.match(r.err, /^The AI's answer was cut off or couldn't be read, also on a second, shorter try\. Your files are kept — try again in a minute\. Details: invalid_json\.$/);
+    assert.match(await page.textContent("#analyze-error"), /Details: invalid_json/);
+  } finally { upstream.events = null; }
+});
+
+test("analysis: when the main model's quota is used up, the backup model's differently shaped answer works", async () => {
+  const id = await examWithMaterials([{ name: "script.pdf", kind: "script", text: anMaterial("LITEWORD") }, { name: "old.pdf", kind: "oldexam", text: oldExamText() }]);
+  // Flash-Lite style: other key names and capitals, numbers as strings, goals and terms as one string, pages as numbers
+  const lite = { Topics: [
+    { Title: "Hypothesis tests", Description: "H0 and H1.", Weight: "5", effort: "4h", pages: 12, Goals: "Set up H0 and H1; Compute a p-value", key_terms: "p-value, alpha", oldExamHits: "3" },
+    { title: "Linear regression", weight: "high", effortH: "3–4 hours", goals: [{ goal: "Fit a least-squares line", page: 6 }, { text: "Read R squared", pages: [7, 9] }], terms: [{ term: "slope" }, "R squared"], prerequisites: "Hypothesis tests" },
+    { name: "Sampling", weight: null, effortH: "90 min" }, { summary: "no name: dropped" }],
+    old_exam_tasks: [{ task: "Task 1", topic: "Hypothesis tests", points: "30 P" }, { task: "Task 2", topics: ["Linear regression"], points: 20 }, { task: "Task 3", topic: "Sampling" }],
+    examStyle: ["Calculations.", "Short definitions."] };
+  try {
+    upstream.prompts = []; upstream.models = [];
+    upstream.failWhen = (p, model) => isAnalysis(p) && model === "gemini-3.8-flash" ? 429 : false;
+    upstream.events = p => isAnalysis(p) && upstream.models.at(-1) === "gemini-3.5-flash-lite" ? gText(JSON.stringify(lite)) : null;
+    const r = await analyzeExam(id);
+    assert.deepEqual(upstream.models, ["gemini-3.8-flash", "gemini-3.5-flash-lite"], "429 on the main model: the backup model answers at once");
+    assert.deepEqual(r.names, ["Hypothesis tests", "Linear regression", "Sampling"]);
+    assert.equal(r.err, ""); assert.equal(r.warn, "");
+    const e = await page.evaluate(id => { const e = examById(id); return { t: e.topics.map(t => ({ w: t.weight, h: t.effortH, hits: t.oldExamHits, src: t.sources, goals: t.goals.map(g => g.text + "|" + g.src), terms: t.terms, pre: t.prereqs.map(p => topicById(e, p).name) })),
+      tasks: e.oldTasks.map(x => [x.label, topicById(e, x.topicId)?.name, x.points]), style: e.style }; }, id);
+    assert.deepEqual(e.t[0], { w: 5, h: 4, hits: 3, src: "p. 12", goals: ["Set up H0 and H1|", "Compute a p-value|"], terms: ["p-value", "alpha"], pre: [] });
+    assert.deepEqual(e.t[1], { w: 4, h: 3.5, hits: 0, src: "", goals: ["Fit a least-squares line|p. 6", "Read R squared|p. 7–9"], terms: ["slope", "R squared"], pre: ["Hypothesis tests"] });
+    assert.deepEqual([e.t[2].w, e.t[2].h], [3, 1.5]);
+    assert.deepEqual(e.tasks, [["Task 1", "Hypothesis tests", 30], ["Task 2", "Linear regression", 20]], "a task without points is dropped");
+    assert.equal(e.style, "Calculations. Short definitions.");
+    assert.equal(await page.locator("#ai-down").count(), 0, "the backup model answered: no 'AI unavailable' banner");
+
+    // other shapes: nested under another object, or a bare list
+    for (const shape of [{ analysis: { themes: [{ name: "Nested topic", weight: "2" }] } }, [{ topic: "Bare topic", effortH: "2,5" }]]) {
+      upstream.events = p => isAnalysis(p) && upstream.models.at(-1) === "gemini-3.5-flash-lite" ? gText(JSON.stringify(shape)) : null;
+      const r2 = await analyzeExam(id);
+      assert.equal(r2.names.length, 1, JSON.stringify(r2));
+    }
+    assert.equal(await page.evaluate(id => examById(id).topics[0].effortH, id), 2.5);
+
+    // both models' quotas used up: the page waits, tries twice more, then one banner and a message with a code
+    await page.evaluate(() => { ANALYZE_BUSY.waitS = 1; });
+    upstream.prompts = []; upstream.models = [];
+    upstream.failWhen = p => isAnalysis(p) ? 429 : false;
+    const r3 = await analyzeExam(id);
+    assert.equal(upstream.models.length, 6, "3 tries by the page, main + backup model each");
+    assert.match(r3.err, /^The free AI quota is used up for now \(a quicker backup model was tried too\)\. .* Details: rate_limited — 429/);
+    assert.doesNotMatch(r3.err, /gemini|google|netlify/i);
+    assert.equal(await page.locator("#ai-down").count(), 1, "one banner");
+    assert.equal(r3.names.length, 1, "the topics from before stay");
+    // quota back: Analyse works again
+    upstream.failWhen = null; upstream.events = null;
+    const r4 = await analyzeExam(id);
+    assert.deepEqual(r4.names, ["Hypothesis tests", "Linear regression"]);
+    assert.equal(await page.locator("#ai-down").count(), 0);
+  } finally { upstream.failWhen = null; upstream.events = null; await page.evaluate(() => { ANALYZE_BUSY.waitS = 20; aiDown = null; }); }
+});
+
+test("analysis: a part that can't be read doesn't stop the others; the message names it", async () => {
+  const id = await examWithMaterials([{ name: "slides.pdf", kind: "slides", text: longMaterial() }, { name: "old.pdf", kind: "oldexam", text: oldExamText() }]);
+  const partOf = p => +(p.match(/This is part (\d) of 3/) || [])[1];
+  try {
+    upstream.prompts = [];
+    upstream.events = p => isAnalysis(p) && partOf(p) === 2 ? gText("The model wrote prose instead of JSON.") : null;
+    const r = await analyzeExam(id);
+    assert.deepEqual(upstream.prompts.map(p => partOf(p) + (isBrief(p) ? "s" : "")), ["1", "2", "2s", "3"], "part 2 is tried once more, shorter; part 3 is still read");
+    assert.deepEqual(r.names, ["Hypothesis tests", "Sampling", "Regression models"], "topics of parts 1 and 3");
+    assert.match(r.warn, /^Part 2 of 3 couldn't be read by the AI \(its answer was cut off or unreadable, also on a second, shorter try\), so topics from that part may be missing\. Press Analyse again to try it again\. Details: invalid_json, part 2 of 3\.$/);
+    assert.match(r.toast, /Part 2 of 3 couldn't be read/);
+    assert.match(r.log, /Part 2 of 3 couldn't be read/);
+    assert.match(await page.textContent("#analyze-partial"), /Part 2 of 3/);
+    // every part unreadable: an error, with the code and the part
+    upstream.prompts = [];
+    upstream.events = p => isAnalysis(p) ? gText("nothing") : null;
+    const r2 = await analyzeExam(id);
+    assert.equal(upstream.prompts.length, 6);
+    assert.match(r2.err, /^The AI's answer for every part was cut off or couldn't be read, also on a second, shorter try\. .*Details: invalid_json, part 1 of 3\.$/);
+    assert.equal(r2.names.length, 3, "the topics from before stay");
+  } finally { upstream.events = null; }
+});
+
+test("analysis: an error in the page's own code shows a message with Details and changes nothing", async () => {
+  const id = await examWithMaterials([{ name: "script.pdf", kind: "script", text: anMaterial("BUGWORD") }]);
+  upstream.events = p => isAnalysis(p) ? gText(anJSON(3)) : null;
+  try {
+    let r = await analyzeExam(id);
+    assert.deepEqual(r.names, ["Topic 1", "Topic 2", "Topic 3"]);
+    const before = await page.evaluate(id => JSON.stringify(examById(id).topics), id);
+    // while the answer is turned into topics
+    upstream.events = p => isAnalysis(p) ? gText(anJSON(4)) : null;
+    await page.evaluate(() => { window.realCleanPrereqs = cleanPrereqs; cleanPrereqs = () => { throw new TypeError("boom in cleanPrereqs"); }; });
+    r = await analyzeExam(id);
+    await page.evaluate(() => { cleanPrereqs = window.realCleanPrereqs; });
+    assert.match(r.err, /^Something went wrong in Exam Coach while handling the AI's answer\. Your files are kept — try again\. If it happens again, send the Details below to the team\. Details: internal — boom in cleanPrereqs\.$/);
+    assert.equal(await page.evaluate(id => JSON.stringify(examById(id).topics), id), before, "the exam is unchanged");
+    assert.match(await page.textContent("#analyze-error"), /Details: internal — boom in cleanPrereqs/);
+    // while one answer is read: that answer counts as unreadable, the short try works
+    upstream.prompts = [];
+    await page.evaluate(() => { window.realAnalysisOf = analysisOf; let once = true; analysisOf = res => { if (once) { once = false; throw new Error("boom in analysisOf"); } return window.realAnalysisOf(res); }; });
+    r = await analyzeExam(id);
+    await page.evaluate(() => { analysisOf = window.realAnalysisOf; });
+    assert.equal(upstream.prompts.length, 2);
+    assert.deepEqual(r.names, ["Topic 1", "Topic 2", "Topic 3", "Topic 4"]);
+    assert.equal(r.err, "");
+    // and when it happens on the short try too, the message says what it was
+    await page.evaluate(() => { analysisOf = () => { throw new Error("boom twice"); }; });
+    r = await analyzeExam(id);
+    await page.evaluate(() => { analysisOf = window.realAnalysisOf; });
+    assert.match(r.err, /Something went wrong in Exam Coach while handling the AI's answer\. .* Details: internal — boom twice\.$/);
+  } finally { upstream.events = null; await page.evaluate(() => { if (window.realCleanPrereqs) cleanPrereqs = window.realCleanPrereqs; if (window.realAnalysisOf) analysisOf = window.realAnalysisOf; }); }
 });
 
 test("explains that scanned PDFs can't be read instead of asking the AI", async () => {

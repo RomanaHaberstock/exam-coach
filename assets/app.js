@@ -1388,6 +1388,80 @@ function mergeTopics(results, sharedOld) {
   return list;
 }
 const buildsOnOf = t => (Array.isArray(t.buildsOn) ? t.buildsOn : []).filter(n => typeof n === "string" && n.trim()).slice(0, 12);
+// The analysis answer as the page uses it: { topics, tasks, style }, whatever shape the AI chose.
+// Models (the quick backup model in particular) drift from the asked-for shape: the list under
+// another key ("Topics", "themes", nested in {"analysis":{…}}) or bare, numbers as strings ("4",
+// "4h", "3–4 hours", "high"), goals and terms as one string, pages as numbers, fields missing.
+// Everything is normalised here; a topic needs only a name.
+const keyOf = k => String(k).toLowerCase().replace(/[^a-z]/g, "");
+function field(o, ...names) {
+  if (!o || typeof o !== "object" || Array.isArray(o)) return undefined;
+  for (const n of names) for (const [k, v] of Object.entries(o)) if (keyOf(k) === n && v != null && v !== "") return v;
+  return undefined;
+}
+// A number from 4, "4", "4.5", "4,5 h", "3–4 hours" (middle), "90 min" (in hours with `hours`), "4/5", "high".
+function numOf(v, { hours = false, words = null } = {}) {
+  if (typeof v === "number") return Number.isFinite(v) ? v : NaN;
+  if (Array.isArray(v)) v = v[0];
+  if (typeof v !== "string") return NaN;
+  const s = v.toLowerCase().replace(/(\d),(\d)/g, "$1.$2");
+  const m = s.match(/\d+(?:\.\d+)?/g);
+  if (!m) { const w = words && Object.keys(words).find(w => s.includes(w)); return w ? words[w] : NaN; }
+  let x = +m[0];
+  if (m.length > 1 && new RegExp(`${m[0]}\\s*(?:-|–|—|to|bis)\\s*${m[1]}`).test(s)) x = (x + +m[1]) / 2;
+  if (hours && /\bmin/.test(s) && !/\bh(ours?|rs?)?\b|stunden?/.test(s)) x /= 60;
+  return x;
+}
+const WEIGHT_WORDS = { "very high": 5, "sehr hoch": 5, critical: 5, high: 4, hoch: 4, medium: 3, mittel: 3, moderate: 3, low: 2, niedrig: 2, gering: 2 };
+const textOf = v => v == null ? "" : typeof v === "string" ? v.trim() : typeof v === "number" ? String(v)
+  : Array.isArray(v) ? v.map(textOf).filter(Boolean).join("; ") : typeof v === "object" ? textOf(field(v, "text", "name", "title", "label", "term", "value")) : "";
+const pagesText = v => typeof v === "number" ? `p. ${v}` : Array.isArray(v) && v.length && v.every(x => typeof x === "number") ? (v.length > 1 ? `p. ${v[0]}–${v[v.length - 1]}` : `p. ${v[0]}`) : textOf(v);
+// A list from an array or from one string ("a; b" or lines; with `commas` also "a, b").
+const listOfStrings = (v, commas) => Array.isArray(v) ? v : typeof v === "string" ? v.split(commas ? /\s*(?:\n|;|,(?![^(]*\)))\s*/ : /\s*(?:\n|;)\s*/).map(s => s.replace(/^\s*(?:[-•*]|\d+[.)])\s*/, "").trim()).filter(Boolean) : [];
+// Finds the list of items under one of `names` (also one or two levels down), or the response itself
+// if it is a list, or the only list of objects in it that `looks` like such items.
+function findList(res, names, looks, depth = 0) {
+  if (Array.isArray(res)) return res;
+  if (!res || typeof res !== "object" || depth > 2) return null;
+  for (const n of names) { const v = field(res, n); if (Array.isArray(v)) return v; }
+  for (const v of Object.values(res)) if (v && typeof v === "object" && !Array.isArray(v)) { const l = findList(v, names, looks, depth + 1); if (l) return l; }
+  if (depth) return null;
+  const arrays = Object.values(res).filter(v => Array.isArray(v) && v.some(looks));
+  return arrays.length === 1 ? arrays[0] : null;
+}
+const TOPIC_KEYS = ["topics", "studytopics", "topiclist", "themes", "themen", "units", "chapters", "modules", "sections"];
+const TASK_KEYS = ["tasks", "oldtasks", "oldexamtasks", "examtasks", "exercises", "questions", "aufgaben"];
+const nameOf = t => textOf(typeof t === "string" ? t : field(t, "name", "title", "topic", "topicname", "heading", "label", "thema"));
+function analysisOf(res) {
+  const rawTopics = findList(res, TOPIC_KEYS, x => x && typeof x === "object" && !!nameOf(x)) || [];
+  const topics = [];
+  for (const t of rawTopics) {
+    const name = nameOf(t).replace(/\s+/g, " ").trim();
+    if (!name) continue;
+    const o = typeof t === "object" ? t : {};
+    const goalsRaw = field(o, "goals", "subtopics", "learninggoals", "objectives", "learningobjectives", "ziele", "lernziele");
+    const goals = listOfStrings(goalsRaw).map(g => typeof g === "string" ? { text: g, pages: "" }
+      : g && typeof g === "object" ? { text: textOf(field(g, "text", "goal", "description", "objective", "title", "name", "subtopic")), pages: pagesText(field(g, "pages", "page", "src", "source", "sources", "where", "location")) } : null).filter(g => g && g.text);
+    const terms = listOfStrings(field(o, "terms", "keyterms", "keywords", "concepts", "vocabulary", "begriffe"), true).map(x => typeof x === "object" ? textOf(x) : x).filter(x => typeof x === "string" || typeof x === "number");
+    const builds = listOfStrings(field(o, "buildson", "prerequisites", "prereqs", "dependson", "requires", "voraussetzungen"), true).map(x => typeof x === "object" ? nameOf(x) : x).filter(x => typeof x === "string" && x.trim());
+    const w = numOf(field(o, "weight", "importance", "priority", "gewicht"), { words: WEIGHT_WORDS });
+    const eff = numOf(field(o, "efforth", "effort", "hours", "efforthours", "studyhours", "time", "aufwand"), { hours: true });
+    const hits = numOf(field(o, "oldexamhits", "examhits", "hits", "oldexamcount"));
+    topics.push({ name: name.slice(0, 120), summary: textOf(field(o, "summary", "description", "desc", "overview", "zusammenfassung")).slice(0, 400),
+      weight: Number.isFinite(w) ? Math.min(5, Math.max(1, w)) : 3, oldExamHits: Number.isFinite(hits) ? Math.max(0, hits) : 0,
+      effortH: Number.isFinite(eff) && eff > 0 ? eff : 3, sources: pagesText(field(o, "sources", "source", "pages", "location", "where", "quellen")).slice(0, 200),
+      buildsOn: builds.slice(0, 12), goals, terms });
+  }
+  const rawTasks = findList(res && typeof res === "object" && !Array.isArray(res) ? res : null, TASK_KEYS, x => x && typeof x === "object" && field(x, "points", "pts", "maxpoints", "marks", "punkte") != null) || [];
+  const tasks = rawTasks.filter(x => x && typeof x === "object" && !Array.isArray(x)).map(x => {
+    const tp = field(x, "topic", "topicname", "topics", "thema");
+    return { label: textOf(field(x, "label", "name", "task", "title", "number", "id", "aufgabe")).slice(0, 60),
+      topic: Array.isArray(tp) ? nameOf(tp[0]) : nameOf(tp && typeof tp === "object" ? tp : { name: tp }), points: numOf(field(x, "points", "pts", "maxpoints", "marks", "score", "punkte")) };
+  }).filter(x => x.points > 0);
+  const st = res && typeof res === "object" && !Array.isArray(res) ? field(res, "style", "examstyle", "questionstyle", "oldexamstyle", "stil") : "";
+  const style = Array.isArray(st) ? st.map(textOf).filter(Boolean).join(" ") : textOf(st);
+  return { topics, tasks, style };
+}
 async function topicContext(e, t, budget = 45000) {
   const words = (t.name + " " + (t.summary || "") + " " + (t.weakConcepts || []).join(" ")).toLowerCase().split(/[^a-zäöüß0-9]+/).filter(w => w.length > 3);
   const all = [];
@@ -1592,8 +1666,9 @@ function aiBanner() {
   return `<section class="alert info"><b>Enter the access code</b><span class="small">This Exam Coach is protected so only your group can use the AI features. Ask the person who set it up for the code.</span>
     <div class="aibar"><input type="text" id="ai-code" autocomplete="off" placeholder="Access code" aria-label="Access code"><button class="btn primary" data-act="ai-code">Unlock</button></div></section>`;
 }
-// `think`: "default" keeps the model's own amount of thinking (material analysis); otherwise the
-// backend asks for little thinking, so the hidden thinking can't use up the answer's token budget.
+// `think`: "default" keeps the model's own amount of thinking (no request uses it any more: the
+// material analysis asks for low thinking too, see ANALYZE_TOKENS); otherwise the backend asks for
+// little thinking, so the hidden thinking can't use up the answer's token budget.
 // `maxTokens`: output limit for this answer (the backend keeps it between 2,048 and 32,768).
 async function aiCall(prompt, opts = {}) {
   try { const r = await aiCall1(prompt, opts); noteAiOk(); return r; }
@@ -1797,8 +1872,11 @@ function aiError(e) {
   return "Something went wrong talking to the AI. Try again." + (d ? ` Details: ${d}` : "");
 }
 let aiCtl = null;
-function analysisPrompt(e, digest, part) {
+// `brief`: the second try of a part whose first answer was cut off or unreadable asks for a
+// shorter answer (fewer subtopics and key terms, short summaries), so it fits the output limit.
+function analysisPrompt(e, digest, part, brief) {
   const multi = part && part.n > 1;
+  const nGoals = brief ? "2–4" : "3–6", nTerms = brief ? "2–4" : "3–8";
   return `You are a study coach helping a university student prepare for an exam.
 Exam: "${e.subject}" — format: ${e.format}, date: ${e.date}, target score: ${e.target}%.
 ${multi ? `The materials are too long for one request, so they come in ${part.n} parts. This is part ${part.i} of ${part.n}.${part.shared ? " The old exams are included in full in every part." : ""}
@@ -1806,7 +1884,8 @@ ${part.known.length ? `Topics found in earlier parts: ${part.known.join("; ")}. 
 
 Tasks:
 1. Split the content${multi ? " of this part" : ""} into ${multi ? "2–8" : "5–12"} study topics in a sensible learning order.
-2. For each topic give: "name" (short, in the language of the material), "summary" (one sentence), "weight" (1–5: importance for the exam, based mainly on how often it appears in the old exams, secondarily on how much space it takes in the material), "oldExamHits" (how many old-exam tasks touch it; 0 if no old exams), "effortH" (realistic hours for a student to learn ${multi ? "the content of this part on it" : "it properly from the material"}, 1–12, may use .5 steps), "sources" (where it is, e.g. "Script p. 12–20; Slides 4–9"), "buildsOn" (names of the other topics a student must understand before this one${multi && part.known.length ? ", from this part or the topics found in earlier parts" : ""}, using exactly their names; [] if none), "goals" (3–6 subtopics${multi ? " in this part" : ""} in the order a student should work through them, each with "text" (what the student must be able to do, concrete, e.g. "Compute a 95% confidence interval for a mean") and "pages" (where it is, with the material's kind and the page markers, e.g. "Slides p. 12–14")), "terms" (3–8 key terms of the topic, as written in the material).
+2. For each topic give: "name" (short, in the language of the material), "summary" (one sentence), "weight" (1–5: importance for the exam, based mainly on how often it appears in the old exams, secondarily on how much space it takes in the material), "oldExamHits" (how many old-exam tasks touch it; 0 if no old exams), "effortH" (realistic hours for a student to learn ${multi ? "the content of this part on it" : "it properly from the material"}, 1–12, may use .5 steps), "sources" (where it is, e.g. "Script p. 12–20; Slides 4–9"), "buildsOn" (names of the other topics a student must understand before this one${multi && part.known.length ? ", from this part or the topics found in earlier parts" : ""}, using exactly their names; [] if none), "goals" (${nGoals} subtopics${multi ? " in this part" : ""} in the order a student should work through them, each with "text" (what the student must be able to do, concrete, e.g. "Compute a 95% confidence interval for a mean") and "pages" (where it is, with the material's kind and the page markers, e.g. "Slides p. 12–14")), "terms" (${nTerms} key terms of the topic, as written in the material).${brief ? `
+Keep the answer short: summaries and goals at most 12 words each, sources and pages short. Use exactly the key names of the JSON shape below.` : ""}
 3. "style": 2–3 sentences in English describing the old exams' question style (task types, typical calculations, point distribution). If there are no old exams, describe what to expect from the material.
 4. "tasks": the tasks of the most recent old exam${multi && !part.shared ? " that are in this part" : ""}, in order, each with "label" (e.g. "Task 1a", as printed in the exam), "topic" (exactly one of your topic names${multi && part.known.length ? " or of the topics found in earlier parts" : ""}) and "points" (points possible; give [] if there are no old exams${multi ? " in this part" : ""} or the points are not shown).
 
@@ -1835,6 +1914,7 @@ function waitAbortable(ms, signal) {
   });
 }
 const progressText = p => !p ? "The AI is reading your materials. This can take a minute or two."
+  : p.brief ? `The AI's answer${p.n > 1 ? ` for part ${p.i} of ${p.n}` : ""} was cut off or couldn't be read, so it is asked again for a shorter answer…`
   : p.wait ? (p.broken ? `The connection to the AI broke off — trying ${p.n > 1 ? `part ${p.i} ` : ""}again${p.split ? " in smaller parts" : ""} in ${p.wait} s…` : `The AI is busy — trying ${p.n > 1 ? `part ${p.i} ` : ""}again in ${p.wait} s…`)
   : p.n > 1 ? `${p.retry ? "That was too much at once, so the AI is trying smaller parts. " : p.resumed ? `Continuing where it stopped (parts 1–${p.resumed} are already read). ` : p.smaller ? "The connection broke off, so the AI reads the rest in smaller parts. " : "Your materials are long, so the AI reads them in parts. "}Reading part ${p.i} of ${p.n}…`
   : "The AI is reading your materials. This can take a minute or two.";
@@ -1852,6 +1932,18 @@ function smallerParts(parts, i, shared) {
   if (cur.length) out.push(cur);
   return [...parts.slice(0, i), ...out];
 }
+// Output limit per analysis answer. A full answer for 14 topics (goals, terms, links) is about
+// 6–8k tokens; on Gemini the limit also counts the (low) thinking. A lower limit than the backend's
+// 32k also ends a model that got stuck repeating itself sooner, so the short second try comes quickly.
+const ANALYZE_TOKENS = { full: 16384, brief: 12288 };
+// Errors after which a part is asked for once more with the short answer format, and skipped (with
+// a note) if that fails too: the answer itself was the problem, not the connection or the quota.
+const PART_RETRY = new Set(["invalid_json", "truncated", "empty_completion", "no_topics", "internal", "refused"]);
+// Any thrown value as an error object { code, detail } (a JavaScript error becomes code "internal").
+function asErr(x) {
+  if (x && typeof x === "object" && typeof x.code === "string" && !(x instanceof Error)) return x;
+  return { code: "internal", detail: String((x && x.message) || x || "unknown error").slice(0, 300), stack: x && x.stack };
+}
 async function runAnalysis(e, mats, budget, signal, retry, fresh) {
   const key = analysisKey(e, mats);
   const saved = analysisResume && analysisResume.key === key ? analysisResume : null;
@@ -1867,22 +1959,31 @@ async function runAnalysis(e, mats, budget, signal, retry, fresh) {
     // Saved answer for the same part (same files, same topics found before, same prompt version).
     // The exam date and target are left out of the key: they don't change which topics there are.
     const pinfo = () => ({ i: i + 1, n: parts.length, shared: shared.length > 0, known });
-    const ckey = "an-" + hashStr(JSON.stringify([ANALYZE_V, analysisPrompt({ ...e, date: "", target: "" }, digestOf([...shared, ...parts[i]]), pinfo())]));
-    let res = fresh ? null : await cacheGet(ckey);
-    if (res) cached++;
-    else for (let attempt = 0; ; attempt++) {
+    const ckey = () => "an-" + hashStr(JSON.stringify([ANALYZE_V, analysisPrompt({ ...e, date: "", target: "" }, digestOf([...shared, ...parts[i]]), pinfo())]));
+    let got = null, perr = null, best = null;
+    const hit = fresh ? null : await cacheGet(ckey());
+    if (hit) { try { const a = analysisOf(hit); if (a.topics.length) { got = a; cached++; } } catch (x) {} }
+    // attempt: tries after a busy/quota/connection error; brief: the second, shorter try
+    for (let attempt = 0, brief = false; !got; ) {
       const n = parts.length;
-      busy.progress = n > 1 || attempt ? { i: i + 1, n, retry, resumed, smaller: smaller && !retry } : null; showProgress();
+      busy.progress = n > 1 || attempt || brief ? { i: i + 1, n, retry, resumed, smaller: smaller && !retry, brief } : null; showProgress();
       try {
-        res = await askAI(analysisPrompt(e, digestOf([...shared, ...parts[i]]), { i: i + 1, n, shared: shared.length > 0, known }), { signal, modelTier: "default", think: "default", force: attempt > 0 });
-        if (res && Array.isArray(res.topics) && res.topics.length) await cachePut(ckey, res, { examId: e.id, kind: "analysis" });
-        break;
+        const opts = { signal, modelTier: "default", think: "low", maxTokens: brief ? ANALYZE_TOKENS.brief : ANALYZE_TOKENS.full, salvage: true, force: attempt > 0 || brief };
+        const a = analysisOf(await askAI(analysisPrompt(e, digestOf([...shared, ...parts[i]]), pinfo(), brief), opts));
+        a.cut = !!opts.cut;
+        if (a.topics.length && !a.cut) { got = a; break; }
+        // cut off: its complete topics are kept in case the short try doesn't do better
+        if (a.topics.length && (!best || a.topics.length > best.topics.length)) best = a;
+        perr = { code: a.cut ? "truncated" : "no_topics", detail: a.topics.length ? `The answer was cut off after ${a.topics.length} topics.` : a.cut ? "The answer was cut off before the first complete topic." : "The answer had no list of topics." };
       }
-      catch (err) {
-        const broken = err && err.code === "stream_broken";
-        const temporary = !(err && err.down) && (broken || (err && (err.code === "busy" || err.code === "rate_limited")));
+      catch (x) {
+        const err = asErr(x);
+        if (err.code === "internal") console.warn("Exam Coach analysis: error while reading the AI's answer for part " + (i + 1), x);
+        const broken = err.code === "stream_broken";
+        const temporary = !err.down && (broken || err.code === "busy" || err.code === "rate_limited");
         const split = broken && !smaller;
         if (temporary && attempt < ANALYZE_BUSY.tries) {
+          attempt++;
           for (let s = ANALYZE_BUSY.waitS; s > 0; s--) { busy.progress = { i: i + 1, n, wait: s, broken, split }; showProgress(); await waitAbortable(1000 * Math.min(1, s), signal); }
           if (split) {
             // Nothing read yet: start over with the smaller plan (as for a too-large request).
@@ -1892,20 +1993,38 @@ async function runAnalysis(e, mats, budget, signal, retry, fresh) {
           }
           continue;
         }
-        if (results.length || smaller) analysisResume = { key, parts, shared, results, smaller, retry };
-        if (temporary && results.length) err.kept = { done: results.length, n: parts.length };
-        throw err;
+        if (!PART_RETRY.has(err.code)) {
+          if (results.length || smaller) analysisResume = { key, parts, shared, results, smaller, retry };
+          if (temporary && results.length) err.kept = { done: results.length, n: parts.length };
+          err.part = { i: i + 1, n: parts.length };
+          throw err;
+        }
+        perr = err;
       }
+      if (brief) break;
+      brief = true;
     }
-    const topics = Array.isArray(res && res.topics) ? res.topics.filter(t => t && t.name) : [];
-    const tasks = Array.isArray(res && res.tasks) ? res.tasks : [];
-    results.push({ topics, tasks, style: String((res && res.style) || ""), old: shared.length > 0 || parts[i].some(m => m.kind === "oldexam"), oldOnly: parts[i].every(m => m.kind === "oldexam") });
+    const n = parts.length;
+    if (!got && best) got = best; // cut off twice: its complete topics are kept
+    const meta = { old: shared.length > 0 || parts[i].some(m => m.kind === "oldexam"), oldOnly: parts[i].every(m => m.kind === "oldexam") };
+    if (got) {
+      if (!got.cut && !hit) await cachePut(ckey(), { topics: got.topics, tasks: got.tasks, style: got.style }, { examId: e.id, kind: "analysis" });
+      results.push({ topics: got.topics, tasks: got.tasks, style: got.style, cut: got.cut, ...meta });
+    } else {
+      // This part couldn't be read, also on the short second try: the other parts still count.
+      results.push({ topics: [], tasks: [], style: "", failed: { i: i + 1, n, code: perr ? perr.code : "no_topics", detail: perr && perr.detail || "" }, ...meta });
+    }
   }
   const n = parts.length;
+  const failed = results.filter(r => r.failed).map(r => r.failed);
+  const cut = results.map((r, k) => r.cut ? k + 1 : 0).filter(Boolean);
   const list = n === 1 ? results[0].topics.slice(0, 14) : mergeTopics(results, shared.length > 0);
-  if (!list.length) throw { code: "invalid_json" };
+  if (!list.length) {
+    const f = failed[0] || { code: "no_topics", i: 1, n };
+    throw { code: f.code, detail: f.detail, retried: true, part: n > 1 ? { i: f.i, n } : null, all: n > 1 };
+  }
   const styled = results.find(r => r.old && r.style) || results.find(r => r.style);
-  return { list, style: styled ? styled.style : "", parts: n, cached, tasks: mergeTasks(results, shared.length > 0) };
+  return { list, style: styled ? styled.style : "", parts: n, cached, tasks: mergeTasks(results, shared.length > 0), failed, cut };
 }
 // More parts than this: the student confirms first (each part is one AI request on the shared key).
 const ANALYZE_ASK_PARTS = 8;
@@ -1913,7 +2032,9 @@ const ANALYZE_ASK_PARTS = 8;
 async function analyzeMaterials(e, sure, fresh) {
   if (filesBusy() || busy.analyze) return;
   busy.anAsk = null;
-  const all = await Promise.all(e.materials.map(async m => ({ ...m, text: await getMaterial(m.id) })));
+  let all;
+  try { all = await Promise.all(e.materials.map(async m => ({ ...m, text: String(await getMaterial(m.id) || "") }))); }
+  catch (x) { const err = asErr(x); console.warn("Exam Coach analysis: couldn't load the stored materials", x); return toast(`Your files couldn't be loaded from this browser's storage. Reload the page and try again. Details: ${err.code} — ${err.detail || "no detail"}.`); }
   const mats = all.filter(m => !looksEmpty(m.text));
   const skipped = all.filter(m => looksEmpty(m.text)).map(m => m.name);
   if (!mats.length) return toast(noTextMsg(skipped.length ? skipped : ["These files"]));
@@ -1922,7 +2043,7 @@ async function analyzeMaterials(e, sure, fresh) {
     if (n > ANALYZE_ASK_PARTS) { busy.anAsk = { examId: e.id, n }; render(); const el = $("#analyze-confirm"); if (el) el.scrollIntoView({ block: "nearest" }); return; }
   }
   const first = !e.topics.length;
-  busy.analyze = e.id; busy.progress = null; busy.anErr = null; busy.anCached = null; render();
+  busy.analyze = e.id; busy.progress = null; busy.anErr = null; busy.anWarn = null; busy.anCached = null; render();
   aiCtl = new AbortController();
   try {
     let r;
@@ -1931,47 +2052,75 @@ async function analyzeMaterials(e, sure, fresh) {
     const small = resume && analysisResume.smaller;
     try { r = await runAnalysis(e, mats, ANALYZE_CHARS, aiCtl.signal, false, fresh); }
     catch (err) {
-      if (err.code !== "prompt_too_large" || small) throw err;
+      if (!err || err.code !== "prompt_too_large" || small) throw err;
       analysisResume = null;
       r = await runAnalysis(e, mats, ANALYZE_RETRY_CHARS, aiCtl.signal, true, fresh);
     }
-    if (r.cached) busy.anCached = { examId: e.id, all: r.cached === r.parts };
+    // Everything is worked out first and only then written to the exam, so an error on the way
+    // leaves the exam as it was.
     const old = Object.fromEntries(e.topics.map(t => [normName(t.name), t]));
-    e.topics = r.list.map(t => {
-      const prev = old[normName(t.name)];
-      return Object.assign(prev || { id: uid(), mastery: null, extraMin: 0, weakConcepts: [], quizzes: [], reviewDue: null, prereqs: [] }, {
+    const seen = new Set();
+    const pairs = r.list.map(t => ({ x: t, prev: old[normName(t.name)] })).filter(({ x }) => { const k = normName(x.name); if (!k || seen.has(k)) return false; seen.add(k); return true; });
+    const topics = pairs.map(({ x: t, prev }) => {
+      const goals = cleanGoals(t.goals), terms = cleanTerms(t.terms);
+      return { ...(prev || { id: uid(), mastery: null, extraMin: 0, weakConcepts: [], quizzes: [], reviewDue: null, prereqs: [] }),
         name: String(t.name).slice(0, 80), summary: String(t.summary || "").slice(0, 240),
         weight: Math.min(5, Math.max(1, Math.round(+t.weight || 3))), oldExamHits: Math.max(0, Math.round(+t.oldExamHits || 0)),
         effortH: Math.min(20, Math.max(0.5, Math.round((+t.effortH || 3) * 2) / 2)), sources: String(t.sources || "").slice(0, 160),
         // a re-analysis without goals keeps the ones the topic had
-        goals: cleanGoals(t.goals).length ? cleanGoals(t.goals) : prev ? cleanGoals(prev.goals) : [],
-        terms: cleanTerms(t.terms).length ? cleanTerms(t.terms) : prev ? cleanTerms(prev.terms) : []
-      });
+        goals: goals.length ? goals : prev ? cleanGoals(prev.goals) : [],
+        terms: terms.length ? terms : prev ? cleanTerms(prev.terms) : [] };
     });
-    e.style = r.style.slice(0, 600);
-    const byName = Object.fromEntries(e.topics.map(t => [normName(t.name), t.id]));
+    const byName = Object.fromEntries(topics.map(t => [normName(t.name), t.id]));
     // Links from the AI, unless the student set this topic's links by hand.
-    r.list.forEach((x, i) => { const t = e.topics[i]; if (!t.prereqsSet) t.prereqs = buildsOnOf(x).map(n => byName[normName(n)]).filter(Boolean); });
-    cleanPrereqs(e);
+    pairs.forEach(({ x }, i) => { const t = topics[i]; t.prereqs = t.prereqsSet ? [...(t.prereqs || [])] : buildsOnOf(x).map(n => byName[normName(n)]).filter(Boolean); });
+    cleanPrereqs({ topics });
+    const oldTasks = r.tasks.slice(0, 40).map((x, i) => ({ label: String(x.label || `Task ${i + 1}`).slice(0, 60),
+      topicId: [...(x.topics || [])].reverse().map(n => byName[normName(n)]).find(Boolean) || null, points: Math.min(200, Math.round(+x.points * 2) / 2) }))
+      .filter(x => x.points > 0);
+    // the old topic objects are kept (other code may hold them), with the new values
+    e.topics = topics.map(t => { const prev = old[normName(t.name)]; return prev && prev.id === t.id ? Object.assign(prev, t) : t; });
+    e.style = String(r.style || "").slice(0, 600);
+    e.oldTasks = oldTasks;
+    if (r.cached) busy.anCached = { examId: e.id, all: r.cached === r.parts };
     const links = sum(e.topics, t => t.prereqs.length);
-    e.oldTasks = r.tasks.slice(0, 40).map((x, i) => ({ label: String(x.label || `Task ${i + 1}`).slice(0, 60),
-      topicId: [...x.topics].reverse().map(n => byName[normName(n)]).find(Boolean) || null, points: Math.min(200, Math.round(+x.points * 2) / 2) }));
     busy.analyze = null; busy.progress = null;
     const goals = sum(e.topics, t => (t.goals || []).length);
+    // Parts the AI couldn't read (also on the short second try), and parts kept from a cut-off answer.
+    const partWord = l => l.length > 1 ? `Parts ${l.slice(0, -1).join(", ")} and ${l[l.length - 1]}` : `Part ${l[0]}`;
+    const warn = [r.failed.length ? `${partWord(r.failed.map(f => f.i))} of ${r.parts} couldn't be read by the AI (its answer was cut off or unreadable, also on a second, shorter try), so topics from ${r.failed.length > 1 ? "those parts" : "that part"} may be missing. Press Analyse again to try ${r.failed.length > 1 ? "them" : "it"} again. Details: ${r.failed.map(f => `${f.code}, part ${f.i} of ${f.n}`).join("; ")}.` : "",
+      r.cut.length ? `The AI's answer${r.parts > 1 ? ` for ${partWord(r.cut).toLowerCase()}` : ""} was cut off, so only its complete topics were kept. Press Analyse again to try for the rest.` : ""].filter(Boolean).join(" ");
+    if (r.failed.length) console.warn("Exam Coach analysis: parts not read", r.failed);
+    busy.anWarn = warn ? { examId: e.id, msg: warn } : null;
     // The first analysis of an exam opens the plan right away (it was built by commit()).
     if (first && view === "exams" && selExam === e.id) { view = "plan"; try { history.replaceState(null, "", "#plan"); } catch (x) {} }
-    commit({ log: { examId: e.id, kind: "setup", title: `${e.subject}: ${e.topics.length} topics from your materials`, detail: `${r.cached ? (r.cached === r.parts ? "These files were analysed before, so the saved result was used (no AI request). " : `${r.cached} of ${r.parts} parts were analysed before, so only ${r.parts - r.cached} AI ${r.parts - r.cached > 1 ? "requests were" : "request was"} needed. `) : ""}${r.parts > 1 ? `The AI read your materials in ${r.parts} parts. ` : ""}Total estimated effort ${sum(e.topics, t => t.effortH)} h.${goals ? ` It also found ${goals} subtopics with their pages, so each study block says what to work through.` : ""}${links ? ` The AI found ${links} ${links > 1 ? "links" : "link"} between topics (what builds on what), so those are learned in that order.` : ""} The plan was rebuilt backwards from ${fmtDay(e.date)}.` } });
+    commit({ log: { examId: e.id, kind: "setup", title: `${e.subject}: ${e.topics.length} topics from your materials`, detail: `${r.cached ? (r.cached === r.parts ? "These files were analysed before, so the saved result was used (no AI request). " : `${r.cached} of ${r.parts} parts were analysed before, so only ${r.parts - r.cached} AI ${r.parts - r.cached > 1 ? "requests were" : "request was"} needed. `) : ""}${r.parts > 1 ? `The AI read your materials in ${r.parts} parts. ` : ""}${warn ? warn + " " : ""}Total estimated effort ${sum(e.topics, t => t.effortH)} h.${goals ? ` It also found ${goals} subtopics with their pages, so each study block says what to work through.` : ""}${links ? ` The AI found ${links} ${links > 1 ? "links" : "link"} between topics (what builds on what), so those are learned in that order.` : ""} The plan was rebuilt backwards from ${fmtDay(e.date)}.` } });
     if (view === "plan") window.scrollTo(0, 0);
-    toast((first && view === "plan" ? "Your study plan is ready." : "Topics created and plan rebuilt.") + (r.cached === r.parts ? " These files were analysed before, so no AI request was needed." : "") + (skipped.length ? ` Skipped (no readable text): ${skipped.join(", ")}.` : ""));
-  } catch (err) {
+    toast((first && view === "plan" ? "Your study plan is ready." : "Topics created and plan rebuilt.") + (r.cached === r.parts ? " These files were analysed before, so no AI request was needed." : "") + (warn ? " " + warn : "") + (skipped.length ? ` Skipped (no readable text): ${skipped.join(", ")}.` : ""));
+  } catch (x) {
     busy.analyze = null; busy.progress = null;
+    const err = asErr(x);
+    if (err.code !== "cancelled") console.warn("Exam Coach analysis failed:", err.code, err.part || "", err.detail || "", x);
     // The message stays on the page (not only in a toast), so it's clear why there is no plan yet.
-    const msg = err.code === "prompt_too_large" ? "The materials are too large for the AI, even in smaller parts. Remove a file and try again."
-      : err.code === "cancelled" ? "" : aiError(err) + (err.kept ? ` The AI already read ${err.kept.done > 1 ? `parts 1–${err.kept.done}` : "part 1"} of ${err.kept.n}. Press Analyse again to continue with part ${err.kept.done + 1}.` : "");
+    const msg = err.code === "cancelled" ? "" : analysisErrMsg(err);
     busy.anErr = msg ? { examId: e.id, msg } : null;
-    render();
+    try { render(); } catch (y) { console.warn("Exam Coach: render after a failed analysis", y); }
     if (msg) toast(msg);
   }
+}
+// What the student sees when an analysis fails: what happened and what to do, then always one
+// "Details:" line with a short code (and the part and the technical detail), so a report can be
+// matched to the cause. Product and host names are taken out of the detail (aiDetail).
+function analysisErrMsg(err) {
+  const c = err.code || "internal";
+  const base = c === "prompt_too_large" ? "The materials are too large for the AI, even in smaller parts. Remove a file and try again."
+    : c === "internal" ? "Something went wrong in Exam Coach while handling the AI's answer. Your files are kept — try again. If it happens again, send the Details below to the team."
+    : (c === "no_topics" || c === "truncated" || c === "invalid_json" || c === "empty_completion") && err.retried ? `The AI's answer ${err.all ? "for every part " : ""}was cut off or couldn't be read, also on a second, shorter try. Your files are kept — try again in a minute.`
+    : c === "no_topics" ? "The AI's answer had no topics in it. Your files are kept — try again."
+    : aiError(err).replace(/ Details: .*$/, "");
+  const kept = err.kept ? ` The AI already read ${err.kept.done > 1 ? `parts 1–${err.kept.done}` : "part 1"} of ${err.kept.n}. Press Analyse again to continue with part ${err.kept.done + 1}.` : "";
+  const d = err.detail ? aiDetail(err.detail) : "";
+  return `${base}${kept} Details: ${c}${err.part && err.part.n > 1 ? `, part ${err.part.i} of ${err.part.n}` : ""}${d ? ` — ${d}` : ""}.`;
 }
 // Material per quiz: 30k characters (about 8k tokens) is plenty for 4–12 questions and keeps each
 // request small on the shared free quota (tokens per minute).
@@ -3737,6 +3886,7 @@ function vExams() {
       </div>
       ${busy.anAsk && busy.anAsk.examId === e.id && busy.analyze !== e.id ? `<div class="alert" id="analyze-confirm"><b>This needs about ${numOr(busy.anAsk.n, 0)} AI requests and may take a few minutes. Continue?</b><span class="row"><button class="btn sm primary" data-act="analyze-go">Continue</button><button class="btn sm ghost" data-act="analyze-no">Cancel</button></span></div>` : ""}
       ${busy.anCached && busy.anCached.examId === e.id && busy.analyze !== e.id ? `<p class="small muted" id="analyze-cached">${busy.anCached.all ? "These files were analysed before, so the saved result was used (no AI request)." : "Parts analysed before were taken from the saved result."} <button class="btn sm ghost" data-act="analyze-fresh" ${aiReady() ? "" : "disabled"}>Ask the AI again</button></p>` : ""}
+      ${busy.anWarn && busy.anWarn.examId === e.id && busy.analyze !== e.id ? `<div class="alert mark" id="analyze-partial"><b>Some of your materials couldn't be read completely.</b><span class="small">${esc(busy.anWarn.msg)}</span></div>` : ""}
       ${busy.anErr && busy.anErr.examId === e.id && busy.analyze !== e.id ? `<div class="alert bad" id="analyze-error"><b>The AI couldn't finish reading your materials, so there are no topics and no plan yet.</b><span class="small">${esc(busy.anErr.msg)}</span><span class="small">Your files are kept. Press Analyze again, or add topics by hand under Topics.</span></div>` : ""}
       ${e.style ? `<div class="fb"><span class="label">Old-exam style</span><span>${esc(e.style)}</span></div>` : ""}
     </section>

@@ -10,7 +10,7 @@
 // SHELL file exists). A new worker installs next to the old one and waits; the page shows
 // "A new version of Exam Coach is ready — Reload", which tells it to take over (skipWaiting) and
 // reloads. Old caches are deleted when the new worker activates.
-const VERSION = "2026-11-15.3";
+const VERSION = "2026-11-17.1";
 const CACHE = "exam-coach-" + VERSION;
 const SHELL = [
   "./",
