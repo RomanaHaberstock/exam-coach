@@ -53,7 +53,7 @@ The screenshots show the built-in example data. Regenerate them with `node tests
 
 ## Privacy
 
-**Your data stays in your browser.** There are no accounts. Each student's plan, quiz results and uploaded materials are saved in their own browser (IndexedDB) and never stored on a server. Under **Plan → Your data**, students can download a backup file and restore it on another device.
+**Your data stays in your browser.** There are no accounts. Each student's plan, quiz results and uploaded materials are saved in their own browser (IndexedDB) and never stored on a server. Under **Plan → Your data**, students can download a backup file and restore it on another device. On an iPhone or iPad, the app added to the home screen keeps its own storage, separate from Safari: a plan made in Safari doesn't appear in the home-screen app (and the other way round), so move it with a backup file (download in one, restore in the other).
 
 Only the text needed for an AI request is sent to the backend, which stores nothing and passes it on to the AI provider. With Google Gemini, users in the EU, Switzerland and the UK get Google's paid-tier data protections even on the free tier, so their prompts aren't used to improve Google's products ([Gemini API terms](https://ai.google.dev/gemini-api/terms)). Outside these regions, free-tier requests may be used by Google, so don't upload sensitive material there. The site loads no external fonts, scripts or trackers. Speech input in oral exam practice is optional and uses the browser's own speech recognition; some browsers (for example Chrome) send the audio to their maker's servers for this, so the app tells students before they use it.
 

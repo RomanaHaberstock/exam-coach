@@ -296,11 +296,22 @@ function tourAfterRender() {
       <ol class="tour-dots" aria-hidden="true">${TOUR_STEPS.map((_, k) => `<li class="${k === TOUR.i ? "on" : ""}"></li>`).join("")}</ol>`;
   }
   const el = st.el && document.querySelector("#main " + st.el);
-  if (el) {
-    el.classList.add("tour-on");
-    if (fresh) el.scrollIntoView({ block: "start", behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
-  }
-  if (fresh) box.querySelector('[data-tour="next"]').focus({ preventScroll: true });
+  if (el) el.classList.add("tour-on");
+  if (fresh) { tourPlace(el, box); box.querySelector('[data-tour="next"]').focus({ preventScroll: true }); }
+}
+// Scrolls the step's element to just under the sticky header (go() leaves the scrolling to the tour).
+// If the page can't scroll that far (element near the end), the card would cover it at the bottom,
+// so the card moves to the top of the screen instead (phones: the card spans the whole width).
+function tourPlace(el, box) {
+  box.classList.remove("tour-up");
+  if (!el) { window.scrollTo(0, 0); return; }
+  const head = document.querySelector("header.top"), headH = head ? Math.max(0, head.getBoundingClientRect().bottom) : 0;
+  const r = el.getBoundingClientRect(), b = box.getBoundingClientRect();
+  const max = Math.max(0, document.documentElement.scrollHeight - innerHeight);
+  const y = Math.max(0, Math.min(max, scrollY + r.top - headH - 12));
+  const top = r.top - (y - scrollY); // where the element starts once scrolled
+  if (top + 40 > b.top) { box.style.setProperty("--tour-top", `${Math.round(headH + 8)}px`); box.classList.add("tour-up"); }
+  window.scrollTo({ top: y, behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
 }
 
 /* ---------- how it works ---------- */
@@ -366,7 +377,7 @@ function vHow() {
     <div class="tablewrap"><table class="how-table"><thead><tr><th scope="col"></th><th scope="col">Asking a chatbot</th><th scope="col">Exam Coach</th></tr></thead>
       <tbody>${rows.map(([a, b, c]) => `<tr><th scope="row">${a}</th><td>${b}</td><td>${c}</td></tr>`).join("")}</tbody></table></div>
   </section>
-  <section class="panel stack"><h3>Your data</h3><p class="small" style="max-width:75ch">There are no accounts. Your plan, results and materials are saved in this browser only. Only the text needed for an AI request (for example a few pages for a quiz) is sent, and nothing is stored on the server.</p></section>
+  <section class="panel stack"><h3>Your data</h3><p class="small" style="max-width:75ch">There are no accounts. Your plan, results and materials are saved in this browser only. On an iPhone or iPad, the app on the home screen has its own storage, separate from Safari: to move your plan between them, download a backup under Plan → Your data in one and restore it in the other. Only the text needed for an AI request (for example a few pages for a quiz) is sent, and nothing is stored on the server.</p></section>
   <div class="row">${ex ? `<button class="btn primary" data-act="tour">Take the tour</button><button class="btn" data-view="dashboard">Back to today</button>`
     : `<button class="btn primary" data-act="demo">Try it with example exams</button>${S.exams.length ? `<button class="btn" data-view="dashboard">Back to today</button>` : `<button class="btn" data-act="new-exam">Add your first exam</button>`}`}</div>`;
 }

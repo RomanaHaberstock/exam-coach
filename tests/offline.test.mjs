@@ -16,7 +16,7 @@ const TOML = fs.readFileSync(path.join(ROOT, "netlify.toml"), "utf8");
 const CSP = TOML.match(/Content-Security-Policy = "([^"]+)"/)[1];
 const TYPES = { ".html": "text/html", ".css": "text/css", ".js": "text/javascript", ".svg": "image/svg+xml", ".woff2": "font/woff2", ".json": "application/json", ".webmanifest": "application/manifest+json", ".png": "image/png" };
 const SW = fs.readFileSync(path.join(ROOT, "sw.js"), "utf8");
-let swBody = SW, server, origin, browser;
+let swBody = SW, appBody = null, server, origin, browser;
 const problems = [];
 
 before(async () => {
@@ -27,7 +27,7 @@ before(async () => {
     const file = path.join(ROOT, rel);
     if (!file.startsWith(ROOT) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) { res.writeHead(404); return res.end("not found"); }
     res.writeHead(200, { "content-type": TYPES[path.extname(file)] || "application/octet-stream", "content-security-policy": CSP, "cache-control": "no-cache" });
-    res.end(rel === "sw.js" ? swBody : fs.readFileSync(file));
+    res.end(rel === "sw.js" ? swBody : rel === "assets/app.js" && appBody ? appBody : fs.readFileSync(file));
   });
   await new Promise(r => server.listen(0, "127.0.0.1", r));
   origin = `http://127.0.0.1:${server.address().port}`;
@@ -90,6 +90,12 @@ test("installs, opens offline, and rolls out a new version with one Reload", asy
   await p.evaluate(() => navigator.serviceWorker.getRegistration().then(r => r.update()));
   await p.waitForSelector("#sw-reload", { timeout: 15000 });
   assert.match(await p.textContent("#toast"), /A new version of Exam Coach is ready/);
+  await p.waitForFunction(() => /A new version of Exam Coach is ready/.test($("#live").textContent), null, { timeout: 3000 });
+  // a later toast replaces the offer only for a while; then the offer comes back
+  await p.evaluate(() => toast("Saved."));
+  assert.equal(await p.locator("#sw-reload").count(), 0);
+  await p.click("#toast");
+  await p.waitForSelector("#sw-reload", { timeout: 3000 });
   const reloaded = p.waitForEvent("load");
   await p.click("#sw-reload");
   await reloaded;
@@ -99,6 +105,32 @@ test("installs, opens offline, and rolls out a new version with one Reload", asy
   await p.goto(origin + "/?nosw");
   await p.waitForFunction(async () => !(await navigator.serviceWorker.getRegistrations()).length, null, { timeout: 15000 });
   swBody = SW;
+  await ctx.close();
+  assert.deepEqual(problems, []);
+});
+
+test("the emergency off switch (docs/sw-kill-switch.js) removes the worker and its caches", async () => {
+  const ctx = await browser.newContext();
+  const p = await ctx.newPage();
+  p.on("pageerror", e => problems.push("page error: " + e.message));
+  await p.goto(origin + "/");
+  await p.waitForFunction(() => !!navigator.serviceWorker.controller, null, { timeout: 15000 });
+  await p.waitForFunction(async () => (await caches.keys()).length > 0, null, { timeout: 15000 });
+  // the deploy: sw.js = the kill switch, registerSW() removed from boot()
+  const APP = fs.readFileSync(path.join(ROOT, "assets/app.js"), "utf8");
+  assert.match(APP, /\n  registerSW\(\);\n\}/);
+  appBody = APP.replace(/\n  registerSW\(\);\n\}/, "\n}");
+  swBody = fs.readFileSync(path.join(ROOT, "docs/sw-kill-switch.js"), "utf8");
+  try {
+    const reloaded = p.waitForEvent("load", { timeout: 15000 });
+    await p.evaluate(() => navigator.serviceWorker.getRegistration().then(r => r.update()));
+    await reloaded; // the switch reloads open tabs
+    await p.waitForFunction(async () => !(await navigator.serviceWorker.getRegistrations()).length && !(await caches.keys()).length && !navigator.serviceWorker.controller, null, { timeout: 15000 });
+    await p.waitForFunction(() => typeof S === "object" && !!document.querySelector("#main h1, #main h2"));
+    await p.reload();
+    await p.waitForTimeout(500);
+    assert.equal(await p.evaluate(async () => (await navigator.serviceWorker.getRegistrations()).length), 0, "stays off");
+  } finally { swBody = SW; appBody = null; }
   await ctx.close();
   assert.deepEqual(problems, []);
 });

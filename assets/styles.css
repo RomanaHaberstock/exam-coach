@@ -268,7 +268,7 @@ details summary{cursor:pointer; font-weight:600}
 .hbar .hb-v{font-size:.9rem; text-align:right}
 .hbar .hb-t{grid-column:1/-1; height:8px; background:var(--sunk); border-radius:99px; overflow:hidden}
 .hbar .hb-t i{display:block; height:100%; background:var(--muted); border-radius:99px}
-.hbar.top .hb-t i{background:var(--accent)}
+.hbar.best .hb-t i{background:var(--accent)}
 .hbar .hb-n{grid-column:1/-1}
 .cpill{display:inline-flex; align-items:center; gap:7px; padding:6px 12px; border:1px solid var(--line); border-radius:99px; cursor:pointer; font-size:.9rem; background:var(--surface)}
 .cpill:has(input:checked){border-color:var(--accent); background:var(--accent-soft); color:var(--accent)}
@@ -374,6 +374,7 @@ details.more[open] > summary{color:var(--muted)}
 .tour{position:fixed; z-index:20; right:max(16px, env(safe-area-inset-right,0px)); bottom:max(16px, env(safe-area-inset-bottom,0px)); width:min(400px, calc(100vw - 32px));
   max-height:min(60vh, 440px); overflow:auto; display:grid; gap:10px; padding:16px 18px; background:var(--surface); color:var(--ink);
   border:2px solid var(--accent); border-radius:var(--r); box-shadow:0 12px 40px rgba(10,16,40,.28)}
+.tour.tour-up{top:var(--tour-top, 16px); bottom:auto}
 .tour h2{font-size:1.15rem}
 .tour p{font-size:.92rem}
 .tour-dots{list-style:none; margin:0; padding:0; display:flex; gap:6px}
