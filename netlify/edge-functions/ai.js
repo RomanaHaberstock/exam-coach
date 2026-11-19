@@ -37,6 +37,20 @@ const TEMPORARY = new Set([500, 502, 503, 529, 599]);
 // (seen live 19 Nov: "client error (SendRequest): connection error: peer closed"). Treated like a
 // temporary server error: retried after a wait, then the other model is tried.
 const NO_CONNECTION = 599;
+// 598 = the provider accepted the request but sent nothing in time (see WAIT). Never sent by a provider.
+const NO_ANSWER = 598;
+// First-answer time limits (measured live 17 and 18 Nov: gemini-3.8-flash sent no answer at all,
+// not even to "Reply with OK", while gemini-3.5-flash-lite answered in under a second). If the
+// provider hasn't sent its response headers within `headersMs`, or after the headers no first piece
+// of the answer within `firstEventMs`, that request is aborted and the other model is tried once,
+// right away (no busy waits: a model that hangs doesn't recover in 10 s). If the other model then
+// answers, the hanging model is skipped (asked only as the fallback) for `skipMs` in this isolate.
+// Best effort: isolates are short-lived, so a new isolate may try the hanging model once more.
+// Changeable by the tests.
+export const WAIT = { headersMs: 25000, firstEventMs: 30000, skipMs: 600000 };
+// model -> time until which it is asked only as the fallback
+const slow = new Map();
+export function resetSlow() { slow.clear(); }
 // Request size: the page's largest request is a material-analysis part of about 90,000 characters
 // (ANALYZE_CHARS = 80,000 plus instructions and topic names); quizzes send at most ~50,000.
 // The limits leave room for that, also when every character needs several bytes as JSON/UTF-8.
@@ -126,7 +140,15 @@ export async function handle(request, context) {
   const modelFor = t => env(t === "quick" ? `${prefix}_MODEL_QUICK` : `${prefix}_MODEL`) || DEFAULT_MODELS[prov][t];
   // The model asked for, then the other one as a fallback when the first stays busy or its quota
   // is used up (free-tier quotas are per model): default → quick, quick → default.
-  const models = [...new Set([modelFor(tier), modelFor(tier === "quick" ? "default" : "quick")])];
+  let models = [...new Set([modelFor(tier), modelFor(tier === "quick" ? "default" : "quick")])];
+  // Emergency switch: GEMINI_FORCE_QUICK=1 (ANTHROPIC_FORCE_QUICK for Anthropic) asks the quick model
+  // first for every request; the default model is only the fallback (quota used up, busy, no answer).
+  if (/^(1|true|yes|on)$/i.test(String(env(`${prefix}_FORCE_QUICK`) || "").trim()) && tier === "default" && models.length > 1) models = [models[1], models[0]];
+  // A model that recently sent no answer in time (and the other one did) is skipped for a while.
+  else if (models.length > 1 && (slow.get(models[0]) || 0) > Date.now()) {
+    console.log(`Exam Coach AI: skipping ${models[0]} for ${Math.ceil((slow.get(models[0]) - Date.now()) / 60000)} more min (it sent no answer in time); asking ${models[1]} first`);
+    models = [models[1], models[0]];
+  }
 
   return streamResponse((send, signal) => prov === "gemini" ? runGemini(send, key, models, prompt, signal, opts) : runAnthropic(send, key, models, prompt, signal, opts));
 }
@@ -195,7 +217,7 @@ async function readLimited(request, max) {
 }
 
 // Error details for the page name the HTTP status, not the provider; the log keeps the provider.
-const STATUS_TEXT = { 400: "bad request", 401: "unauthorized", 403: "forbidden", 404: "not found", 408: "timeout", 413: "too large", 429: "rate limit", 500: "server error", 502: "bad gateway", 503: "unavailable", 504: "timeout", 529: "overloaded", 599: "no connection" };
+const STATUS_TEXT = { 598: "no answer in time", 400: "bad request", 401: "unauthorized", 403: "forbidden", 404: "not found", 408: "timeout", 413: "too large", 429: "rate limit", 500: "server error", 502: "bad gateway", 503: "unavailable", 504: "timeout", 529: "overloaded", 599: "no connection" };
 const statusLabel = status => `${status} ${STATUS_TEXT[status] || "error"}`;
 
 // Starts the response immediately, keeps it alive while waiting, and turns any
@@ -230,10 +252,6 @@ function streamResponse(run) {
   return new Response(stream, { headers: sseHeaders });
 }
 
-// Calls the provider with `request(model)`. On a temporary server error it waits and tries
-// again (RETRY.delaysMs). If the model still fails that way, or it answers 429 (quota or rate
-// limit), the quick model (when it is a different one) gets one try; if that fails too, the
-// first model's error is reported, with `fallbackTried` set.
 // cancel() returns a promise; a rejection must not go unhandled (that would end the isolate).
 const drop = res => { try { const p = res.body && res.body.cancel(); if (p && p.catch) p.catch(() => {}); } catch (e) {} };
 // A fetch that throws (network error, connection closed by the provider) becomes a 599 response,
@@ -249,8 +267,61 @@ const reach = request => async model => {
     return new Response(JSON.stringify({ error: { message: short } }), { status: NO_CONNECTION, headers: { "content-type": "application/json" } });
   }
 };
-async function fetchWithRetry(name, models, request) {
-  request = reach(request);
+// Runs request(model, signal) with the first-answer limits (WAIT). The signal is aborted when the
+// page goes away or the limit passes. Returns the Response (an ok one carries its first piece of the
+// answer already read, put back in front of the rest), or a 598 response when nothing came in time.
+// The races don't rely on fetch reacting to the abort (late answers are dropped, rejections caught).
+const timed = (name, request, page) => async model => {
+  const ctrl = new AbortController(), t0 = Date.now();
+  const onPage = () => ctrl.abort();
+  if (page) { if (page.aborted) ctrl.abort(); else page.addEventListener("abort", onPage, { once: true }); }
+  const pageGone = new Promise((_, rej) => { const f = () => rej(Object.assign(new Error("The page closed the connection."), { name: "AbortError" })); if (ctrl.signal.aborted) f(); else ctrl.signal.addEventListener("abort", f, { once: true }); });
+  pageGone.catch(() => {});
+  let timer;
+  const limit = ms => new Promise(r => { timer = setTimeout(() => r(NO_ANSWER), ms); });
+  const late = what => {
+    ctrl.abort();
+    const r = new Response(JSON.stringify({ error: { message: "the AI service didn't answer in time" } }), { status: NO_ANSWER, headers: { "content-type": "application/json" } });
+    r.noAnswer = `sent no answer in ${Math.round((Date.now() - t0) / 1000)} s (${what})`;
+    return r;
+  };
+  // The page's abort stays linked for the whole answer, so closing the page also aborts the provider request.
+  try {
+    const p = Promise.resolve().then(() => request(model, ctrl.signal));
+    p.then(r => { if (ctrl.signal.aborted && r && r.body) drop(r); }, () => {});
+    const res = await Promise.race([p, limit(WAIT.headersMs), pageGone]);
+    clearTimeout(timer);
+    if (res === NO_ANSWER) return late("no response headers");
+    if (!res.ok || !res.body) return res;
+    // Wait for the first piece of the answer (Gemini sends no comments, so its first bytes are the first event).
+    const reader = res.body.getReader(), until = Date.now() + WAIT.firstEventMs;
+    let first;
+    for (;;) {
+      const rd = reader.read();
+      rd.catch(() => {});
+      first = await Promise.race([rd, limit(Math.max(0, until - Date.now())), pageGone]);
+      clearTimeout(timer);
+      if (first === NO_ANSWER) { try { reader.cancel().catch(() => {}); } catch (e) {} return late("headers, then nothing"); }
+      if (first.done || (first.value && first.value.byteLength)) break;
+    }
+    let sentFirst = false;
+    const body = new ReadableStream({
+      async pull(c) {
+        if (!sentFirst) { sentFirst = true; if (first.done) { c.close(); return; } c.enqueue(first.value); return; }
+        const r = await reader.read();
+        if (r.done) c.close(); else c.enqueue(r.value);
+      },
+      cancel(why) { return reader.cancel(why).catch(() => {}); },
+    });
+    return new Response(body, { status: res.status, headers: res.headers });
+  } finally { clearTimeout(timer); }
+};
+// Calls the provider with `request(model, signal)`. On a temporary server error it waits and tries
+// again (RETRY.delaysMs). If the model still fails that way, answers 429 (quota or rate limit) or
+// sends nothing in time (WAIT), the other model (when it is a different one) gets one try; if that
+// fails too, the first model's error is reported, with `fallbackTried` set.
+async function fetchWithRetry(name, models, request, page) {
+  request = reach(timed(name, request, page));
   const [model, fallback] = models;
   let res = await request(model);
   for (let i = 0; i < RETRY.delaysMs.length && TEMPORARY.has(res.status); i++) {
@@ -260,13 +331,18 @@ async function fetchWithRetry(name, models, request) {
     await RETRY.sleep(wait);
     res = await request(model);
   }
-  const quota = res.status === 429;
-  if (!(TEMPORARY.has(res.status) || quota) || !fallback) return { res, fallbackTried: false };
+  const quota = res.status === 429, hung = res.status === NO_ANSWER;
+  if (hung && !fallback) console.log(`Exam Coach AI retry: ${name} ${model} ${res.noAnswer}; no other model to try`);
+  if (!(TEMPORARY.has(res.status) || quota || hung) || !fallback) return { res, fallbackTried: false };
   console.log(quota ? `Exam Coach AI retry: ${name} ${model} answered 429 (quota or rate limit); trying ${fallback} instead`
+    : hung ? `Exam Coach AI retry: ${name} ${model} ${res.noAnswer}; trying ${fallback} instead`
     : `Exam Coach AI retry: ${name} ${model} still answers ${res.status}; trying ${fallback} instead`);
   const alt = await request(fallback);
-  if (alt.ok) { drop(res); return { res: alt, fallbackTried: true }; }
-  console.log(`Exam Coach AI retry: ${name} ${fallback} answered ${alt.status} too`);
+  if (alt.ok) {
+    if (hung) { slow.set(model, Date.now() + WAIT.skipMs); console.log(`Exam Coach AI: ${fallback} answered; skipping ${model} for ${Math.ceil(WAIT.skipMs / 60000)} min in this isolate`); }
+    drop(res); return { res: alt, fallbackTried: true };
+  }
+  console.log(`Exam Coach AI retry: ${name} ${fallback} ${alt.noAnswer || `answered ${alt.status}`} too`);
   drop(alt);
   return { res, fallbackTried: true };
 }
@@ -280,7 +356,7 @@ async function readError(res) {
 
 function errorCode(status, message) {
   if (status === 429) return "rate_limited";
-  if (status === 503 || status === 529 || status === NO_CONNECTION) return "busy";
+  if (status === 503 || status === 529 || status === NO_CONNECTION || status === NO_ANSWER) return "busy";
   if (status === 401 || status === 403 || (status === 400 && /API[_ ]?KEY/i.test(message))) return "bad_key";
   if (status === 404) return "model_unavailable";
   if (status === 413 || (status === 400 && /token|too long|too large|exceeds/i.test(message))) return "prompt_too_large";
@@ -324,11 +400,11 @@ async function runAnthropic(send, key, models, prompt, signal, opts = {}) {
   // The request body names the model, so it is built once per model (not once per retry).
   const bodies = new Map();
   const bodyFor = model => bodies.get(model) || bodies.set(model, JSON.stringify({ model, max_tokens: Math.min(16000, opts.maxTokens || 16000), stream: true, system: SYSTEM, messages: [{ role: "user", content: prompt }] })).get(model);
-  const { res, fallbackTried } = await fetchWithRetry("Anthropic", models, model => fetch("https://api.anthropic.com/v1/messages", {
+  const { res, fallbackTried } = await fetchWithRetry("Anthropic", models, (model, sig) => fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: { "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json" },
-    body: bodyFor(model), signal,
-  }));
+    body: bodyFor(model), signal: sig,
+  }), signal);
   if (!res.ok) return sendError(send, "Anthropic", res, fallbackTried);
   await pipe(res, send, signal);
 }
@@ -362,20 +438,20 @@ async function runGemini(send, key, models, prompt, signal, opts = {}) {
     }
     return bodies.get(k);
   };
-  const call = (model, plain) => fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`, {
+  const call = (model, plain, sig) => fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`, {
     method: "POST",
     headers: { "x-goog-api-key": key, "content-type": "application/json" },
-    body: bodyFor(model, plain), signal,
+    body: bodyFor(model, plain), signal: sig,
   });
-  const { res, fallbackTried } = await fetchWithRetry("Gemini", models, async model => {
-    const r = await call(model);
+  const { res, fallbackTried } = await fetchWithRetry("Gemini", models, async (model, sig) => {
+    const r = await call(model, false, sig);
     // A model that doesn't know the thinking setting (e.g. set with GEMINI_MODEL) answers 400: ask again without it.
     if (r.status === 400 && thinkingFor(model, opts.think)) {
       const msg = await readError(r.clone());
-      if (/think/i.test(msg)) { console.log(`Exam Coach AI retry: Gemini ${model} refused the thinking setting; asking again without it`); drop(r); return call(model, true); }
+      if (/think/i.test(msg)) { console.log(`Exam Coach AI retry: Gemini ${model} refused the thinking setting; asking again without it`); drop(r); return call(model, true, sig); }
     }
     return r;
-  });
+  }, signal);
   if (!res.ok) return sendError(send, "Gemini", res, fallbackTried);
   const parser = geminiParser(send);
   await pipe(res, parser.push, signal);

@@ -3,7 +3,7 @@
 
 import { test, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
-import { handle, provider, geminiToEvents, geminiParser, resetLimits, thinkingFor, RATE, CODE_RATE, RETRY, STREAM, OUTPUT } from "../netlify/edge-functions/ai.js";
+import { handle, provider, geminiToEvents, geminiParser, resetLimits, resetSlow, thinkingFor, RATE, CODE_RATE, RETRY, STREAM, OUTPUT, WAIT } from "../netlify/edge-functions/ai.js";
 
 const realFetch = globalThis.fetch;
 let next = null, lastCall = null, calls = 0;
@@ -16,8 +16,8 @@ let waits = [];
 RETRY.sleep = async ms => { waits.push(ms); };
 after(() => { RETRY.sleep = realSleep; });
 
-const VARS = ["AI_PROVIDER", "GEMINI_API_KEY", "ANTHROPIC_API_KEY", "ACCESS_CODE", "GEMINI_MODEL", "GEMINI_MODEL_QUICK", "ANTHROPIC_MODEL", "ANTHROPIC_MODEL_QUICK", "ALLOWED_ORIGINS"];
-beforeEach(() => { for (const v of VARS) delete process.env[v]; next = null; lastCall = null; calls = 0; waits = []; resetLimits(); });
+const VARS = ["AI_PROVIDER", "GEMINI_API_KEY", "ANTHROPIC_API_KEY", "ACCESS_CODE", "GEMINI_MODEL", "GEMINI_MODEL_QUICK", "ANTHROPIC_MODEL", "ANTHROPIC_MODEL_QUICK", "ALLOWED_ORIGINS", "GEMINI_FORCE_QUICK"];
+beforeEach(() => { for (const v of VARS) delete process.env[v]; next = null; lastCall = null; calls = 0; waits = []; resetLimits(); resetSlow(); });
 
 const post = (body, headers = {}, context) => handle(new Request("http://x/api/ai", { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) }), context);
 const get = (headers = {}, context) => handle(new Request("http://x/api/ai", { headers }), context);
@@ -469,4 +469,188 @@ test("passes the provider's retry time of a quota error on to the page (retryS)"
     next = () => new Response('{"error":{"code":429,"message":"Quota"}}', { status: 429 });
     assert.equal((await lastError(await post({ prompt: "x" }))).retryS, undefined);
   } finally { console.log = log; }
+});
+
+// ---- first-answer time limits (17/18 Nov: gemini-3.8-flash accepted requests and sent nothing) ----
+const hang = () => new Promise(() => {});                                   // never sends headers
+const silent = () => new Response(new ReadableStream({ pull: () => new Promise(() => {}) })); // headers, then nothing
+async function withWait(fn, limits = { headersMs: 80, firstEventMs: 80 }) {
+  const saved = { ...WAIT }, logs = [], log = console.log;
+  Object.assign(WAIT, limits);
+  console.log = (...a) => logs.push(a.join(" "));
+  try { return await fn(logs); } finally { Object.assign(WAIT, saved); console.log = log; }
+}
+
+test("limits are generous enough for a slow answer, and short enough for the page", () => {
+  assert.equal(WAIT.headersMs, 25000);
+  assert.equal(WAIT.firstEventMs, 30000);
+  assert.equal(WAIT.skipMs, 600000);
+});
+
+test("Gemini: a default model that never answers is given up after the limit and the quick model answers", async () => {
+  process.env.GEMINI_API_KEY = "g";
+  await withWait(async logs => {
+    const models = [], signals = [];
+    next = () => { models.push(modelOf(lastCall.url)); signals.push(lastCall.init.signal); return models.at(-1) === "gemini-3.5-flash-lite" ? geminiOk() : hang(); };
+    const t0 = Date.now();
+    const events = await readEvents(await post({ prompt: "Reply with OK" }));
+    const ms = Date.now() - t0;
+    assert.deepEqual(models, ["gemini-3.8-flash", "gemini-3.5-flash-lite"], "no busy retries on a timeout: straight to the other model");
+    assert.deepEqual(waits, []);
+    assert.equal(events.find(e => e.type === "content_block_delta").delta.text, "{}");
+    assert.equal(events.at(-1).delta.stop_reason, "end_turn");
+    assert.ok(ms < 1000, `bounded by the limit: ${ms} ms`);
+    assert.equal(signals[0].aborted, true, "the hanging request is aborted");
+    assert.equal(signals[1].aborted, false);
+    assert.ok(logs.some(l => /Exam Coach AI retry: Gemini gemini-3\.8-flash sent no answer in \d+ s \(no response headers\); trying gemini-3\.5-flash-lite instead/.test(l)), logs.join("\n"));
+  });
+});
+
+test("Gemini: headers, then silence: switches to the other model", async () => {
+  process.env.GEMINI_API_KEY = "g";
+  await withWait(async logs => {
+    const models = [];
+    next = () => { models.push(modelOf(lastCall.url)); return models.at(-1) === "gemini-3.5-flash-lite" ? geminiOk() : silent(); };
+    const events = await readEvents(await post({ prompt: "x" }));
+    assert.deepEqual(models, ["gemini-3.8-flash", "gemini-3.5-flash-lite"]);
+    assert.equal(events.find(e => e.type === "content_block_delta").delta.text, "{}");
+    assert.ok(logs.some(l => /gemini-3\.8-flash sent no answer in \d+ s \(headers, then nothing\)/.test(l)), logs.join("\n"));
+
+    // a quick request whose model hangs gets the default model the same way
+    resetSlow(); models.length = 0;
+    next = () => { models.push(modelOf(lastCall.url)); return models.at(-1) === "gemini-3.8-flash" ? geminiOk() : hang(); };
+    assert.equal((await readEvents(await post({ prompt: "x", tier: "quick" }))).find(e => e.type === "content_block_delta").delta.text, "{}");
+    assert.deepEqual(models, ["gemini-3.5-flash-lite", "gemini-3.8-flash"]);
+  });
+});
+
+test("an answer that starts within the limits is passed on whole, also when it is slow after that", async () => {
+  process.env.GEMINI_API_KEY = "g";
+  await withWait(async () => {
+    const enc = new TextEncoder();
+    next = () => new Promise(r => setTimeout(() => r(new Response(new ReadableStream({ async start(c) {
+      await new Promise(w => setTimeout(w, 40));
+      c.enqueue(enc.encode('data: {"candidates":[{"content":{"parts":[{"text":"{\\"a\\":"}]}}]}\n\n'));
+      await new Promise(w => setTimeout(w, 200)); // longer than the limits: only the first piece is timed
+      c.enqueue(enc.encode('data: {"candidates":[{"content":{"parts":[{"text":"1}"}]},"finishReason":"STOP"}]}\n\n'));
+      c.close();
+    } }))), 40));
+    const events = await readEvents(await post({ prompt: "x" }));
+    assert.equal(calls, 1, "no switch");
+    assert.equal(events.filter(e => e.type === "content_block_delta").map(e => e.delta.text).join(""), '{"a":1}');
+    assert.equal(events.at(-1).delta.stop_reason, "end_turn");
+  });
+});
+
+test("both models send no answer in time: a busy error that says the other model was tried", async () => {
+  process.env.GEMINI_API_KEY = "g";
+  await withWait(async logs => {
+    const models = [];
+    next = () => { models.push(modelOf(lastCall.url)); return models.length === 1 ? hang() : silent(); };
+    const t0 = Date.now();
+    const err = await lastError(await post({ prompt: "x" }));
+    assert.ok(Date.now() - t0 < 1000);
+    assert.deepEqual(models, ["gemini-3.8-flash", "gemini-3.5-flash-lite"]);
+    assert.deepEqual(waits, []);
+    assert.equal(err.type, "busy");
+    assert.equal(err.fallback, true);
+    assert.equal(err.message, "598 no answer in time: the AI service didn't answer in time");
+    assert.doesNotMatch(err.message, /gemini|google/i);
+    assert.ok(logs.some(l => /gemini-3\.5-flash-lite sent no answer in \d+ s \(headers, then nothing\) too/.test(l)), logs.join("\n"));
+    // nobody answered, so no model is skipped later
+    models.length = 0;
+    next = () => { models.push(modelOf(lastCall.url)); return geminiOk(); };
+    await (await post({ prompt: "x" })).text();
+    assert.deepEqual(models, ["gemini-3.8-flash"]);
+
+    // only one model configured: busy without fallback
+    models.length = 0; process.env.GEMINI_MODEL_QUICK = "gemini-3.8-flash";
+    next = () => { models.push(modelOf(lastCall.url)); return hang(); };
+    const one = await lastError(await post({ prompt: "x" }));
+    assert.deepEqual(models, ["gemini-3.8-flash"]);
+    assert.equal(one.type, "busy");
+    assert.equal(one.fallback, undefined);
+  });
+});
+
+test("closing the page while waiting for the first answer aborts the request and tries no other model", async () => {
+  process.env.GEMINI_API_KEY = "g";
+  await withWait(async () => {
+    for (const fake of [hang, silent]) {
+      calls = 0;
+      let signal;
+      next = () => { signal = lastCall.init.signal; return fake(); };
+      const res = await post({ prompt: "x" });
+      const reader = res.body.getReader();
+      await reader.read();
+      for (let i = 0; i < 10 && !signal; i++) await new Promise(r => setTimeout(r, 5));
+      assert.ok(signal && !signal.aborted);
+      await reader.cancel();
+      assert.equal(signal.aborted, true, "the request to the provider is aborted");
+      await new Promise(r => setTimeout(r, 300)); // past the limits
+      assert.equal(calls, 1, `no fallback after the page left (${fake.name})`);
+    }
+  }, { headersMs: 100, firstEventMs: 100 });
+});
+
+test("after the default model hung and the quick one answered, the default model is skipped for a while", async () => {
+  process.env.GEMINI_API_KEY = "g";
+  await withWait(async logs => {
+    const models = [];
+    next = () => { models.push(modelOf(lastCall.url)); return models.at(-1) === "gemini-3.5-flash-lite" ? geminiOk() : hang(); };
+    await (await post({ prompt: "x" })).text();
+    assert.deepEqual(models, ["gemini-3.8-flash", "gemini-3.5-flash-lite"]);
+    assert.ok(logs.some(l => /gemini-3\.5-flash-lite answered; skipping gemini-3\.8-flash for \d+ min in this isolate/.test(l)), logs.join("\n"));
+
+    // later default requests ask the quick model first, without waiting for the default
+    models.length = 0; logs.length = 0;
+    const t0 = Date.now();
+    await (await post({ prompt: "x" })).text();
+    assert.ok(Date.now() - t0 < 70, "no time lost on the hanging model");
+    assert.deepEqual(models, ["gemini-3.5-flash-lite"]);
+    assert.ok(logs.some(l => /skipping gemini-3\.8-flash for \d+ more min/.test(l)), logs.join("\n"));
+
+    // the default model is still the fallback (e.g. the quick model's quota is used up)
+    models.length = 0;
+    next = () => { models.push(modelOf(lastCall.url)); return models.at(-1) === "gemini-3.5-flash-lite" ? new Response('{"error":{"code":429,"message":"Quota"}}', { status: 429 }) : geminiOk(); };
+    assert.equal((await readEvents(await post({ prompt: "x" }))).find(e => e.type === "content_block_delta").delta.text, "{}");
+    assert.deepEqual(models, ["gemini-3.5-flash-lite", "gemini-3.8-flash"]);
+  }, { headersMs: 80, firstEventMs: 80, skipMs: 300 });
+
+  // after skipMs the default model is asked first again
+  await new Promise(r => setTimeout(r, 320));
+  const models = [];
+  next = () => { models.push(modelOf(lastCall.url)); return geminiOk(); };
+  await (await post({ prompt: "x" })).text();
+  assert.deepEqual(models, ["gemini-3.8-flash"]);
+});
+
+test("GEMINI_FORCE_QUICK=1 asks the quick model first, with the default model as the fallback", async () => {
+  process.env.GEMINI_API_KEY = "g"; process.env.GEMINI_FORCE_QUICK = "1";
+  const models = [];
+  next = () => { models.push(modelOf(lastCall.url)); return geminiOk(); };
+  await (await post({ prompt: "x" })).text();
+  await (await post({ prompt: "x", tier: "quick" })).text();
+  assert.deepEqual(models, ["gemini-3.5-flash-lite", "gemini-3.5-flash-lite"]);
+  models.length = 0;
+  next = () => { models.push(modelOf(lastCall.url)); return models.length === 1 ? new Response('{"error":{"code":429,"message":"Quota"}}', { status: 429 }) : geminiOk(); };
+  await (await post({ prompt: "x" })).text();
+  assert.deepEqual(models, ["gemini-3.5-flash-lite", "gemini-3.8-flash"]);
+  process.env.GEMINI_FORCE_QUICK = "0";
+  models.length = 0;
+  next = () => { models.push(modelOf(lastCall.url)); return geminiOk(); };
+  await (await post({ prompt: "x" })).text();
+  assert.deepEqual(models, ["gemini-3.8-flash"]);
+});
+
+test("Anthropic: a hanging model is given up and the other one answers", async () => {
+  process.env.ANTHROPIC_API_KEY = "a";
+  const sse = 'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"{}"}}\n\n';
+  await withWait(async () => {
+    const models = [];
+    next = () => { const m = JSON.parse(lastCall.init.body).model; models.push(m); return m === "claude-haiku-5-5" ? new Response(streamOf(sse)) : hang(); };
+    const text = await (await post({ prompt: "x" })).text();
+    assert.deepEqual(models, ["claude-sonnet-5-5", "claude-haiku-5-5"]);
+    assert.ok(text.endsWith(sse));
+  });
 });

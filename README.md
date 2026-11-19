@@ -117,10 +117,13 @@ From then on, every push to GitHub updates the site automatically.
 | `ALLOWED_ORIGINS` | none | Other websites (comma-separated origins, e.g. `https://example.org`) allowed to call `/api/ai` from a browser. The site itself always may. |
 | `GEMINI_MODEL` | `gemini-3.8-flash` | Gemini model for analysing materials, quizzes, grading and study sessions. |
 | `GEMINI_MODEL_QUICK` | `gemini-3.5-flash-lite` | Gemini model for short requests. |
+| `GEMINI_FORCE_QUICK` | none | Set to `1` to use the quick model for every request (the main model is then only the fallback). Emergency switch for when the main model doesn't answer. |
 | `ANTHROPIC_MODEL` | `claude-sonnet-5-5` | Anthropic model for the main requests. |
 | `ANTHROPIC_MODEL_QUICK` | `claude-haiku-5-5` | Anthropic model for short requests. |
 
 **About `ACCESS_CODE`:** without it, anyone who finds the link can use the AI features, and all of them share one free quota (requests per minute and per day). For a site whose link is shared with a class or a professor, setting a short code and handing it out with the link is recommended: the example data, the tour and the plan work without the code; only AI features (analysing materials, AI quizzes, grading, study sessions) ask for it. The backend compares the code safely and slows down repeated wrong guesses. After adding or changing it, trigger a new deploy.
+
+**If the AI doesn't answer** (analysis or quiz spins for minutes): the backend gives a model 25 s to start answering (30 s more after the first response headers) and then switches to the other model by itself, and skips the slow model for 10 minutes. To skip it for good, set `GEMINI_FORCE_QUICK` to `1` (or `GEMINI_MODEL` to `gemini-3.5-flash-lite`) and trigger a new deploy; delete the variable and redeploy to go back.
 
 If Google retires a model, set `GEMINI_MODEL` to a current one from the [Gemini models list](https://ai.google.dev/gemini-api/docs/models) and redeploy.
 
