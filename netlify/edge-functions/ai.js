@@ -32,7 +32,11 @@ export const STREAM = { keepAliveMs: 5000 };
 // minute or a day; the quick model has its own quota on the free tier, so it gets one try.
 // `sleep` can be replaced by the tests.
 export const RETRY = { delaysMs: [2000, 5000, 10000], jitterMs: 500, sleep: ms => new Promise(r => setTimeout(r, ms)) };
-const TEMPORARY = new Set([500, 502, 503, 529]);
+const TEMPORARY = new Set([500, 502, 503, 529, 599]);
+// 599 = no answer at all: the connection to the provider failed or was closed before an answer
+// (seen live 19 Nov: "client error (SendRequest): connection error: peer closed"). Treated like a
+// temporary server error: retried after a wait, then the other model is tried.
+const NO_CONNECTION = 599;
 // Request size: the page's largest request is a material-analysis part of about 90,000 characters
 // (ANALYZE_CHARS = 80,000 plus instructions and topic names); quizzes send at most ~50,000.
 // The limits leave room for that, also when every character needs several bytes as JSON/UTF-8.
@@ -191,7 +195,7 @@ async function readLimited(request, max) {
 }
 
 // Error details for the page name the HTTP status, not the provider; the log keeps the provider.
-const STATUS_TEXT = { 400: "bad request", 401: "unauthorized", 403: "forbidden", 404: "not found", 408: "timeout", 413: "too large", 429: "rate limit", 500: "server error", 502: "bad gateway", 503: "unavailable", 504: "timeout", 529: "overloaded" };
+const STATUS_TEXT = { 400: "bad request", 401: "unauthorized", 403: "forbidden", 404: "not found", 408: "timeout", 413: "too large", 429: "rate limit", 500: "server error", 502: "bad gateway", 503: "unavailable", 504: "timeout", 529: "overloaded", 599: "no connection" };
 const statusLabel = status => `${status} ${STATUS_TEXT[status] || "error"}`;
 
 // Starts the response immediately, keeps it alive while waiting, and turns any
@@ -208,7 +212,10 @@ function streamResponse(run) {
       const ping = setInterval(() => send(": keep-alive\n\n"), STREAM.keepAliveMs);
       try { await run(send, gone.signal); }
       catch (e) {
-        const msg = e && e.message ? e.message : "The request to the AI failed.";
+        // Network errors name internal addresses and URLs; the page gets a short form (full text in the log).
+        const raw = e && e.message ? e.message : "The request to the AI failed.";
+        const msg = raw.replace(/https?:\/\/\S+/g, "the AI service").replace(/\b\d{1,3}(\.\d{1,3}){3}(:\d+)?\b/g, "").replace(/\s*\(\s*\)/g, "").replace(/\s{2,}/g, " ").trim().slice(0, 200);
+        if (raw !== msg) console.log("Exam Coach AI error (full):", raw);
         if (gone.signal.aborted) console.log("Exam Coach AI: the page closed the connection");
         else if (e && e.broken) { console.log("Exam Coach AI error: the provider's answer broke off:", msg); send(errorEvent("stream_broken", `The AI's answer broke off: ${msg}`)); }
         else { console.log("Exam Coach AI error:", msg); send(errorEvent("upstream_error", msg)); }
@@ -229,7 +236,21 @@ function streamResponse(run) {
 // first model's error is reported, with `fallbackTried` set.
 // cancel() returns a promise; a rejection must not go unhandled (that would end the isolate).
 const drop = res => { try { const p = res.body && res.body.cancel(); if (p && p.catch) p.catch(() => {}); } catch (e) {} };
+// A fetch that throws (network error, connection closed by the provider) becomes a 599 response,
+// unless the page itself went away (abort), so the retry loop below handles it like a 503.
+// The thrown message holds internal addresses, so only a short form goes to the page.
+const reach = request => async model => {
+  try { return await request(model); }
+  catch (e) {
+    if (e && e.name === "AbortError") throw e;
+    const msg = String(e && e.message || e);
+    console.log(`Exam Coach AI retry: no connection to ${model}: ${msg}`);
+    const short = /peer closed|connection (reset|closed|refused)|broken pipe|eof/i.test(msg) ? "the AI service closed the connection" : "the AI service could not be reached";
+    return new Response(JSON.stringify({ error: { message: short } }), { status: NO_CONNECTION, headers: { "content-type": "application/json" } });
+  }
+};
 async function fetchWithRetry(name, models, request) {
+  request = reach(request);
   const [model, fallback] = models;
   let res = await request(model);
   for (let i = 0; i < RETRY.delaysMs.length && TEMPORARY.has(res.status); i++) {
@@ -259,7 +280,7 @@ async function readError(res) {
 
 function errorCode(status, message) {
   if (status === 429) return "rate_limited";
-  if (status === 503 || status === 529) return "busy";
+  if (status === 503 || status === 529 || status === NO_CONNECTION) return "busy";
   if (status === 401 || status === 403 || (status === 400 && /API[_ ]?KEY/i.test(message))) return "bad_key";
   if (status === 404) return "model_unavailable";
   if (status === 413 || (status === 400 && /token|too long|too large|exceeds/i.test(message))) return "prompt_too_large";

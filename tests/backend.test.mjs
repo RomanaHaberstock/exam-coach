@@ -147,6 +147,34 @@ test("Gemini: falls back to the quick model once when the default stays busy", a
   assert.equal(calls, 1);
 });
 
+test("Gemini: retries when the connection to the provider is closed before an answer (peer closed)", async () => {
+  process.env.GEMINI_API_KEY = "g";
+  // seen live on 19 Nov: fetch threw "error sending request from 172.16.16.253:53950 for https://… : connection error: peer closed"
+  const peerClosed = () => { throw new TypeError("error sending request from 172.16.16.253:53950 for https://generativelanguage.googleapis.com/v1beta/models/x:streamGenerateContent?alt=sse (172.217.117.4:443): client error (SendRequest): connection error: peer closed"); };
+  let n = 0;
+  next = () => ++n <= 2 ? peerClosed() : geminiOk();
+  const events = await readEvents(await post({ prompt: "x" }));
+  assert.equal(calls, 3, "two dropped connections, then success");
+  assert.equal(events.find(e => e.type === "content_block_delta").delta.text, "{}");
+  assert.equal(waits.length, 2, "waits like a busy answer");
+
+  // never connects: both models are tried, the page gets "busy" without addresses or URLs
+  calls = 0; waits = [];
+  const models = [];
+  next = () => { models.push(modelOf(lastCall.url)); return peerClosed(); };
+  const err = await lastError(await post({ prompt: "x" }));
+  assert.deepEqual(models, [...Array(4).fill("gemini-3.8-flash"), "gemini-3.5-flash-lite"]);
+  assert.equal(err.type, "busy");
+  assert.match(err.message, /closed the connection/);
+  assert.doesNotMatch(err.message, /\d+\.\d+\.\d+\.\d+|https?:|googleapis/);
+
+  // any other thrown error message is also cleaned of addresses
+  calls = 0;
+  next = () => geminiOk();
+  const res = await post({ prompt: "x" });
+  assert.equal((await readEvents(res)).find(e => e.type === "content_block_delta").delta.text, "{}");
+});
+
 test("falls back to the quick model once when the default model's quota is used up (429)", async () => {
   process.env.GEMINI_API_KEY = "g";
   const quota = () => new Response(JSON.stringify({ error: { code: 429, message: "You exceeded your current quota. Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_input_token_count" } }), { status: 429 });
@@ -322,8 +350,9 @@ test("turns a network failure into an error event", async () => {
   process.env.GEMINI_API_KEY = "g";
   next = () => { throw new Error("getaddrinfo ENOTFOUND"); };
   const err = await lastError(await post({ prompt: "x" }));
-  assert.equal(err.type, "upstream_error");
-  assert.match(err.message, /ENOTFOUND/);
+  assert.equal(calls, 5, "retried like a busy answer, then the other model");
+  assert.equal(err.type, "busy");
+  assert.match(err.message, /^599 no connection: the AI service could not be reached/);
 });
 
 test("Gemini: model can be changed with GEMINI_MODEL", async () => {
